@@ -229,7 +229,7 @@ Sequoia 15.8.2 与 Tahoe 26.7.3 都还在安全更新窗口内，**两端每次�
 
 ### 11.1 拷过去的文件
 
-直接把工作区里的 `P0-TahoeProbe.zip` 拷到被控端解压即可（U 盘 / 网盘 / `scp` 都行，注意第 11.2 节说的是**不要 ssh 执行**，拷文件不受影响）。
+直接把工作区里的 `P0-TahoeProbe.zip` 拷到被控端解压即可（U 盘 / 网盘 / `scp` 都行，注意第 11.2 节说的是**不要 ssh 执行**，拷文件不受影响）。工作区根目录已初始化 git 仓库并做了初始提交；若想保留提交历史，也可以整目录拷过去（含 `.git`）。`.gitattributes` 已强制所有 shell / ObjC 文件用 LF，避免 Windows 的 `core.autocrlf` 把 `build.sh` 转成 CRLF 后在 Mac 上跑不起来。
 
 ```
 P0-TahoeProbe/
