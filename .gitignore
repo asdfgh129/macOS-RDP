@@ -1,0 +1,14 @@
+# WorkBuddy 会话数据（本地记忆，不入库）
+.workbuddy/
+
+# 构建产物与一键诊断产物
+P0-TahoeProbe/p0probe
+P0-TahoeProbe/p0_result.json
+P0-TahoeProbe/diag-*/
+P0-TahoeProbe/p0-diag-*.tar.gz
+P0-TahoeProbe.zip
+
+# macOS / Python 噪声
+.DS_Store
+__pycache__/
+*.pyc
