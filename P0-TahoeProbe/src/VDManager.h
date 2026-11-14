@@ -30,6 +30,10 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, strong, readonly) NSArray<id> *displays;      // 必须全程持有，释放即注销
 @property (nonatomic, strong, readonly) NSArray<NSNumber *> *displayIDs;
 
+// SPI 同步调用超时（WindowServer 疑似挂起）时置 YES。
+// 一旦置位，调用方必须立即停止全部建屏/重试动作，不得再向 WindowServer 发请求。
+@property (nonatomic, assign, readonly) BOOL windowServerHung;
+
 - (instancetype)initWithConfigs:(NSArray<NSDictionary *> *)configs
                  identityOffset:(uint32_t)offset
               conservativeFirst:(BOOL)conservativeFirst;
@@ -49,6 +53,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 // 等 WindowServer 完成注册（默认最多 3 秒，逐屏检查 usable）。
 - (BOOL)waitUntilUsableTimeoutMs:(int)timeoutMs;
+
+// 等每块屏的实际 CGDisplayMode 落到请求的 points 尺寸。
+// applySettings: 是异步提交（15.5 实测需 1-3 秒，attach 期内的首次 apply 可能被吞），
+// 只查 online/active 会把 1x1 的未提交状态误判为可用。超时中途会补一次 apply。
+- (BOOL)waitUntilModeMatchesTimeoutMs:(int)timeoutMs conservative:(BOOL)conservative;
 
 - (void)destroyAll;
 

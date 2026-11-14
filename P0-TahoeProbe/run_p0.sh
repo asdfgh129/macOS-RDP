@@ -78,11 +78,13 @@ if [ "$BUILD_OK" = "1" ]; then
   # 第 1 步永远先跑：不建屏，只验环境 / 私有类签名 / TCC / 编码器档位。
   run_step probe probe --capabilities
 
-  # 第 2 步：默认保守 canvas 的完整链路。
+  # 第 2 步：按 OS 自动选路的完整链路（Tahoe=保守 canvas，Sequoia=直建）。
   run_step verify verify ${P0_EXTRA:-}
 
-  # 第 3 步：对照实验，跳过保守 canvas 直接以目标分辨率建屏（PR #288 的 A/B）。
-  if [ "${P0_QUICK:-0}" != "1" ]; then
+  # 第 3 步：对照实验，仅在 Tahoe 上有意义（跳过保守 canvas 直接建屏，PR #288 的 A/B）。
+  # Sequoia 默认本就直建，再跑 --direct 是重复，故跳过。
+  OS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
+  if [ "${P0_QUICK:-0}" != "1" ] && [ "$OS_MAJOR" = "26" ]; then
     run_step verify_direct verify --direct ${P0_EXTRA:-}
   fi
 

@@ -36,36 +36,6 @@ static SCShareableContent * _Nullable P0ShareableContent(NSError * _Nullable * _
     return result;
 }
 
-+ (NSArray<NSNumber *> * _Nullable)shareableDisplayIDsWithError:(NSError * _Nullable * _Nullable)error {
-    SCShareableContent *content = P0ShareableContent(error);
-    if (!content) return nil;
-    NSMutableArray *ids = [NSMutableArray array];
-    for (SCDisplay *d in content.displays) [ids addObject:@(d.displayID)];
-    return ids;
-}
-
-+ (BOOL)waitForDisplayIDs:(NSArray<NSNumber *> *)ids
-                timeoutMs:(int)timeoutMs
-                 lastSeen:(NSArray<NSNumber *> * _Nullable * _Nullable)lastSeen {
-    NSSet *want = [NSSet setWithArray:ids];
-    int elapsed = 0;
-    NSArray *seen = @[];
-    while (elapsed <= timeoutMs) {
-        NSError *err = nil;
-        NSArray *now = [self shareableDisplayIDsWithError:&err];
-        seen = now ?: @[];
-        if (err) P0Error(@"SCShareableContent: %@", err.localizedDescription);
-        if ([want isSubsetOfSet:[NSSet setWithArray:seen]]) {
-            if (lastSeen) *lastSeen = seen;
-            return YES;
-        }
-        P0SleepMs(200);
-        elapsed += 200;
-    }
-    if (lastSeen) *lastSeen = seen;
-    return NO;
-}
-
 #pragma mark - Encoder capability probe
 
 static void P0CompressionCallbackNoop(void *refCon, void *sourceFrameRefCon, OSStatus status,
@@ -108,33 +78,6 @@ static NSDictionary *P0ProbeEncoder(CMVideoCodecType codec, NSString *label,
 
     CFRelease(session);
     return r;
-}
-
-+ (NSDictionary *)encoderCapabilities {
-    NSMutableArray *rows = [NSMutableArray array];
-    // ARC 下 C 结构体不能放强引用 ObjC 对象，名字用 const char * 再转。
-    struct { CFStringRef profile; const char *name; CMVideoCodecType codec; } cases[] = {
-        { kVTProfileLevel_H264_Baseline_AutoLevel, "H264-Baseline", kCMVideoCodecType_H264 },
-        { kVTProfileLevel_H264_Main_AutoLevel,     "H264-Main",     kCMVideoCodecType_H264 },
-        { kVTProfileLevel_H264_High_AutoLevel,     "H264-High",     kCMVideoCodecType_H264 },
-        { kVTProfileLevel_HEVC_Main_AutoLevel,     "HEVC-Main",     kCMVideoCodecType_HEVC },
-    };
-    int rasters[][2] = { {1920, 1080}, {2560, 1440}, {3840, 2160} };
-    for (int c = 0; c < 4; c++) {
-        for (int i = 0; i < 3; i++) {
-            NSString *label = [NSString stringWithUTF8String:cases[c].name];
-            [rows addObject:P0ProbeEncoder(cases[c].codec, label,
-                                           cases[c].profile, rasters[i][0], rasters[i][1])];
-        }
-    }
-
-    // OpenDisplay PR #288：H.264 High@L5.2 有吞吐上限，直接请求 5K 会让
-    // VideoToolbox 返回成功回调却不产出 buffer（表现为黑屏）。这里给出建议工作点。
-    return @{
-        @"rows": rows,
-        @"note": @"Intel 上以 H264-Main/Baseline 4:2:0 为基线；HEVC-Main 仅在 supported && hardwareAccelerated 时启用",
-        @"safeH264OperatingPoint": @"4096x2304@55 (H264 High@L5.2 吞吐上限内的安全点，来自 PR #288 实测)",
-    };
 }
 
 #pragma mark - Frame sink (SCStreamOutput + VideoToolbox loopback)
@@ -366,7 +309,66 @@ static NSDictionary *P0LumaStats(CVPixelBufferRef pb) {
 
 @end
 
-#pragma mark - Capture
+#pragma mark - PipelineProbe
+
+@implementation PipelineProbe
+
++ (NSArray<NSNumber *> * _Nullable)shareableDisplayIDsWithError:(NSError * _Nullable * _Nullable)error {
+    SCShareableContent *content = P0ShareableContent(error);
+    if (!content) return nil;
+    NSMutableArray *ids = [NSMutableArray array];
+    for (SCDisplay *d in content.displays) [ids addObject:@(d.displayID)];
+    return ids;
+}
+
++ (BOOL)waitForDisplayIDs:(NSArray<NSNumber *> *)ids
+                timeoutMs:(int)timeoutMs
+                 lastSeen:(NSArray<NSNumber *> * _Nullable * _Nullable)lastSeen {
+    NSSet *want = [NSSet setWithArray:ids];
+    int elapsed = 0;
+    NSArray *seen = @[];
+    while (elapsed <= timeoutMs) {
+        NSError *err = nil;
+        NSArray *now = [self shareableDisplayIDsWithError:&err];
+        seen = now ?: @[];
+        if (err) P0Error(@"SCShareableContent: %@", err.localizedDescription);
+        if ([want isSubsetOfSet:[NSSet setWithArray:seen]]) {
+            if (lastSeen) *lastSeen = seen;
+            return YES;
+        }
+        P0SleepMs(200);
+        elapsed += 200;
+    }
+    if (lastSeen) *lastSeen = seen;
+    return NO;
+}
+
++ (NSDictionary *)encoderCapabilities {
+    NSMutableArray *rows = [NSMutableArray array];
+    // ARC 下 C 结构体不能放强引用 ObjC 对象，名字用 const char * 再转。
+    struct { CFStringRef profile; const char *name; CMVideoCodecType codec; } cases[] = {
+        { kVTProfileLevel_H264_Baseline_AutoLevel, "H264-Baseline", kCMVideoCodecType_H264 },
+        { kVTProfileLevel_H264_Main_AutoLevel,     "H264-Main",     kCMVideoCodecType_H264 },
+        { kVTProfileLevel_H264_High_AutoLevel,     "H264-High",     kCMVideoCodecType_H264 },
+        { kVTProfileLevel_HEVC_Main_AutoLevel,     "HEVC-Main",     kCMVideoCodecType_HEVC },
+    };
+    int rasters[][2] = { {1920, 1080}, {2560, 1440}, {3840, 2160} };
+    for (int c = 0; c < 4; c++) {
+        for (int i = 0; i < 3; i++) {
+            NSString *label = [NSString stringWithUTF8String:cases[c].name];
+            [rows addObject:P0ProbeEncoder(cases[c].codec, label,
+                                           cases[c].profile, rasters[i][0], rasters[i][1])];
+        }
+    }
+
+    // OpenDisplay PR #288：H.264 High@L5.2 有吞吐上限，直接请求 5K 会让
+    // VideoToolbox 返回成功回调却不产出 buffer（表现为黑屏）。这里给出建议工作点。
+    return @{
+        @"rows": rows,
+        @"note": @"Intel 上以 H264-Main/Baseline 4:2:0 为基线；HEVC-Main 仅在 supported && hardwareAccelerated 时启用",
+        @"safeH264OperatingPoint": @"4096x2304@55 (H264 High@L5.2 吞吐上限内的安全点，来自 PR #288 实测)",
+    };
+}
 
 + (NSDictionary *)captureDisplayID:(CGDirectDisplayID)displayID
                         durationMs:(int)durationMs
@@ -386,6 +388,17 @@ static NSDictionary *P0LumaStats(CVPixelBufferRef pb) {
         return @{ @"displayID": @(displayID), @"ok": @NO,
                   @"error": @"该 displayID 不在 SCShareableContent.displays 中（Tahoe stale display 的典型症状）",
                   @"visibleIDs": [self shareableDisplayIDsWithError:NULL] ?: @[] };
+    }
+
+    // 拒绝退化 mode：对 1x1 虚拟屏启动 SCK 捕获是 2026-11-14 WindowServer
+    // 挂起事故的疑似触发点之一。mode 未提交时宁可失败，绝不尝试捕获。
+    CGDisplayModeRef curMode = CGDisplayCopyDisplayMode(displayID);
+    size_t mw = curMode ? CGDisplayModeGetWidth(curMode) : 0;
+    size_t mh = curMode ? CGDisplayModeGetHeight(curMode) : 0;
+    if (curMode) CGDisplayModeRelease(curMode);
+    if (mw < 2 || mh < 2) {
+        return @{ @"displayID": @(displayID), @"ok": @NO,
+                  @"error": [NSString stringWithFormat:@"退化 mode %zux%zu（未提交），拒绝捕获", mw, mh] };
     }
 
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:target excludingWindows:@[]];
@@ -420,6 +433,11 @@ static NSDictionary *P0LumaStats(CVPixelBufferRef pb) {
     }];
     dispatch_semaphore_wait(started, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
     if (startErr) {
+        // 失败路径也必须收尾：半启动的 SCStream 若直接释放，其异步 teardown
+        // 会与调用方随后的虚拟屏销毁竞争。best-effort stop 后再返回。
+        dispatch_semaphore_t stopSem = dispatch_semaphore_create(0);
+        [stream stopCaptureWithCompletionHandler:^(NSError *e) { dispatch_semaphore_signal(stopSem); }];
+        dispatch_semaphore_wait(stopSem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
         return @{ @"displayID": @(displayID), @"ok": @NO,
                   @"error": [NSString stringWithFormat:@"startCapture: %@", startErr.localizedDescription] };
     }

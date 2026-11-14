@@ -8,6 +8,14 @@ P0-TahoeProbe/diag-*/
 P0-TahoeProbe/p0-diag-*.tar.gz
 P0-TahoeProbe.zip
 
+# 临时诊断二进制 / 调试符号 / 运行日志（diag.m、diag2.m 源码作为实验证据保留）
+P0-TahoeProbe/diag
+P0-TahoeProbe/diag2
+*.dSYM/
+*.jsonl
+*.stderr.log
+P0-TahoeProbe/build*.log
+
 # macOS / Python 噪声
 .DS_Store
 __pycache__/

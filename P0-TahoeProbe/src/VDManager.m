@@ -20,7 +20,28 @@ static const uint32_t kSerialBase  = 0x1000;
 @property (nonatomic, strong) NSMutableArray<id> *heldDescriptors;
 @property (nonatomic, strong) NSMutableArray<dispatch_queue_t> *heldQueues;
 @property (nonatomic, assign) BOOL promoted;
+@property (nonatomic, assign, readwrite) BOOL windowServerHung;
 @end
+
+// initWithDescriptor:/applySettings: 是对 WindowServer 的同步 IPC，无系统级超时。
+// 2026-11-14 实测：WindowServer 挂起时这两个调用会永久阻塞，探针若继续重试
+// 会加剧挂起直至 watchdog 杀掉 WindowServer（全屏黑屏、强制注销）。
+// 这里放到工作线程并加 8s 死线；超时即置 windowServerHung，调用方必须整体中止。
+// 被阻塞的工作线程无法安全取消，但进程随后退出，不会持续施压。
+static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nullable (^block)(void)) {
+    __block id result = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        result = block();
+        dispatch_semaphore_signal(sem);
+    });
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC)) != 0) {
+        P0Error(@"%@ 超时(8s)：WindowServer 疑似挂起，立即中止全部建屏动作", label);
+        mgr.windowServerHung = YES;
+        return nil;
+    }
+    return result;
+}
 
 @implementation VDManager
 
@@ -165,14 +186,24 @@ static const uint32_t kSerialBase  = 0x1000;
         id settings = [self makeSettingsForConfig:initialCfg];
         if (!desc || !settings) { P0Error(@"屏 #%lu descriptor/settings 构造失败", (unsigned long)i + 1); allOK = NO; break; }
 
-        id rawDisplay = [displayCls alloc];
-        id<VD_Display> display = [(id<VD_Display>)rawDisplay initWithDescriptor:desc];
+        id<VD_Display> display = P0CallSPIWithTimeout(@"initWithDescriptor:", self, ^id{
+            return [(id<VD_Display>)[displayCls alloc] initWithDescriptor:desc];
+        });
         if (!display) {
-            P0Error(@"屏 #%lu initWithDescriptor: 返回 nil（identity 可能被拒绝）", (unsigned long)i + 1);
+            if (!self.windowServerHung) {
+                P0Error(@"屏 #%lu initWithDescriptor: 返回 nil（identity 可能被拒绝）", (unsigned long)i + 1);
+            }
             allOK = NO;
             break;
         }
-        BOOL applied = [display applySettings:settings];
+        // 15.5 实测：attach 未完成时 applySettings 会被 WindowServer 吞掉（mode 停在 1x1）。
+        // 先给注册一点时间，再提交首个 mode；后续仍有 waitUntilModeMatches 兜底。
+        P0SleepMs(500);
+        NSNumber *appliedNum = P0CallSPIWithTimeout(@"applySettings:", self, ^id{
+            return @([display applySettings:settings]);
+        });
+        if (self.windowServerHung) { allOK = NO; break; }
+        BOOL applied = [appliedNum boolValue];
         CGDirectDisplayID did = [display displayID];
 
         // 顺序很重要：必须先把对象存进数组，绝不能让 ARC 在作用域末尾释放，
@@ -193,30 +224,87 @@ static const uint32_t kSerialBase  = 0x1000;
             @"productID": @(kProductBase + _identityOffset),
             @"serialNum": @(kSerialBase + (uint32_t)i + _identityOffset),
         });
-        if (!applied) allOK = NO;
+        if (!applied) { allOK = NO; break; }
+
+        // 逐屏串行提交：等这一块屏的 mode 真正落地，再建下一块。
+        // 2026-11-14 事故日志显示两块屏同时处于未提交状态时 WindowServer 已开始异常
+        // （active=false、mode 串号），并发重配置会把小问题放大成挂起。
+        BOOL committed = [self waitModeForIndex:i conservative:_conservativeFirst timeoutMs:6000];
+        P0Emit(@"mode-commit", @{ @"index": @(i), @"displayID": @(did), @"ok": @(committed) });
+        if (!committed || self.windowServerHung) { allOK = NO; break; }
     }
 
     if (!allOK) [self destroyAll];
     return allOK;
 }
 
+// 单屏 mode 提交等待：只轮询 / 只补 apply 这一块屏，不触碰其它屏。
+- (BOOL)waitModeForIndex:(NSUInteger)i conservative:(BOOL)conservative timeoutMs:(int)timeoutMs {
+    NSDictionary *cfg = [self effectiveConfigForIndex:i conservative:conservative];
+    NSUInteger w = [cfg[@"width"] unsignedIntegerValue];
+    NSUInteger h = [cfg[@"height"] unsignedIntegerValue];
+    id<VD_Display> d = _heldDisplays[i];
+    int elapsed = 0;
+    BOOL reapplied = NO;
+    while (elapsed < timeoutMs) {
+        if (self.windowServerHung) return NO;
+        CGDisplayModeRef m = CGDisplayCopyDisplayMode([d displayID]);
+        BOOL match = m && CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h;
+        if (m) CGDisplayModeRelease(m);
+        if (match) return YES;
+        if (!reapplied && elapsed >= timeoutMs / 2) {
+            // 首个 apply 可能被 attach 过程吞掉（diag2 E 实证），中途只补这一块屏。
+            P0Log(@"屏 #%lu mode 尚未提交，中途补一次 applySettings", (unsigned long)i + 1);
+            id settings = [self makeSettingsForConfig:cfg];
+            if (settings) {
+                P0CallSPIWithTimeout(@"applySettings:", self, ^id{
+                    return @([d applySettings:settings]);
+                });
+            }
+            if (self.windowServerHung) return NO;
+            reapplied = YES;
+        }
+        P0SleepMs(100);
+        elapsed += 100;
+    }
+    P0Emit(@"mode-wait-timeout", @{
+        @"index": @(i),
+        @"timeoutMs": @(timeoutMs),
+        @"conservative": @(conservative),
+        @"detail": [self liveness],
+    });
+    return NO;
+}
+
 - (void)destroyAll {
+    if (self.windowServerHung) {
+        // WindowServer 挂起时，释放 CGVirtualDisplay 触发的注销 IPC 同样会永久阻塞。
+        // 故意泄漏这些对象，由进程退出兜底；绝不能在这里再发 IPC。
+        P0Error(@"WindowServer 疑似挂起，跳过虚拟屏释放（进程退出时由系统回收）");
+        return;
+    }
     P0Log(@"销毁 %lu 块虚拟屏（对象释放即注销）", (unsigned long)_heldDisplays.count);
     [self.heldDisplays removeAllObjects];
     [self.heldDescriptors removeAllObjects];
     [self.heldQueues removeAllObjects];
     _promoted = NO;
-    // 给 WindowServer 一点时间处理注销，否则立刻重建可能命中同一个 stale identity。
-    P0SleepMs(300);
+    // 给 WindowServer 足够时间处理注销再重建。300ms 太短：高频热插拔是
+    // 2026-11-14 WindowServer 挂起事故的诱因之一，放宽到 1.5s。
+    P0SleepMs(1500);
 }
 
 - (BOOL)applyConfiguredDimsConservative:(BOOL)conservative {
+    if (self.windowServerHung) return NO;
     BOOL allOK = YES;
     for (NSUInteger i = 0; i < _heldDisplays.count; i++) {
         NSDictionary *cfg = [self effectiveConfigForIndex:i conservative:conservative];
         id settings = [self makeSettingsForConfig:cfg];
         id<VD_Display> display = _heldDisplays[i];
-        BOOL ok = settings ? [display applySettings:settings] : NO;
+        NSNumber *okNum = settings ? P0CallSPIWithTimeout(@"applySettings:", self, ^id{
+            return @([display applySettings:settings]);
+        }) : nil;
+        if (self.windowServerHung) return NO;
+        BOOL ok = [okNum boolValue];
         P0Emit(@"applySettings", @{
             @"index": @(i),
             @"displayID": @([display displayID]),
@@ -295,6 +383,38 @@ static const uint32_t kSerialBase  = 0x1000;
     }
     P0Emit(@"liveness-timeout", @{
         @"timeoutMs": @(timeoutMs),
+        @"detail": [self liveness],
+    });
+    return NO;
+}
+
+- (BOOL)waitUntilModeMatchesTimeoutMs:(int)timeoutMs conservative:(BOOL)conservative {
+    int elapsed = 0;
+    BOOL reapplied = NO;
+    while (elapsed < timeoutMs) {
+        BOOL allMatch = _heldDisplays.count > 0;
+        for (NSUInteger i = 0; i < _heldDisplays.count; i++) {
+            NSDictionary *cfg = [self effectiveConfigForIndex:i conservative:conservative];
+            NSUInteger w = [cfg[@"width"] unsignedIntegerValue];
+            NSUInteger h = [cfg[@"height"] unsignedIntegerValue];
+            id<VD_Display> d = _heldDisplays[i];
+            CGDisplayModeRef m = CGDisplayCopyDisplayMode([d displayID]);
+            BOOL match = m && CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h;
+            if (m) CGDisplayModeRelease(m);
+            if (!match) { allMatch = NO; break; }
+        }
+        if (allMatch) return YES;
+        if (!reapplied && elapsed >= timeoutMs / 2) {
+            P0Log(@"mode 尚未提交（可能仍为 1x1），中途补一次 applySettings");
+            [self applyConfiguredDimsConservative:conservative];
+            reapplied = YES;
+        }
+        P0SleepMs(100);
+        elapsed += 100;
+    }
+    P0Emit(@"mode-wait-timeout", @{
+        @"timeoutMs": @(timeoutMs),
+        @"conservative": @(conservative),
         @"detail": [self liveness],
     });
     return NO;

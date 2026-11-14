@@ -126,6 +126,41 @@ NSDictionary *P0SystemInfo(void) {
     };
 }
 
+NSDictionary *P0OSPolicy(void) {
+    NSOperatingSystemVersion v = [NSProcessInfo processInfo].operatingSystemVersion;
+    NSInteger major = v.majorVersion;
+    NSString *name;
+    P0OSFamily family;
+    switch (major) {
+        case 26: name = @"Tahoe";   family = P0OSFamilyTahoe;   break;
+        case 15: name = @"Sequoia"; family = P0OSFamilySequoia; break;
+        case 14: name = @"Sonoma";  family = P0OSFamilyOther;   break;
+        case 13: name = @"Ventura"; family = P0OSFamilyOther;   break;
+        default:
+            name = [NSString stringWithFormat:@"macOS %ld", (long)major];
+            family = P0OSFamilyOther;
+            break;
+    }
+    BOOL tahoe = (family == P0OSFamilyTahoe);
+    // Tahoe 专属 workaround（保守 canvas / identity walk / offset 持久化）只在 26 上启用；
+    // Sequoia 15.5 实证：直建目标分辨率 + 单次 apply 即可提交（diag2 D/F），
+    // 而两次 WindowServer 事故恰恰都发生在保守 canvas→promote 路径上。
+    // 其它版本走与 Sequoia 相同的最小风险路径，结论仅供参考。
+    return @{
+        @"osMajor": @(major),
+        @"osVersion": [NSString stringWithFormat:@"%ld.%ld.%ld",
+                       (long)v.majorVersion, (long)v.minorVersion, (long)v.patchVersion],
+        @"osName": name,
+        @"family": @(family),
+        @"conservativeFirst": @(tahoe),
+        @"identityWalk": @(tahoe),
+        @"persistIdentity": @(tahoe),
+        @"maxRetries": @(tahoe ? 4 : 1),
+        // mode 提交等待全版本必需：15.5 实测 applySettings 异步生效（1–3s）。
+        @"modeWaitMs": @6000,
+    };
+}
+
 NSArray<NSDictionary *> *P0DisplayList(void) {
     NSMutableArray<NSNumber *> *candidates = [NSMutableArray array];
 
@@ -158,7 +193,10 @@ NSArray<NSDictionary *> *P0DisplayList(void) {
         CGRect bounds = CGDisplayBounds(did);
         BOOL online = CGDisplayIsOnline(did);
         BOOL active = CGDisplayIsActive(did);
-        if (CGRectIsEmpty(bounds) && !online && !active) continue;
+        // 实测（15.5 Intel）：不存在的 displayID 上 CGDisplayIsOnline/IsActive 也返回 true，
+        // 不能靠它们过滤 1..64 补查带来的幽灵项。真实屏与 stale 屏的 bounds 都非空，
+        // 空 bounds 直接跳过即可，stale 僵尸项（bounds 非空但 offline）仍会被列出。
+        if (CGRectIsEmpty(bounds)) continue;
 
         size_t pixelW = 0, pixelH = 0, pointW = 0, pointH = 0;
         CGDisplayModeRef mode = CGDisplayCopyDisplayMode(did);

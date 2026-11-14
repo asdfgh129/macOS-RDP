@@ -22,9 +22,14 @@ echo "SDK   : $SDKROOT"
 echo "CLANG : $CLANG"
 
 MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
-if [ "$MAJOR" != "26" ]; then
-  echo "警告：当前 macOS 大版本是 $MAJOR，本工程的目标是被控端 Tahoe 26。" >&2
-  echo "      probe / capabilities 仍可采集环境，但 verify 的结论不作数。" >&2
+if [ "$MAJOR" = "26" ]; then
+  echo "目标系统 Tahoe 26：verify 将启用保守 canvas + identity walk 全套 workaround。"
+elif [ "$MAJOR" = "15" ]; then
+  echo "当前 Sequoia 15：verify 走本机实证的基线路径（直建目标分辨率、固定 identity、失败即止）。"
+  echo "      这是冒烟基线，Tahoe 结论仍以被控端真机为准。"
+else
+  echo "警告：当前 macOS 大版本是 $MAJOR，既非目标 Tahoe 26 也非已验证的 Sequoia 15。" >&2
+  echo "      verify 走最小风险路径，结论仅供参考。" >&2
 fi
 
 SOURCES=(
@@ -43,6 +48,7 @@ FRAMEWORKS=(
   -framework VideoToolbox
   -framework IOSurface
   -framework QuartzCore
+  -framework IOKit
 )
 
 for f in "${SOURCES[@]}"; do

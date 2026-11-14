@@ -10,6 +10,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 #import "CGVirtualDisplaySPI.h"
 #import "ProbeUtil.h"
 #import "VDManager.h"
@@ -68,6 +69,7 @@ static NSArray<NSDictionary *> *P0ParseSpec(NSString *spec) {
 static int P0CommandProbe(NSDictionary *args) {
     NSDictionary *env = P0SystemInfo();
     P0Emit(@"env", env);
+    P0Emit(@"os-policy", P0OSPolicy());
     P0Log(@"OS %@ / %@ / %@ / parent=%@", env[@"osVersion"], env[@"arch"],
           env[@"model"], env[@"parentApp"]);
 
@@ -98,8 +100,9 @@ static int P0CommandProbe(NSDictionary *args) {
     NSMutableArray *missing = [NSMutableArray array];
     for (NSString *r in required) {
         NSArray *kv = [r componentsSeparatedByString:@":"];
-        NSArray *sels = VDSelectorDump(kv[0]) ?: @[];
-        NSString *sel = [r substringFromIndex:kv[0].length + 1];
+        NSString *clsName = kv[0];
+        NSArray *sels = VDSelectorDump(clsName) ?: @[];
+        NSString *sel = [r substringFromIndex:clsName.length + 1];
         // 属性 getter（如 displayID）无尾冒号，setter / init 有，两种都接受。
         NSString *alt = [sel hasSuffix:@":"] ? [sel substringToIndex:sel.length - 1] : sel;
         if (![sels containsObject:sel] && ![sels containsObject:alt]) [missing addObject:r];
@@ -131,33 +134,66 @@ static int P0CommandCapabilities(void) {
     return 0;
 }
 
-// 建屏 + visibility + identity walk。成功返回一个已持有的 VDManager，失败返回 nil。
+// 建屏 + visibility。策略按 OS 版本分流（P0OSPolicy）：
+//  - Tahoe(26)：保守 canvas→promote、identity walk、offset 持久化（stale/poisoned workaround）；
+//  - Sequoia(15) 及其它：直建目标分辨率、固定 identity、失败即止，不做 Tahoe 专属重试。
+// 成功返回已持有的 VDManager；失败返回 nil，outReason 给出失败环节。
+// outHung=YES 表示 WindowServer 疑似挂起：调用方必须立即结束进程，不得再发任何 SPI。
 static VDManager * _Nullable P0EstablishDisplays(NSArray<NSDictionary *> *configs,
                                                   NSDictionary *args,
-                                                  uint32_t *outOffset) {
-    uint32_t base = args[@"fresh"] ? 0 : (uint32_t)[VDManager savedIdentityOffset];
+                                                  uint32_t *outOffset,
+                                                  BOOL *outHung,
+                                                  NSString * _Nullable * _Nullable outReason) {
+    NSDictionary *policy = P0OSPolicy();
+    BOOL walk = [policy[@"identityWalk"] boolValue];
+    BOOL conservative = args[@"direct"] ? NO : [policy[@"conservativeFirst"] boolValue];
+    uint32_t base = args[@"fresh"] ? 0 : (walk ? (uint32_t)[VDManager savedIdentityOffset] : 0);
     if (args[@"offset"]) base = (uint32_t)P0IntArg(args, @"offset", 0);
-    int maxRetries = P0IntArg(args, @"max-retries", 8);
-    BOOL direct = [args[@"direct"] boolValue];
+    int maxRetries = P0IntArg(args, @"max-retries", [policy[@"maxRetries"] intValue]);
     int visTimeout = P0IntArg(args, @"visibility-timeout", 5000);
+    int modeWaitMs = [policy[@"modeWaitMs"] intValue];
 
+    P0Log(@"OS 策略：%@（macOS %@）→ conservativeFirst=%d identityWalk=%d maxRetries=%d",
+          policy[@"osName"], policy[@"osMajor"], conservative, walk, maxRetries);
+
+    NSString *reason = @"IDENTITY_WALK_EXHAUSTED";
     for (int attempt = 0; attempt <= maxRetries; attempt++) {
-        uint32_t offset = base + (uint32_t)attempt;
-        P0Log(@"identity 尝试 %d/%d，offset=%u (vendor/product/serial 同步游走)",
-              attempt + 1, maxRetries + 1, offset);
+        uint32_t offset = walk ? base + (uint32_t)attempt : base;
+        P0Log(@"建屏尝试 %d/%d，offset=%u%@", attempt + 1, maxRetries + 1, offset,
+              walk ? @"（vendor/product/serial 同步游走）" : @"（固定 identity）");
 
         VDManager *mgr = [[VDManager alloc] initWithConfigs:configs
                                             identityOffset:offset
-                                         conservativeFirst:!direct];
-        if (![mgr createAll]) { [mgr destroyAll]; continue; }
+                                         conservativeFirst:conservative];
+        if (![mgr createAll]) {
+            BOOL hung = mgr.windowServerHung;
+            [mgr destroyAll];
+            if (hung) { if (outHung) *outHung = YES; return nil; }
+            reason = @"CREATE_FAILED";
+            if (!walk) break;   // 非 Tahoe：不做 identity 重试，避免向异常 WindowServer 继续施压
+            continue;
+        }
 
         if (![mgr waitUntilUsableTimeoutMs:3000]) {
-            P0Error(@"online/active 检查未通过 —— Tahoe stale display 特征，换 identity 重建");
+            P0Error(@"online/active 检查未通过");
             P0Emit(@"liveness", @{ @"attempt": @(attempt), @"detail": [mgr liveness] });
             [mgr destroyAll];
+            reason = @"LIVENESS_FAILED";
+            if (!walk) break;
             continue;
         }
         P0Emit(@"liveness", @{ @"attempt": @(attempt), @"detail": [mgr liveness] });
+
+        // createAll 已逐屏等过 mode 提交，这里是双保险（promote 后还会再查一次）。
+        if (![mgr waitUntilModeMatchesTimeoutMs:modeWaitMs conservative:conservative]) {
+            if (mgr.windowServerHung) { if (outHung) *outHung = YES; return nil; }
+            P0Error(@"mode 未提交到请求尺寸");
+            [mgr destroyAll];
+            reason = @"MODE_COMMIT_FAILED";
+            if (!walk) break;
+            continue;
+        }
+        P0Emit(@"mode-wait", @{ @"attempt": @(attempt), @"ok": @YES, @"detail": [mgr liveness] });
 
         NSArray *seen = nil;
         BOOL visible = [PipelineProbe waitForDisplayIDs:mgr.displayIDs
@@ -170,38 +206,48 @@ static VDManager * _Nullable P0EstablishDisplays(NSArray<NSDictionary *> *config
             @"ok": @(visible),
         });
         if (!visible) {
-            P0Error(@"虚拟屏未出现在 SCShareableContent —— 命中 Tahoe 的 poisoned identity，换一组重建");
+            P0Error(@"虚拟屏未出现在 SCShareableContent");
             [mgr destroyAll];
+            reason = @"VISIBILITY_FAILED";
+            if (!walk) break;
             continue;
         }
 
-        NSError *saveErr = nil;
-        [VDManager saveIdentityOffset:offset error:&saveErr];
-        if (saveErr) P0Error(@"identity offset 持久化失败: %@", saveErr.localizedDescription);
+        if (walk && [policy[@"persistIdentity"] boolValue]) {
+            NSError *saveErr = nil;
+            [VDManager saveIdentityOffset:offset error:&saveErr];
+            if (saveErr) P0Error(@"identity offset 持久化失败: %@", saveErr.localizedDescription);
+        }
         if (outOffset) *outOffset = offset;
 
-        // 保守 canvas → 目标分辨率；失败则事务性回退。
-        if (!direct) {
+        // 保守 canvas → 目标分辨率（仅 Tahoe 默认路径）；失败则事务性回退。
+        if (conservative) {
             if ([mgr promoteToTarget]) {
+                BOOL modeOK = [mgr waitUntilModeMatchesTimeoutMs:modeWaitMs conservative:NO];
                 BOOL stillVisible = [PipelineProbe waitForDisplayIDs:mgr.displayIDs
                                                          timeoutMs:3000 lastSeen:NULL];
                 BOOL stillUsable = [mgr waitUntilUsableTimeoutMs:2000];
-                P0Emit(@"promote", @{ @"ok": @(stillVisible && stillUsable),
+                P0Emit(@"promote", @{ @"ok": @(modeOK && stillVisible && stillUsable),
+                                      @"modeCommitted": @(modeOK),
                                       @"stillVisible": @(stillVisible),
                                       @"stillUsable": @(stillUsable),
                                       @"detail": [mgr liveness] });
-                if (!stillVisible || !stillUsable) {
-                    P0Error(@"提升分辨率后虚拟屏丢失，回退到保守 canvas（PR #288 的事务性回退）");
+                if (!modeOK || !stillVisible || !stillUsable) {
+                    P0Error(@"提升分辨率后虚拟屏丢失或 mode 未提交，回退到保守 canvas（PR #288 的事务性回退）");
                     [mgr rollbackToConservative];
+                    [mgr waitUntilModeMatchesTimeoutMs:modeWaitMs conservative:YES];
                     [PipelineProbe waitForDisplayIDs:mgr.displayIDs timeoutMs:3000 lastSeen:NULL];
                 }
             } else {
                 P0Error(@"applySettings 提升失败，保持保守 canvas");
                 [mgr rollbackToConservative];
+                [mgr waitUntilModeMatchesTimeoutMs:modeWaitMs conservative:YES];
             }
         }
+        if (mgr.windowServerHung) { if (outHung) *outHung = YES; return nil; }
         return mgr;
     }
+    if (outReason) *outReason = reason;
     return nil;
 }
 
@@ -212,13 +258,28 @@ static int P0CommandVerify(NSDictionary *args, BOOL hold) {
     int holdSeconds = P0IntArg(args, @"hold-seconds", 60);
     BOOL withEncoder = !args[@"no-encode"];
 
+    // 防御性措施：测试期间保持显示管线活跃。注意 2026-11-14 事故复盘已确认
+    // displayState=OFF 是 WindowServer 挂起的结果而非诱因（当时屏幕常亮），
+    // 这里只是排除休眠这一额外变量，不是事故修复本身。
+    IOPMAssertionID displayAssertion = kIOPMNullAssertionID;
+    IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep,
+                                kIOPMAssertionLevelOn,
+                                CFSTR("P0-TahoeProbe: keep displays awake during virtual display test"),
+                                &displayAssertion);
+    IOPMAssertionID activityAssertion = kIOPMNullAssertionID;
+    IOPMAssertionDeclareUserActivity(CFSTR("P0-TahoeProbe verify"), kIOPMUserActiveLocal,
+                                     &activityAssertion);
+
+    NSDictionary *policy = P0OSPolicy();
     P0Emit(@"env", P0SystemInfo());
+    P0Emit(@"os-policy", policy);
     P0Emit(@"plan", @{
         @"spec": spec,
         @"displays": configs,
         @"durationMs": @(duration),
         @"withEncoder": @(withEncoder),
-        @"conservativeFirst": @(!args[@"direct"]),
+        @"conservativeFirst": @(args[@"direct"] ? NO : [policy[@"conservativeFirst"] boolValue]),
+        @"identityWalk": policy[@"identityWalk"],
         @"identityPath": [VDManager identityPath],
     });
 
@@ -231,19 +292,27 @@ static int P0CommandVerify(NSDictionary *args, BOOL hold) {
     });
     if (!before) {
         P0Error(@"屏幕录制权限未就绪，先运行 `p0probe probe` 并按提示授权");
+        if (displayAssertion != kIOPMNullAssertionID) IOPMAssertionRelease(displayAssertion);
+        if (activityAssertion != kIOPMNullAssertionID) IOPMAssertionRelease(activityAssertion);
         return 1;
     }
 
     if (withEncoder) P0Emit(@"encoder-capabilities", [PipelineProbe encoderCapabilities]);
 
     uint32_t usedOffset = 0;
-    VDManager *mgr = P0EstablishDisplays(configs, args, &usedOffset);
+    BOOL hung = NO;
+    NSString *failReason = nil;
+    VDManager *mgr = P0EstablishDisplays(configs, args, &usedOffset, &hung, &failReason);
     if (!mgr) {
         P0Emit(@"verdict", @{
             @"pass": @NO,
-            @"reason": @"IDENTITY_WALK_EXHAUSTED",
-            @"detail": @"所有 identity 均无法让虚拟屏同时满足 online/active 与 SCShareableContent 可见",
+            @"reason": hung ? @"WINDOWSERVER_SPI_TIMEOUT" : (failReason ?: @"IDENTITY_WALK_EXHAUSTED"),
+            @"detail": hung
+                ? @"SPI 同步调用超时，WindowServer 疑似挂起：已立即中止，未再重试。请检查系统状态（必要时重启）后再测"
+                : @"建屏链路未通过，见 reason 字段定位环节（CREATE/LIVENESS/MODE_COMMIT/VISIBILITY/WALK）",
         });
+        if (displayAssertion != kIOPMNullAssertionID) IOPMAssertionRelease(displayAssertion);
+        if (activityAssertion != kIOPMNullAssertionID) IOPMAssertionRelease(activityAssertion);
         return 1;
     }
 
@@ -274,10 +343,23 @@ static int P0CommandVerify(NSDictionary *args, BOOL hold) {
         if (withEncoder && [r[@"encodedFrames"] intValue] == 0) encodedOK = NO;
     }
 
+    // 通过判据必须包含「达到目标分辨率」：promote 失败回退后捕获仍可能成功，
+    // 但那只是保守 canvas 跑通，不代表目标分辨率可用（README 第 5 节）。
+    BOOL targetReached = YES;
+    for (NSUInteger i = 0; i < configs.count && i < mgr.displayIDs.count; i++) {
+        CGDisplayModeRef m = CGDisplayCopyDisplayMode(mgr.displayIDs[i].unsignedIntValue);
+        NSUInteger w = [configs[i][@"width"] unsignedIntegerValue];
+        NSUInteger h = [configs[i][@"height"] unsignedIntegerValue];
+        BOOL match = m && CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h;
+        if (m) CGDisplayModeRelease(m);
+        if (!match) targetReached = NO;
+    }
+
     NSDictionary *summary = @{
-        @"pass": @(allCaptured && noBlack && (!withEncoder || encodedOK)),
+        @"pass": @(allCaptured && noBlack && targetReached && (!withEncoder || encodedOK)),
         @"allCaptured": @(allCaptured),
         @"noBlackFrames": @(noBlack),
+        @"targetResolutionReached": @(targetReached),
         @"encoderProducedFrames": @(encodedOK),
         @"identityOffset": @(usedOffset),
         @"displays": mgr.displayIDs,
@@ -292,6 +374,8 @@ static int P0CommandVerify(NSDictionary *args, BOOL hold) {
     P0Log(@"结果已写入 ./p0_result.json");
 
     [mgr destroyAll];
+    if (displayAssertion != kIOPMNullAssertionID) IOPMAssertionRelease(displayAssertion);
+    if (activityAssertion != kIOPMNullAssertionID) IOPMAssertionRelease(activityAssertion);
     return [summary[@"pass"] boolValue] ? 0 : 1;
 }
 
@@ -316,15 +400,17 @@ int main(int argc, const char *argv[]) {
             rc = P0CommandVerify(args, YES);
         } else {
             fprintf(stderr,
-                "P0-TahoeProbe — Intel Mac / macOS 26 Tahoe 虚拟屏 P0 验证\n\n"
+                "P0-TahoeProbe — Intel Mac 虚拟屏 P0 验证（自动识别 Tahoe 26 / Sequoia 15 并分流）\n\n"
                 "  p0probe probe  --capabilities              环境与私有 API 签名探测\n"
                 "  p0probe capabilities                       仅探测 VideoToolbox 编码档位\n"
                 "  p0probe verify [--spec 1920x1080x0,2560x1440x0]\n"
                 "                 [--duration 4000] [--no-encode] [--direct]\n"
-                "                 [--offset N] [--fresh] [--max-retries 8]\n"
+                "                 [--offset N] [--fresh] [--max-retries N]\n"
                 "                 [--visibility-timeout 5000]   完整 P0 链路\n"
                 "  p0probe hold   --hold-seconds 60 [...]       建屏后保持，便于在 GUI 核对\n\n"
-                "spec 格式：WxHxHIDPI，多屏用逗号分隔；HIDPI=1 时 descriptor 自动用 2 倍像素。\n");
+                "spec 格式：WxHxHIDPI，多屏用逗号分隔；HIDPI=1 时 descriptor 自动用 2 倍像素。\n"
+                "OS 策略：Tahoe 26 默认保守 canvas+identity walk（max-retries 4）；\n"
+                "         Sequoia 15 及其它默认直建目标分辨率、固定 identity（max-retries 1）。\n");
             rc = 0;
         }
         return rc;

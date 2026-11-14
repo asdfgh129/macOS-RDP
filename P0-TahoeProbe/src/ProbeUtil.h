@@ -27,6 +27,17 @@ NSString *P0RectString(CGRect rect);
 // 环境指纹：OS 版本 / build / 架构 / 机型 / 已登录 GUI 会话判断。
 NSDictionary *P0SystemInfo(void);
 
+// 系统版本族：决定建屏策略走哪条路径（见 README 第 12.5 节）。
+typedef NS_ENUM(NSInteger, P0OSFamily) {
+    P0OSFamilyOther = 0,   // 其它 / 未知版本：走最小风险路径并提示结论仅供参考
+    P0OSFamilySequoia,     // macOS 15：本机实证过的基线路径（直建目标分辨率）
+    P0OSFamilyTahoe,       // macOS 26：stale / poisoned identity 全套 workaround
+};
+
+// 探测 OS 版本并返回该版本的建屏策略：
+// conservativeFirst / identityWalk / persistIdentity / maxRetries / modeWaitMs。
+NSDictionary *P0OSPolicy(void);
+
 // 用 Quartz 列出的当前 display 全量状态（含 offline 的 stale 项）。
 NSArray<NSDictionary *> *P0DisplayList(void);
 

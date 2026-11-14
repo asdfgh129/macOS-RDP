@@ -54,14 +54,16 @@
 
 ```
 P0-TahoeProbe/
-├── build.sh                     clang 一键编译
+├── build.sh                     clang 一键编译（按 OS 大版本提示走哪条路径）
+├── run_p0.sh                    一键运行 + 诊断回收（Tahoe 才跑 --direct 对照）
+├── check_static.py              跨平台静态自检（编码/括号/声明实现/参数一致性）
 ├── README.md
 └── src/
     ├── CGVirtualDisplaySPI.h    私有 API 的 protocol 重声明 + 运行时解析接口
-    ├── ProbeUtil.h/.m           日志、JSON 输出、环境指纹、Quartz display 列表、selector dump
-    ├── VDManager.h/.m           建屏 / liveness / identity walk / 保守 canvas 提升 / 销毁
+    ├── ProbeUtil.h/.m           日志、JSON 输出、环境指纹、OS 版本策略 P0OSPolicy、Quartz display 列表、selector dump
+    ├── VDManager.h/.m           逐屏串行建屏 / mode 提交等待 / liveness / identity walk / 保守 canvas 提升 / SPI 超时熔断 / 销毁
     ├── PipelineProbe.h/.m       SCK 可见性 / 逐屏捕获 / 亮度判黑 / VT 能力探测 / 编码环回
-    └── main.m                   probe / capabilities / verify / hold 四个子命令
+    └── main.m                   probe / capabilities / verify / hold 四个子命令 + 按 OS 分流的建屏编排
 ```
 
 ---
@@ -106,11 +108,19 @@ bash build.sh
 | `--spec WxHxHIDPI[,...]` | `1920x1080x0,2560x1440x0` | 屏幕数量、分辨率、是否 HiDPI |
 | `--duration MS` | 4000 | 捕获总时长，按屏数平分，每屏最少 1000ms |
 | `--no-encode` | 关 | 只验证捕获，跳过 VideoToolbox |
-| `--direct` | 关 | 跳过保守 canvas，直接按目标分辨率建屏（对照 PR #288） |
+| `--direct` | 关 | 强制直建目标分辨率、跳过保守 canvas（Tahoe 上作 PR #288 对照；Sequoia 默认本就直建） |
 | `--fresh` | 关 | 忽略 `~/.p0_identity.json`，从 offset 0 开始试 |
-| `--offset N` | 上次的成功值 | 指定 identity 起始偏移 |
-| `--max-retries N` | 8 | identity walk 最多换几组 |
+| `--offset N` | 上次的成功值 | 指定 identity 起始偏移（仅 Tahoe identity walk 用） |
+| `--max-retries N` | Tahoe 4 / 其它 1 | 建屏失败最多重试几组（2026-11-14 事故后下调，限制热插拔压力） |
 | `--visibility-timeout MS` | 5000 | 等虚拟屏出现在 `SCShareableContent` 的超时 |
+
+**OS 自动分流**：探针启动时用 `NSProcessInfo` 读系统大版本，`probe` / `verify` 都会先打一条 `os-policy` JSON 说明本机走哪条路径——
+
+- **Tahoe 26**：保守 canvas→promote、identity walk、offset 持久化（stale / poisoned identity 全套 workaround），`max-retries` 默认 4。
+- **Sequoia 15**：直建目标分辨率、固定 identity、失败即止，`max-retries` 默认 1。这是本机实证过的基线路径（见 12.5），**不把 Tahoe 的 workaround 套在 Sequoia 上**。
+- **其它版本**：走与 Sequoia 相同的最小风险路径，结论仅供参考。
+
+`--direct` / `--offset` / `--max-retries` 仍可手动覆盖默认。无论哪条路径，SPI 8s 死线 + 挂起熔断、逐屏 mode 提交等待、退化 mode 拒捕这些安全机制都生效。
 
 每行 stdout 都是单行 JSON（`stage` 字段标识阶段），日志走 stderr，可直接分离：
 
@@ -126,20 +136,23 @@ bash build.sh
 
 | stage | 通过条件 | 不通过说明什么 |
 |---|---|---|
-| `env` | `arch == x86_64`，`osVersion` 以 26. 开头 | 跑错机器了 |
+| `env` | `arch == x86_64` | 跑错机器了（本工程面向 Intel） |
+| `os-policy` | `osName` 与本机一致（Tahoe / Sequoia） | 版本探测异常；核对 `family` 决定走哪条建屏路径 |
 | `spi` | `allClassesResolved == true` | Tahoe 上私有类改名/迁移 framework，需重新逆向 |
 | `spi-signature-check` | `missing == []` | selector 漂移，要按 dump 结果改 `CGVirtualDisplaySPI.h` |
 | `sck-before` | `screenRecordingGranted == true` | 终端没拿到屏幕录制权限，后面全是假失败 |
 | `encoder-capabilities` | `H264-Main` 在 1920×1080 / 2560×1440 上 `supported=true` 且 `hardwareAccelerated=true` | Intel 硬编不可用，只能软编，延迟目标要重定 |
 | `create` | N 条，`applySettings=true`，displayID 非 0 | `initWithDescriptor:` 被拒 → identity 被污染 |
+| `mode-commit` | 每屏 `ok=true`（逐屏串行提交） | 该屏 mode 未落地；createAll 会中止，不再建下一块 |
 | `liveness` | 每条 `online=true, active=true, usable=true` | Tahoe stale display（bounds 非空但 offline） |
-| `visibility` | `ok=true` 且 `seen` 包含全部 `wanted` | **最关键的 Tahoe 判据**；失败会触发 identity walk |
-| `promote` | `ok=true` 且 `modePoints` 变成目标分辨率 | 提升后掉屏，工程会自动回退保守 canvas 并标记 |
+| `mode-wait` | `ok=true`，实际 mode 已落到请求的 points 尺寸 | applySettings 异步提交未完成（15.5 实测 1-3 秒）；停在 1×1 属退化态，禁止捕获 |
+| `visibility` | `ok=true` 且 `seen` 包含全部 `wanted` | **最关键的 Tahoe 判据**；Tahoe 失败会触发 identity walk，Sequoia 失败即止 |
+| `promote` | `ok=true` 且 `modePoints` 变成目标分辨率 | 仅 Tahoe 保守路径；提升后掉屏会自动回退保守 canvas 并标记 |
 | `capture` | `verdict=HAS_CONTENT`、`frames>0`、`fps≈55-60`、`suspectedBlackFrames` 远小于 frames | `NO_FRAMES_TCC_OR_STALE` 或 `MOSTLY_BLACK` |
 | `capture` 编码部分 | `encodedFrames>0`、`keyFrames>0`、`encodeErrors=0`、`decodedFrames>0` | 编码器不产出 buffer（PR #288 的吞吐上限问题） |
-| `verdict` | `pass=true` | 按下面决策树定位 |
+| `verdict` | `pass=true`（含 `targetResolutionReached=true`） | 按下面决策树定位；`reason=WINDOWSERVER_SPI_TIMEOUT` 时**立即停测**，见第 12 节 |
 
-**P0 通过的定义**：两块虚拟屏都满足 `online+active+SCK 可见`，捕获到非黑画面且帧率接近 60，H.264 编码与环回解码都产出帧。`encodeEnqueueP50Ms` 只反映入队开销，**不是**端到端延迟，端到端要等双机 spike 再测。
+**P0 通过的定义**：两块虚拟屏都满足 `online+active+SCK 可见`，**mode 实际落到目标分辨率**，捕获到非黑画面且帧率接近 60，H.264 编码与环回解码都产出帧。`encodeEnqueueP50Ms` 只反映入队开销，**不是**端到端延迟，端到端要等双机 spike 再测。
 
 ---
 
@@ -255,7 +268,7 @@ cd P0-TahoeProbe
 bash run_p0.sh
 ```
 
-依次执行：环境采集 → `bash build.sh` → `probe --capabilities`（不建屏）→ `verify`（默认保守 canvas）→ `verify --direct`（对照）→ 汇总 → 打包。
+依次执行：环境采集 → `bash build.sh` → `probe --capabilities`（不建屏）→ `verify`（按 OS 自动选路）→ `verify --direct`（对照，**仅 Tahoe**；Sequoia 默认本就直建，自动跳过）→ 汇总 → 打包。
 
 可选环境变量：`P0_QUICK=1` 跳过对照；`P0_RUN_HOLD=60` 额外保持 60 秒供肉眼核对排列 / 分辨率；`P0_EXTRA="--fresh --max-retries 12"` 透传；`P0_NO_BUILD=1` 改完代码只重跑。
 
@@ -309,3 +322,83 @@ bash run_p0.sh
 3. 补控制端 P0 四项（可另开 `P1-ClientProbe/`）；
 4. 双机联调，测 1080p60 glass-to-glass 延迟（目标：采集+编码 < 30ms）；
 5. 才进入正式产品骨架（SideScreen MacHost MIT / VirtualDisplayKit MIT）的落地。
+
+## 12. Sequoia 真机基线与 WindowServer 崩溃事故（2026-11-14）
+
+### 12.1 基线结果（本机 = 控制端规格：Macmini8,1 / i5-9500 / UHD 630 / macOS 15.5 24F74）
+
+- 编译修了三处：`PipelineProbe.m` 方法声明结构、`main.m` 对 `id` 用点语法、`build.sh` 补 `-framework IOKit`。
+- `spi-signature-check.missing = []`：15.5 Intel 上全部私有 selector 与重声明一致。
+- `encoder-capabilities`：H.264 Baseline/Main/High 与 HEVC Main 在 1080p/1440p/4K 全部可建会话且 `hardwareAccelerated = true`（UHD 630 QuickSync）。Intel 硬编这一最大不确定性**已排除**。
+- **关键实测发现**：`applySettings:` 是**异步提交**（本机约 1–3s），attach 期间的第一个 apply 可能被吞掉——ObjC 侧读回的 width/height 全对，但 `CGDisplayCopyDisplayMode` 停在 **1×1**。此时启动 SCK 捕获得到 `Start stream failed`。修复：建屏后等 500ms 再 apply；新增 `waitUntilModeMatchesTimeoutMs:`（6s 死线，中途补一次 apply），mode 未落地不进捕获；`captureDisplayID:` 对 <2×2 的退化 mode 直接拒捕。
+- 本机 `CGDisplayIsOnline/IsActive` 对不存在的 ID 也返回 true（会枚举出 64 块幽灵屏），`P0DisplayList` 改为以 bounds 非空为准。
+
+### 12.2 崩溃事故：两次 WindowServer 看门狗重启（强制注销）
+
+两次 `verify` 执行均导致黑屏闪烁 → WindowServer 被看门狗杀掉 → 用户被注销、所有进程终止。取证（`/Library/Logs/DiagnosticReports/WindowServer-2026-11-14-221946.ips` / `-222256.ips`，bug_type 409 `userspace_watchdog_timeout`）：
+
+- 挂起栈：`SkyLight → CoreDisplay → SkyLight → 内核等待`，即**显示重配置的同步 SPI IPC 卡死**，系统侧没有超时兜底；
+- 两次 crash 里 `p0probe` 都活着，主线程 `TH_WAIT`、turnstile 阻塞在 WindowServer 上，另一线程挂在 `com.apple.VirtualDisplayListener` 队列；
+- 两次 `displayState` 均为 **OFF**。
+
+**时间线复核（2026-11-14，本机屏幕全程常亮，用户确认未休眠）：**
+
+| 事件 | 时刻 | 证据 |
+|---|---|---|
+| verify 第 1 次（pid 3818） | 22:13:58 → 22:14:04 | `verify.jsonl`：1×1 退化 mode，`Start stream failed`，verdict pass=0 后正常退出 |
+| WindowServer 崩溃 #1 | 22:19:46 | `.ips`：p0probe pid **4592**（另一次运行）主线程阻塞在 WindowServer(pid 155) |
+| verify 第 2 次（pid 6144） | 22:21:56 起 | `verify2.jsonl`：22:21:58 建屏 → 22:22:09 已 `active=false`、两块屏 mode 串号成 2560×1440 |
+| WindowServer 崩溃 #2 | 22:22:56 | `.ips`：p0probe pid **6144** 与 verify2 完全对应，距启动恰好 60s |
+
+**关键更正：`displayState=OFF` 是 WindowServer 挂起的「结果」，不是「诱因」。** 此前把它归因为「显示器休眠期间重配置触发死锁」是错的——用户确认屏幕常亮，且 verify2 在启动后 **13 秒**（22:22:09）就已出现 `active=false`、mode 串号这类显示管线损坏迹象，远早于任何空闲休眠可能发生的时刻。黑屏闪烁从测试一开始就出现，是显示重配置把 WindowServer 拖挂的直接表现。IOKit 防休眠断言因此降级为「排除额外变量的防御性措施」，不是事故修复本身。
+
+旧代码的四个缺陷叠加放大了事故：
+
+1. **SPI 调用无超时**：`initWithDescriptor:` / `applySettings:` 同步等 WindowServer，挂起即无限等；
+2. **无全局熔断**：挂起后仍按 identity walk 连续重试（默认 9 次），每次 destroy 再 release 又是同步 IPC，反复捶打已挂死的 WindowServer——verify2 在 22:22:09 已见显示损坏，却仍在 22:22:10 继续换 identity 建屏；
+3. **两块屏并发处于未提交态**：两个 1×1 虚拟屏同时 attach、mode 串号，并发重配置把小问题放大成挂起；
+4. **1×1 退化 mode 照样送 SCK 捕获**，且 `startCapture` 失败路径不 stopCapture，留下悬空 stream。
+
+### 12.3 已落地的安全修复（全部只改代码，未再执行）
+
+| 修复 | 位置 | 作用 |
+|---|---|---|
+| SPI 8s 死线 + `windowServerHung` 全局熔断 | `VDManager.m` `P0CallSPIWithTimeout` | init/apply 放到工作线程，超时立即置位；所有建屏/重试路径见位即整体中止 |
+| 挂起时 destroyAll 跳过 release | `VDManager.m` | 不再向已挂死的 WindowServer 发同步 IPC（进程退出由系统回收） |
+| **逐屏串行建屏**：每块屏 mode 提交后才建下一块 | `VDManager.m` `createAll` / `waitModeForIndex:` | 消除两块屏并发未提交态（事故日志里的 mode 串号 / active=false） |
+| mode 提交等待 + 退化 mode 拒捕 | `VDManager.m` / `PipelineProbe.m` | 1×1 不再进捕获，消灭 `Start stream failed` 这一崩溃前兆 |
+| destroy 前 settle 300ms→1500ms；重试上限按 OS 下调 | `VDManager.m` / `main.m` | 降低重配置频率与总 IPC 次数 |
+| IOKit 防显示休眠断言 + 唤醒声明（**防御性**） | `main.m`（verify/hold 全程持有，三个返回路径都释放） | 排除休眠这一额外变量；非事故根因修复 |
+| startCapture 失败路径 best-effort stopCapture | `PipelineProbe.m` | 不留悬空 stream |
+| verdict 细分失败环节 + `targetResolutionReached` | `main.m` | `WINDOWSERVER_SPI_TIMEOUT` / `CREATE` / `LIVENESS` / `MODE_COMMIT` / `VISIBILITY` / `WALK` 可区分；pass 必须 mode 真落到目标分辨率 |
+| **OS 版本自动分流** | `ProbeUtil.m` `P0OSPolicy` / `main.m` | Sequoia 不再套用 Tahoe workaround，见 12.5 |
+
+### 12.4 安全重跑协议（由用户决定何时执行）
+
+1. 确保显示器亮着、接物理屏，系统设置里临时把「关闭显示器」设为「永不」；
+2. 先最小化试跑：`./p0probe verify --spec 1920x1080x0 --no-encode --fresh`（单屏、不编码、全新 identity）；
+3. 通过后再跑完整默认双屏 + 编码；
+4. **任何一次出现 `WINDOWSERVER_SPI_TIMEOUT`、屏幕闪烁或风扇异常，立即停测**，不要重试；
+5. 本机 `~/.p0_identity.json` 里 offset 0 来自失败轮次、可能已被污染，本机重跑一律带 `--fresh`；
+6. 本机只是 Sequoia 基线冒烟，**Tahoe 结论仍以被控端真机为准**（第 11 节流程不变）。
+
+### 12.5 OS 版本自适应（Sequoia 基线 vs Tahoe 目标）
+
+探针不再把 Tahoe 的 workaround 无差别套在所有系统上。`P0OSPolicy()`（`ProbeUtil.m`）用 `NSProcessInfo.operatingSystemVersion.majorVersion` 判定版本族，`probe` / `verify` 启动即打 `os-policy` JSON：
+
+| 策略 | Tahoe 26 | Sequoia 15 / 其它 |
+|---|---|---|
+| 建屏尺寸 | 保守 canvas 1280×800 → promote 到目标 | **直建目标分辨率**（单次 apply） |
+| identity | walk（vendor/product/serial 游走）+ 持久化成功 offset | **固定 identity**，不 walk、不持久化 |
+| 失败重试 | 最多 4 组（stale/poisoned 恢复机制） | **失败即止**（最多 1 次），不向异常 WindowServer 继续施压 |
+| `--direct` 对照 | 有意义（A/B PR #288） | 默认本就直建，`run_p0.sh` 自动跳过对照 |
+
+**为什么 Sequoia 直建是安全的**：本机 diag2 受控实验（`diag2.m`）——
+
+- **D**（主队列 + 建屏后跑 1s run loop 再 apply）：2s 后 mode = **1920×1080**，单次 apply 即提交；
+- **F**（串行队列、不跑 run loop、立即 apply + usleep 3s）：mode = **1920×1080**，同样单次提交；
+- **E**（串行队列 + 二次 apply）：第一次 apply 后仍 1×1，第二次才落到 1920×1080 —— 证明「首个 apply 可能被 attach 吞掉」，用 mode 提交等待 + 中途补一次 apply 兜底即可。
+
+而两次 WindowServer 事故恰恰都发生在**保守 canvas→promote** 路径（两次 apply、两块屏并发未提交）。Sequoia 直建把每块屏的重配置 IPC 从 2 次降到 1 次，配合逐屏串行提交，显著降低把 WindowServer 拖挂的概率。
+
+**全版本共用的安全机制**（不随 OS 分流关闭）：SPI 8s 死线 + 挂起熔断、逐屏 mode 提交等待、退化 mode 拒捕、destroy settle、失败路径 stopCapture。Tahoe 真机明天跑时会自动识别为 26 并切回保守 canvas + identity walk 全套路径，无需改代码。
