@@ -156,8 +156,9 @@ NSDictionary *P0OSPolicy(void) {
         @"identityWalk": @(tahoe),
         @"persistIdentity": @(tahoe),
         @"maxRetries": @(tahoe ? 4 : 1),
-        // mode 提交等待全版本必需：15.5 实测 applySettings 异步生效（1–3s）。
-        @"modeWaitMs": @6000,
+        // mode 提交等待全版本必需：15.5 实测 applySettings 异步生效（1–3s），
+        // 双屏时第二块屏受全局重配置影响可能更慢，放宽到 10s。
+        @"modeWaitMs": @10000,
     };
 }
 

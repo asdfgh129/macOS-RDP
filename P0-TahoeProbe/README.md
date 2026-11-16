@@ -57,6 +57,8 @@ P0-TahoeProbe/
 ├── build.sh                     clang 一键编译（按 OS 大版本提示走哪条路径）
 ├── run_p0.sh                    一键运行 + 诊断回收（Tahoe 才跑 --direct 对照）
 ├── check_static.py              跨平台静态自检（编码/括号/声明实现/参数一致性）
+├── diag.m / diag2.m             2026-11-14 事故取证与 apply 吞掉对照实验（证据保留）
+├── diag3.m / diag4.m            2026-11-16 自动镜像发现与双屏顺序对照实验（证据保留）
 ├── README.md
 └── src/
     ├── CGVirtualDisplaySPI.h    私有 API 的 protocol 重声明 + 运行时解析接口
@@ -144,7 +146,8 @@ bash build.sh
 | `encoder-capabilities` | `H264-Main` 在 1920×1080 / 2560×1440 上 `supported=true` 且 `hardwareAccelerated=true` | Intel 硬编不可用，只能软编，延迟目标要重定 |
 | `create` | N 条，`applySettings=true`，displayID 非 0 | `initWithDescriptor:` 被拒 → identity 被污染 |
 | `mode-commit` | 每屏 `ok=true`（逐屏串行提交） | 该屏 mode 未落地；createAll 会中止，不再建下一块 |
-| `liveness` | 每条 `online=true, active=true, usable=true` | Tahoe stale display（bounds 非空但 offline） |
+| `unmirror` | `ok=true`，随后 `liveness` 里 `mirrorSet=0` | 自动镜像未解除（镜像态 active=false、SCK 不可见），见 12.6 |
+| `liveness` | 每条 `online=true, active=true, usable=true, mirrorSet=0` | Tahoe stale display（bounds 非空但 offline）；Sequoia 自动镜像（见 12.6） |
 | `mode-wait` | `ok=true`，实际 mode 已落到请求的 points 尺寸 | applySettings 异步提交未完成（15.5 实测 1-3 秒）；停在 1×1 属退化态，禁止捕获 |
 | `visibility` | `ok=true` 且 `seen` 包含全部 `wanted` | **最关键的 Tahoe 判据**；Tahoe 失败会触发 identity walk，Sequoia 失败即止 |
 | `promote` | `ok=true` 且 `modePoints` 变成目标分辨率 | 仅 Tahoe 保守路径；提升后掉屏会自动回退保守 canvas 并标记 |
@@ -359,7 +362,7 @@ bash run_p0.sh
 3. **两块屏并发处于未提交态**：两个 1×1 虚拟屏同时 attach、mode 串号，并发重配置把小问题放大成挂起；
 4. **1×1 退化 mode 照样送 SCK 捕获**，且 `startCapture` 失败路径不 stopCapture，留下悬空 stream。
 
-### 12.3 已落地的安全修复（全部只改代码，未再执行）
+### 12.3 已落地的安全修复（2026-11-14 落地，2026-11-16 已按 12.4 协议重跑验证）
 
 | 修复 | 位置 | 作用 |
 |---|---|---|
@@ -373,13 +376,13 @@ bash run_p0.sh
 | verdict 细分失败环节 + `targetResolutionReached` | `main.m` | `WINDOWSERVER_SPI_TIMEOUT` / `CREATE` / `LIVENESS` / `MODE_COMMIT` / `VISIBILITY` / `WALK` 可区分；pass 必须 mode 真落到目标分辨率 |
 | **OS 版本自动分流** | `ProbeUtil.m` `P0OSPolicy` / `main.m` | Sequoia 不再套用 Tahoe workaround，见 12.5 |
 
-### 12.4 安全重跑协议（由用户决定何时执行）
+### 12.4 安全重跑协议（2026-11-16 已按此执行并通过，见 12.6）
 
 1. 确保显示器亮着、接物理屏，系统设置里临时把「关闭显示器」设为「永不」；
 2. 先最小化试跑：`./p0probe verify --spec 1920x1080x0 --no-encode --fresh`（单屏、不编码、全新 identity）；
 3. 通过后再跑完整默认双屏 + 编码；
 4. **任何一次出现 `WINDOWSERVER_SPI_TIMEOUT`、屏幕闪烁或风扇异常，立即停测**，不要重试；
-5. 本机 `~/.p0_identity.json` 里 offset 0 来自失败轮次、可能已被污染，本机重跑一律带 `--fresh`；
+5. 本机重跑建议带 `--fresh`（2026-11-16 已验证 offset 0 可正常建屏并通过完整链路）；
 6. 本机只是 Sequoia 基线冒烟，**Tahoe 结论仍以被控端真机为准**（第 11 节流程不变）。
 
 ### 12.5 OS 版本自适应（Sequoia 基线 vs Tahoe 目标）
@@ -401,4 +404,27 @@ bash run_p0.sh
 
 而两次 WindowServer 事故恰恰都发生在**保守 canvas→promote** 路径（两次 apply、两块屏并发未提交）。Sequoia 直建把每块屏的重配置 IPC 从 2 次降到 1 次，配合逐屏串行提交，显著降低把 WindowServer 拖挂的概率。
 
-**全版本共用的安全机制**（不随 OS 分流关闭）：SPI 8s 死线 + 挂起熔断、逐屏 mode 提交等待、退化 mode 拒捕、destroy settle、失败路径 stopCapture。Tahoe 真机明天跑时会自动识别为 26 并切回保守 canvas + identity walk 全套路径，无需改代码。
+**全版本共用的安全机制**（不随 OS 分流关闭）：SPI 8s 死线 + 挂起熔断、逐屏 mode 提交等待、退化 mode 拒捕、destroy settle、失败路径 stopCapture。Tahoe 真机跑时会自动识别为 26 并切回保守 canvas + identity walk 全套路径，无需改代码。
+
+### 12.6 安全重跑通过：自动镜像根因与原子解除（2026-11-16）
+
+按 12.4 协议重跑，**全程无闪烁、无挂起、销毁干净，完整双屏 + H.264 链路两次通过**。过程与结论：
+
+1. **终审补漏**：`startCapture` 5s 超时但 error=nil 时会被误判为成功 → 超时分支强制 stopCapture 并返回失败（`PipelineProbe.m`）。
+2. **最小单屏安全失败暴露新根因**：1920×1080 mode 已提交，但 `active=false`、SCK 不可见 → `LIVENESS_FAILED`。`diag3.m` 证实：**Sequoia 在 mode 提交后会把虚拟屏自动镜像到物理屏**（`mirrorSet=1`），镜像态 `active=false` 且从 `SCShareableContent` 消失。用 `CGConfigureDisplayMirrorOfDisplay(cfg, did, kCGNullDirectDisplay)` 解除后恢复扩展模式，15s 稳定无反弹。
+3. **双屏顺序陷阱**（`diag4.m` 三组对照）：
+   - A（不解除镜像）：两块屏 mode 都能提交，但都被镜像到同一块物理屏；
+   - B（先解 #1 镜像再建 #2）：**#2 的 apply 被 WindowServer 吞掉，mode 永卡 1×1**，补 apply 无效；且 #1 之后会反弹回镜像态；
+   - C（全部 mode 提交后，单事务原子解除两块屏镜像）：一次生效，10s 无反弹，双屏 `active=1`。
+4. **落地修复**（`VDManager.m` / `ProbeUtil.m`）：`createAll` 全部 mode 提交后 `unmirrorAll` 单事务原子解除；liveness 等待中限频（≥1s）补救反弹；promote/rollback 后统一原子解除；mode 等待 6s→10s（`P0OSPolicy.modeWaitMs`），中途补 apply 改为每 2s 限次；`liveness` 增加 `mirrorSet` 字段。unmirror 同样走 8s 死线 + 熔断，**全版本通用**（虚拟屏必须是扩展模式才能被 SCK 捕获）。
+
+**重跑结果**（本机 Sequoia 15.5，静态检查 7/7）：
+
+| 测试 | 结果 |
+|---|---|
+| 单屏 1920×1080 无编码（offset 7） | pass：73 帧 `HAS_CONTENT`，0 黑帧，首帧 504ms |
+| 单屏 2560×1440 无编码（offset 10） | pass：65 帧 `HAS_CONTENT`，0 黑帧，首帧 335ms |
+| 双屏 + H.264（offset 12） | **pass**：21/21、41/41 帧编码→环回解码全成功，keyFrames 各 1，0 编码错误，0 黑帧 |
+| 双屏 + H.264（`--fresh`，offset 0 复测） | **pass**：默认 identity 可复现，排除「offset 0 已污染」的担忧 |
+
+注：桌面静止内容下捕获帧率 10–20fps 属正常（SCK 只在画面变化时产帧），判黑与编解码指标才是 P0 判据；§5 的 ≈60fps 需要动态画面，留给后续 spike 验证。

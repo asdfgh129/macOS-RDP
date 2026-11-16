@@ -431,15 +431,17 @@ static NSDictionary *P0LumaStats(CVPixelBufferRef pb) {
     [stream startCaptureWithCompletionHandler:^(NSError *err) {
         startErr = err; dispatch_semaphore_signal(started);
     }];
-    dispatch_semaphore_wait(started, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
-    if (startErr) {
+    BOOL startTimedOut = dispatch_semaphore_wait(started, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0;
+    if (startErr || startTimedOut) {
         // 失败路径也必须收尾：半启动的 SCStream 若直接释放，其异步 teardown
         // 会与调用方随后的虚拟屏销毁竞争。best-effort stop 后再返回。
         dispatch_semaphore_t stopSem = dispatch_semaphore_create(0);
         [stream stopCaptureWithCompletionHandler:^(NSError *e) { dispatch_semaphore_signal(stopSem); }];
         dispatch_semaphore_wait(stopSem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
         return @{ @"displayID": @(displayID), @"ok": @NO,
-                  @"error": [NSString stringWithFormat:@"startCapture: %@", startErr.localizedDescription] };
+                  @"error": startErr
+                      ? [NSString stringWithFormat:@"startCapture: %@", startErr.localizedDescription]
+                      : @"startCapture 5s 未回调（WindowServer 疑似异常），已中止捕获" };
     }
 
     P0Log(@"开始捕获 display %u (%zux%zu)，持续 %d ms", displayID,

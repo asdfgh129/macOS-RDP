@@ -229,11 +229,17 @@ static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nu
         // 逐屏串行提交：等这一块屏的 mode 真正落地，再建下一块。
         // 2026-11-14 事故日志显示两块屏同时处于未提交状态时 WindowServer 已开始异常
         // （active=false、mode 串号），并发重配置会把小问题放大成挂起。
-        BOOL committed = [self waitModeForIndex:i conservative:_conservativeFirst timeoutMs:6000];
+        BOOL committed = [self waitModeForIndex:i conservative:_conservativeFirst
+                                      timeoutMs:[P0OSPolicy()[@"modeWaitMs"] intValue]];
         P0Emit(@"mode-commit", @{ @"index": @(i), @"displayID": @(did), @"ok": @(committed) });
         if (!committed || self.windowServerHung) { allOK = NO; break; }
     }
 
+    // 全部 mode 提交后再原子解除镜像（顺序依据见 unmirrorAll 注释）。
+    if (allOK) {
+        [self unmirrorAll];
+        if (self.windowServerHung) allOK = NO;
+    }
     if (!allOK) [self destroyAll];
     return allOK;
 }
@@ -245,15 +251,16 @@ static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nu
     NSUInteger h = [cfg[@"height"] unsignedIntegerValue];
     id<VD_Display> d = _heldDisplays[i];
     int elapsed = 0;
-    BOOL reapplied = NO;
+    int nextReapplyMs = timeoutMs / 2;
     while (elapsed < timeoutMs) {
         if (self.windowServerHung) return NO;
         CGDisplayModeRef m = CGDisplayCopyDisplayMode([d displayID]);
         BOOL match = m && CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h;
         if (m) CGDisplayModeRelease(m);
         if (match) return YES;
-        if (!reapplied && elapsed >= timeoutMs / 2) {
-            // 首个 apply 可能被 attach 过程吞掉（diag2 E 实证），中途只补这一块屏。
+        if (elapsed >= nextReapplyMs) {
+            // apply 可能被 attach / 全局重配置吞掉（diag2 E、双屏实测），
+            // 每 2s 只补这一块屏，次数受 timeout 约束，不会形成重试风暴。
             P0Log(@"屏 #%lu mode 尚未提交，中途补一次 applySettings", (unsigned long)i + 1);
             id settings = [self makeSettingsForConfig:cfg];
             if (settings) {
@@ -262,7 +269,7 @@ static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nu
                 });
             }
             if (self.windowServerHung) return NO;
-            reapplied = YES;
+            nextReapplyMs += 2000;
         }
         P0SleepMs(100);
         elapsed += 100;
@@ -274,6 +281,35 @@ static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nu
         @"detail": [self liveness],
     });
     return NO;
+}
+
+// 15.5 实测（diag3/diag4）：mode 提交后 WindowServer 会把虚拟屏自动镜像到物理屏；
+// 镜像态 active=false 且从 SCShareableContent 消失，SCK 永远看不到。
+// 顺序陷阱：先解除 #1 镜像再建 #2，#2 的 apply 会被吞掉（mode 永卡 1x1）；
+// 逐块解除也会互相反弹。正确做法：全部屏 mode 提交后，单事务原子解除所有镜像。
+- (BOOL)unmirrorAll {
+    NSMutableArray<NSNumber *> *mirrored = [NSMutableArray array];
+    for (id<VD_Display> d in _heldDisplays) {
+        CGDirectDisplayID did = [d displayID];
+        if (CGDisplayIsInMirrorSet(did)) [mirrored addObject:@(did)];
+    }
+    if (mirrored.count == 0) return YES;
+    NSNumber *okNum = P0CallSPIWithTimeout(@"unmirror", self, ^id{
+        CGDisplayConfigRef cfg = NULL;
+        if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess || !cfg) return @NO;
+        for (NSNumber *did in mirrored) {
+            if (CGConfigureDisplayMirrorOfDisplay(cfg, (CGDirectDisplayID)did.unsignedIntValue,
+                                                  kCGNullDirectDisplay) != kCGErrorSuccess) {
+                CGCancelDisplayConfiguration(cfg);
+                return @NO;
+            }
+        }
+        return @(CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession) == kCGErrorSuccess);
+    });
+    if (self.windowServerHung) return NO;
+    BOOL ok = [okNum boolValue];
+    P0Emit(@"unmirror", @{ @"displayIDs": mirrored, @"ok": @(ok) });
+    return ok;
 }
 
 - (void)destroyAll {
@@ -313,6 +349,11 @@ static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nu
             @"ok": @(ok),
         });
         if (!ok) allOK = NO;
+    }
+    if (allOK) {
+        // promote/rollback 改 mode 也可能再次触发自动镜像，统一原子解除。
+        [self unmirrorAll];
+        if (self.windowServerHung) return NO;
     }
     return allOK;
 }
@@ -359,6 +400,7 @@ static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nu
             @"bounds": P0RectString(bounds),
             @"boundsNonEmpty": @(boundsOK),
             @"usable": @(online && active && boundsOK),
+            @"mirrorSet": @(CGDisplayIsInMirrorSet(did)),
             @"modePoints": points,
             @"modePixels": pixels,
             @"reportedHiDPI": @([d hiDPI]),
@@ -376,8 +418,20 @@ static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nu
 
 - (BOOL)waitUntilUsableTimeoutMs:(int)timeoutMs {
     int elapsed = 0;
+    // 自动镜像可能晚于建屏时的原子解除才出现（全局重配置反弹），限频补救。
+    int lastUnmirrorMs = -1000;
     while (elapsed < timeoutMs) {
         if ([self allUsable]) return YES;
+        if (elapsed - lastUnmirrorMs >= 1000) {
+            for (id<VD_Display> d in _heldDisplays) {
+                if (CGDisplayIsInMirrorSet([d displayID])) {
+                    lastUnmirrorMs = elapsed;
+                    [self unmirrorAll];
+                    break;
+                }
+            }
+            if (self.windowServerHung) return NO;
+        }
         P0SleepMs(100);
         elapsed += 100;
     }
