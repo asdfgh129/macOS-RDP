@@ -15,6 +15,7 @@ fi
 rm -rf /Applications/P0VRootProbe.app
 cp -R build/P0VRootProbe.app /Applications/
 chown -R root:wheel /Applications/P0VRootProbe.app
+chmod -R a+rX /Applications/P0VRootProbe.app
 
 install -m 644 -o root -g wheel com.p0v.rootprobe.plist /Library/LaunchDaemons/com.p0v.rootprobe.plist
 

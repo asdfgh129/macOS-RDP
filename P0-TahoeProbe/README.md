@@ -538,7 +538,7 @@ P0_NO_BUILD=1 bash run_p0.sh          # 已编译过，跳过重建以保住 TCC
 
 - ~~**H.264 实际编码**~~：已于同日 15:15 补测通过（§15.1）。
 - ~~`--direct` 对照（Tahoe 上跳过保守 canvas 的 A/B）~~：已于 15:20 完成，正是它定位出 F-4（§15.2）。
-- **双虚拟屏**（默认 spec 的另一半）：仍未测。UHD 630 上限 3 屏，本机已占 2 物理屏，加 2 虚拟屏会超限，需单独设计（拔一块物理屏或接受风险窗口）。
+- ~~**双虚拟屏**~~：已于 §16.1 实测 2 物理 + 4 虚拟共 6 屏同时在线；V-03 的「只剩虚拟屏再建一块」由 `P0V-DisplayIsolation` 覆盖（待现场执行）。
 - 运动场景帧率 / glass-to-glass 延迟（§15.3 显示静态场景的 `P95` 波动达 20 倍，不可用）。
 
 ## 15. A-01 补测：编码面 + HiDPI 面（2026-11-17 15:15–15:22）
@@ -682,3 +682,52 @@ pass = true, mode = capture-only, displayCount = 2, elapsedMs = 5152
 | 多用户并发会话 | ✅ 独立 session | ❌ 只有 console session |
 
 后三项是**会话隔离**能力，属于「镜像模型」与「会话模型」的根本差异，靠虚拟屏无法弥补。若产品定位是无人值守远程办公（隐私、锁屏可用），需单独立项验证 macOS 的虚拟会话能力（Fast User Switching 是"切换"不是"并发"；私有 SkyLight virtual session 未公开、跨版本易碎）。**这是待决策的架构分叉，不是当前 P0 能回答的问题。**
+
+## 17. 残留虚拟屏槽位导致建屏卡死（Sequoia 15.5 / Macmini8,1，2026-11-17 21:10）
+
+> 环境标注：本章结论来自 **Sequoia 15.5（Macmini8,1 / i5-9500）**，不是 Tahoe 机。
+> 修复本身按 `conservative` 分流，Tahoe 保守 canvas→promote 路径不受影响；Tahoe 上
+> 是否也存在槽位复用问题尚未验证。
+
+现象：`p0probe verify --spec 1280x720x0` 连续失败在 `MODE_COMMIT`。新建屏拿到
+`displayID=4128835`，状态却是 `online=1 active=0 mirror=1`、`bounds={0,0,1920,1080}`、
+`mode=2560x1440`（points 与 pixels 都是 2560x1440），`applySettings` 返回 YES 但
+10s 内 mode 永不提交。换 identity（`--offset 7`）无效。
+
+根因：本机 WindowServer 保留了 5 个已注销虚拟屏的槽位（4128831–4128835）。它们
+offline 时表现为 `1x1`、bounds 在 `5472..5476` 的停车位；但新建屏**复用最近释放的
+4128835** 时会继承该槽位的镜像态，mode 一直报告旧 master 的 2560x1440。这不是
+identity 缓存问题，identity walk 绕不开。
+
+对照实验（独立最小程序）：
+
+| 动作 | active | mirror | mode |
+| --- | --- | --- | --- |
+| 建屏 + apply | 0 | 1 | 2560×1440 |
+| 单事务 `CGConfigureDisplayMirrorOfDisplay(kCGNullDirectDisplay)` | **1** | **0** | **1280×720** |
+| 再显式 `CGConfigureDisplayWithDisplayMode` | 1 | 0 | 1280×720 |
+
+修法（`VDManager waitModeForIndex:`）：**单屏、非 Tahoe 保守路径**下，建屏 2s 后若
+仍 `CGDisplayIsInMirrorSet` 且 mode 不匹配，提前调用一次 `unmirrorAll`（之后 mode 在
+1s 内提交）。多屏保持原有「全部 mode 提交后再统一解除镜像」顺序，因为 15.5 实测过
+「先解除 #1 再建 #2 会吞掉 #2 的 apply」的顺序陷阱；Tahoe 保守 canvas→promote 路径
+也不动。
+
+验证：修复后 `p0probe verify --spec 1280x720x0` 与
+`P0V-DisplayIsolation/v01probe run --dry-run` 均通过（mode 1280×720、SCK 可见、
+`HAS_CONTENT`）。残留槽位本身在正常注销后仍会留在 SLS 列表里。
+
+**槽位能否从用户态清掉（2026-11-17 22:30 复测）**：不能。`CDVirtualDisplayDestroy`
+只接受创建进程内的 client 指针，`SL2CDVirtualDisplayDestroy` 只查本进程虚拟屏表；
+换用 `0xFFFFFFFF` 身份重建仍只复用 4128835；`pmset displaysleepnow` + `caffeinate -u`
+两轮也没有回收离线槽位（该方法只能回收「在线孤儿」）。只有注销/重启会清空。
+因此 `P0V-DisplayIsolation` 改成：检测到槽位时只自动跳过「零物理屏下再建一块」子项，
+不再中止整个 V-03，也不要求用户重启；详见该工程 README。
+
+**后续事故（同日 22:03，同一台 Sequoia 机）**：在已有 5 个残留槽位的 WindowServer 里
+一次创建第 2 块虚拟屏（V-03 重建测试），WindowServer 在
+`DisplaySet::create → PKGDisplay::PKGDisplay → canonical_mirror_master` 的
+`WSCanonicalMirrorMasterForDisplayDevice` 断言处 SIGABRT，整机注销。第 1 块创建安全。
+修复方向：多屏必须在禁用物理屏之前建齐；不要在该状态下补建。
+22:35 用新预检重跑 V-03 核心（`--mode all --watch-secs 20`）：重建子项自动跳过，
+其余判据全过（含 20s 唤醒观察 0 次重新 enable、输入注入），恢复精确，`label=PASS`。

@@ -35,6 +35,12 @@ cd P0V-RootDaemon
 
 root daemon **没有 UI 会话，弹不出授权框**，只能手动加。这是 D-08 里记的那笔账，现在就撞上了。
 
+> **2026-11-17 实测（Sequoia 15.5）**：ad-hoc 签名下，无论把 `.app` 还是
+> `Contents/MacOS/p0vprobe` 加进这两个列表，系统 TCC 都只会记成
+> `client_type=1` 的路径条目，daemon 侧既不认辅助功能也不认屏幕录制
+> （`axTrusted=0`、SCK 返回 declined/超时）。需要 Developer ID 或至少
+> 自签名证书，让 TCC 能按 bundle id 记账；详见文末实测记录。
+
 ### 3. 安装（需管理员密码）
 
 ```bash
@@ -85,6 +91,79 @@ sudo ./uninstall.sh
 ```
 
 清理 LaunchDaemon、`/Applications` 下的 app、`/tmp` 下的输出。TCC 里的条目需在系统设置中手动删除。
+
+## 实测记录（2026-11-17 22:40–22:53，Sequoia 15.5 / Macmini8,1 / i5-9500）
+
+环境：**Sequoia 15.5（24F74）**，与 Tahoe 机结果不可混用。
+
+### 1. root LaunchDaemon：TCC 与 GUI 会话双重失败
+
+按 README 流程安装后（`/Applications/P0VRootProbe.app`，ad-hoc 签名，
+cdhash `ee2231ad…`），分别把 `.app` 和可执行文件
+`/Applications/P0VRootProbe.app/Contents/MacOS/p0vprobe` 加入「辅助功能」与
+「屏幕与系统录音」。系统 TCC 库中确实出现两条 `auth_value=2` 的记录，但均为
+`client_type=1`（路径条目）、`csreq` 只有 40 字节的 cdhash。
+
+daemon 实测（`sudo launchctl kickstart -k system/com.p0v.rootprobe`）：
+
+| 项 | 结果 |
+|---|---|
+| `euid` / `bundleID` | 0 / `com.p0v.rootprobe` |
+| `session.available` | 0（不在 GUI 会话） |
+| `axTrusted` | **0**（尽管辅助功能条目 allowed） |
+| SCK | **`SCShareableContent 6s 超时`** |
+| 注入 | `INJECTION_NO_VISIBLE_EFFECT`（抓不到帧，无判据） |
+
+用户域 LaunchAgent 启动同一二进制时，SCK 直接返回
+`The user declined TCCs for application, window, display capture`，
+证明之前“用户态能跑”是继承了 Qoder 的 responsible-process 授权，而不是
+探针自己的 TCC 条目生效。对照：Qoder/Terminal 的 TCC 条目都是
+`client_type=0`（bundle id）且 `csreq` 更长；ad-hoc 签名只能生成 cdhash
+要求，系统设置把探针记成路径条目，**执行侧不采纳**。
+
+### 2. 用户会话进程：锁屏捕获 + 定向注入均通过（V-04a / V-04b）
+
+用继承 Qoder TCC 授权的用户态进程（同一 `p0vprobe` 二进制，非 root）
+在锁屏后执行：
+
+```bash
+caffeinate -u -t 150 &
+# 轮询 probe 直到 session.screenIsLocked=true，再等 3s
+screencapture -x /tmp/p0v-lock3-before.png
+p0vprobe capture --ms 1000
+p0vprobe inject-test          # 注入 "aa" + Return（错误密码）
+screencapture -x /tmp/p0v-lock3-after.png
+p0vprobe capture --ms 1500
+```
+
+结果：
+
+| 项 | 数据 |
+|---|---|
+| 锁屏截图 | 真实登录界面（用户头像 + 密码框 + 时间），非黑帧 |
+| `capture.verdict` | `HAS_CONTENT`，注入前 1 帧 / 注入后 1 帧 |
+| `inject.verdict` | `INJECTION_ACCEPTED_UI_CHANGED`，152/256 格变化 |
+| 注入后截图 | 密码框已出现输入圆点，"Enter Password" 占位符消失 |
+| `sessionAfter.screenIsLocked` | `true`（错误密码按预期未解锁） |
+
+**结论：loginwindow 并不阻止用户会话进程捕获或定向注入。** 之前 D-08 的
+“必须 root 才能进登录窗”前提在本机被推翻；真正的门槛是 **TCC 身份**（应用必须
+被正确签名并按 bundle id 记账），不是进程特权等级。
+
+### 3. 尚未验证
+
+- **V-04c（正确密码解锁）**：探针按设计只注入错误密码。完整解锁需要真实凭据，
+  2026-11-17 决定**主动跳过、记为未测**；留到正式签名后的产品验证。现有证据是
+  密码框接收了注入字符（出现圆点），解锁链路本身未被否定。
+- **V-04d（登录窗态建虚拟屏 + 禁物理屏）**：未实现。
+- **正式签名身份**：本机没有 Developer ID / Apple Development 证书；自签名
+  证书能否让 TCC 记成 `client_type=0` 尚未测试。
+
+### 4. 安装脚本缺陷（已修）
+
+仓库位于 exFAT（noowners）、umask 077，`cp -R` 会把 700 权限带进
+`/Applications`，导致系统设置和 TCC 无法读取 bundle。`build.sh` 与
+`install.sh` 已加 `chmod -R a+rX`。
 
 ## 判读
 

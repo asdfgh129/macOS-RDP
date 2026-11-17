@@ -202,8 +202,17 @@ Host 不为每个会话预先创建虚拟屏。会话开始时的供给顺序是
 ### 待验证 / 风险
 
 - **V-01 / V-03**：一块、以及**全部**物理屏 disable 后，建屏+SCK 采集+事件注入是否仍正常。全部 disable 是 C-09 的极限情形，风险最高（WindowServer 可能判定为「无显示器」而回落到默认模式）。见 DESIGN A-08。
+  - 探针已实现：`P0V-DisplayIsolation/`（`v01probe run --mode one|all`，含快照、守护进程兜底、事务死线、两阶段恢复）。
+  - 2026-11-17 晚在 Sequoia 15.5 / Macmini8,1 首跑 V-03（`--mode all --watch-secs 0 --no-rebuild-test`）：**3 块物理屏全部退出 active、虚拟屏 58fps `HAS_CONTENT`、SCK 干净、指针 5/5 点 0 偏差、恢复 OK**。物理屏仍在 online 列表（Intel 上属「摘出 active 空间」而非断开）。输入注入因 `axTrusted=0` 未过；唤醒观察与重建测试未跑。V-01 尚未跑。
+  - 同日 22:03 完整版（唤醒观察 20s + 重建测试）：观察期 0 次重新 enable；**重建测试创建第 2 块虚拟屏时 WindowServer SIGABRT（`canonical_mirror_master` 断言），整机注销**。根因是该 WindowServer 已有 5 个残留虚拟屏槽位。
+  - 同日 22:30 复测：**这些「停放槽位」（`vendor=0xFFFFFFFF / offline / 1x1`）无法从用户态清除**。`CDVirtualDisplayDestroy` 只接受创建进程内的 client 指针；`SL2CDVirtualDisplayDestroy` 只查本进程虚拟屏表；用同一身份重建仍只复用 4128835，不会认领旧槽位；`pmset displaysleepnow` + `caffeinate -u` 两轮也只能回收「在线孤儿」。只有注销/重启会清空。
+  - 因此探针改为：检测到槽位时**只自动跳过**「零物理屏下再建一块」子项（结果记 `rebuildTest.skipped=staleVirtualSlots`），V-03 核心继续，**不再要求重启机器**；`--count > 1` 需显式 `--allow-stale-slots`。
+  - **对 M1 的硬性结论**：全部虚拟屏必须在禁用物理屏**之前**建齐，会话期间不新建虚拟屏；该组合（零 active 物理屏 + 槽位 + 新建屏）是平台级崩溃点，不能靠重试或清理绕过。A-08 据此记录。
+  - 同日 22:15 **V-01 通过**（`--mode one --watch-secs 20`）：禁用的物理屏退出 active，虚拟屏 `HAS_CONTENT`，SCK 干净，指针逐屏采样 0 偏差且 0 次落入禁用屏，输入注入 `axTrusted=1` 通过，20s 唤醒观察 0 次重新 enable，恢复后 bounds/主屏身份精确回原值。**V-01 在 Sequoia 15.5 / Macmini8,1 关闭。** 注意：禁用一块屏期间 WindowServer 会临时重排剩余物理屏（模式/位置变化），恢复后还原；M1 窗口布局快照仍是必需项。
+  - 同日 22:35 **V-03 核心完整版通过**（`--mode all --watch-secs 20`）：3 块物理屏全部退出 active、虚拟屏 60fps `HAS_CONTENT`、SCK 干净、指针逐屏 0 偏差、输入注入 `axTrusted=1` 通过、20s 唤醒观察 0 次重新 enable、恢复后 bounds/mode/主屏身份精确回原值；重建子项由预检自动跳过（`rebuildTested=false`），未再崩溃。**V-03 核心在 Sequoia 15.5 / Macmini8,1 关闭。**
+  - 顺带修复：WindowServer 残留虚拟屏槽位会让新建屏继承镜像态、mode 卡死；`VDManager` 已加单屏自愈（详见 `P0-TahoeProbe/README.md` §17）。
 - **窗口重排副作用**：物理屏被移出空间时 WindowServer 会把原在该屏的窗口搬到剩余屏；断开后**不会**自动回原位。必须会话前快照 display 布局 + 各窗口 frame，断开后还原。这是 M1 的一个独立工作项，不是"顺手就能好"的细节。
-- **`disable` 权限**：`SLSConfigureDisplayEnabled` 的符号可调已实测（`P0V-SessionRecon`），但**在事务内真正生效**尚未验证（V-01 未跑）。若被 WindowServer 拒绝，走决定第 3 条 + `CGDisplayCapture` 降级。
+- **`disable` 权限**：`SLSConfigureDisplayEnabled` 的符号可调已实测（`P0V-SessionRecon`），V-01/V-03 均已在事务内真正生效并恢复。若运行环境（非 Intel / 非 Sequoia）被 WindowServer 拒绝，走决定第 3 条 + `CGDisplayCapture` 降级。
 
 ---
 
@@ -287,7 +296,7 @@ Host 不为每个会话预先创建虚拟屏。会话开始时的供给顺序是
 
 ## D-08 远程登录（锁屏 / 登录窗）：走 root daemon，而不是"永不锁屏"
 
-**日期**：2026-11-17　**状态**：方向已定；**探针已实现并构建通过（`P0V-RootDaemon/`），待人工执行 V-04**（本机沙箱拒绝 `sudo`，必须由管理员在 Terminal 里跑）
+**日期**：2026-11-17　**状态**：方向已修订；**V-04a/V-04b 已在 Sequoia 15.5 通过（用户会话路径），root daemon 路径被 TCC 与 GUI 会话归属挡住**；**V-04c 主动跳过、记为未测，V-04d 未实现**
 
 ### 更正：此前结论错在哪
 
@@ -309,6 +318,8 @@ Host 不为每个会话预先创建虚拟屏。会话开始时的供给顺序是
 | 我们原方案 | 用户态 LaunchAgent | 仅用户授权给 App | ❌ 被 loginwindow 挡 |
 
 差别不在 API 存不存在，而在**进程特权等级 + TCC 归属 + 事件投递方式**（广播 vs 定向投递到 loginwindow）。这也解释了为什么 Apple 不用授权：`screensharingd` 是系统组件；第三方要用户手动授权。
+
+第 3 行「用户态 LaunchAgent 被 loginwindow 挡」已被 2026-11-17 晚实测推翻（见下）。修订方向：**登录窗捕获与定向注入不需要 root**，只要进程位于用户 GUI 会话且 TCC 身份正确；root 组件只在“无人登录/登录窗尚未建立用户会话”等场景才可能需要。优先把双组件收敛为 **一个正确签名的用户态 App**。
 
 ### 决定（方向）
 
@@ -353,6 +364,33 @@ session: available = 1, screenIsLocked = 0, loginDone = 1, auditID = 100001
 
 1. **TCC 按 responsible process 记账，不是按二进制。** 这个新二进制从没被授权过，却拿到了画面 —— 因为它的父进程链（终端 / 宿主 App）已有「屏幕录制」。这解释了 daemon 为什么必须自己拿授权：它没有父进程可继承，`responsible` 就是它自己。
 2. `axTrusted = 0` 说明**注入能力此时为零**，哪怕抓屏是通的。抓屏与注入是两套授权，必须分别验。
+
+### 实测记录（2026-11-17 22:40–22:53，Sequoia 15.5 / Macmini8,1）
+
+**root LaunchDaemon 路径失败**：安装 `/Applications/P0VRootProbe.app` 后，把 `.app`
+和其可执行文件分别加入「辅助功能」「屏幕与系统录音」。系统 TCC 库出现
+`auth_value=2` 条目，但都是 `client_type=1`（路径）、`csreq` 仅 40 字节 cdhash。
+daemon 实测：`session.available=0`、`axTrusted=0`、SCK `6s 超时`、注入无效。
+用户域 LaunchAgent 启动同一二进制时 SCK 返回
+`The user declined TCCs for application, window, display capture`，说明此前的
+“用户态可跑”是继承 Qoder 的 responsible-process 授权，探针自身条目未被采纳。
+根因指向 **ad-hoc 签名无法生成 bundle-id 级 TCC 要求**，系统设置只能记成路径条目；
+同时系统域 daemon 不在 GUI 会话，SCK 本就难以工作。
+
+**用户会话路径通过（V-04a / V-04b）**：用继承 Qoder 授权的同一二进制，在锁屏后：
+
+| 项 | 结果 |
+|---|---|
+| 锁屏截图 | 真实登录界面（头像 + 密码框 + 时间），非黑帧 |
+| `capture` | `HAS_CONTENT`（注入前 1 帧 / 后 1 帧） |
+| `inject`（`aa`+Return） | `INJECTION_ACCEPTED_UI_CHANGED`，152/256 格变化 |
+| 注入后截图 | 密码框出现输入圆点，占位符消失 |
+| `sessionAfter` | `screenIsLocked=true`（错误密码未解锁，符合预期） |
+
+**结论**：loginwindow 不阻止用户会话进程捕获或定向注入；真正的门槛是 TCC 身份
+与 GUI 会话归属，不是 root 特权。**V-04c 于 2026-11-17 决定主动跳过、记为未测**
+（完整解锁需要真实凭据，留到正式签名后的产品验证）；V-04d 未实现。**Path A 的
+推荐形态改为“正确签名的用户态 App + 用户授权”，root daemon 仅在无人登录场景再评估。**
 
 ---
 

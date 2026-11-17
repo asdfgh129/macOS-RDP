@@ -24,4 +24,5 @@ __pycache__/
 # P0V 探针构建产物（源码入库，二进制不入库）
 P0V-RootDaemon/build/
 P0V-SessionRecon/recon
+P0V-DisplayIsolation/v01probe
 P0-TahoeProbe/last_min.log

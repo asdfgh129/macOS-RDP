@@ -263,12 +263,24 @@ static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nu
     id<VD_Display> d = _heldDisplays[i];
     int elapsed = 0;
     int nextReapplyMs = timeoutMs / 2;
+    int lastUnmirrorMs = -2000;
     while (elapsed < timeoutMs) {
         if (self.windowServerHung) return NO;
         CGDisplayModeRef m = CGDisplayCopyDisplayMode([d displayID]);
         BOOL match = m && CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h;
         if (m) CGDisplayModeRelease(m);
         if (match) return YES;
+        // 2026-11-17 实测（15.5，本机存在 5 个残留虚拟屏槽位）：新建屏会复用带镜像态的
+        // 旧槽位（ID 4128835），mode 永远报告 master 的分辨率，apply 无法提交。
+        // 单屏场景没有「先解除 #1 再建 #2 会吞掉 #2 apply」的顺序陷阱，可提前解除；
+        // 多屏与 Tahoe 保守 canvas→promote 路径保持原顺序不动。
+        if (!conservative && _configs.count == 1 && elapsed >= 2000 &&
+            CGDisplayIsInMirrorSet([d displayID]) && elapsed - lastUnmirrorMs >= 2000) {
+            P0Log(@"屏 #%lu 建屏即处于镜像态（残留槽位），提前解除镜像", (unsigned long)i + 1);
+            lastUnmirrorMs = elapsed;
+            [self unmirrorAll];
+            if (self.windowServerHung) return NO;
+        }
         if (elapsed >= nextReapplyMs) {
             // apply 可能被 attach / 全局重配置吞掉（diag2 E、双屏实测），
             // 每 2s 只补这一块屏，次数受 timeout 约束，不会形成重试风暴。

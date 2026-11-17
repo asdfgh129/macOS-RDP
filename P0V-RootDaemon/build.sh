@@ -40,6 +40,10 @@ clang -fobjc-arc -O2 -Wall -Wextra \
 
 codesign --force --sign - --identifier com.p0v.rootprobe --timestamp=none "$APP"
 
+# 仓库可能位于 exFAT（noowners），umask 077 会让 bundle 目录变成 700；
+# TCC 与系统设置的文件选择器需要能读取 bundle，统一放宽到标准权限。
+chmod -R a+rX "$APP"
+
 echo "--- 构建结果 ---"
 codesign -dv "$APP" 2>&1 | grep -E 'Identifier|Signature|CDHash|Format' || true
 echo "产物: $(pwd)/$APP"

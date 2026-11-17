@@ -1,0 +1,693 @@
+//
+//  P0VDisplayControl.m
+//  P0V-DisplayIsolation
+//
+
+#import "P0VDisplayControl.h"
+#import "ProbeUtil.h"
+
+#import <dlfcn.h>
+#import <fcntl.h>
+#import <mach-o/dyld.h>
+#import <spawn.h>
+#import <signal.h>
+#import <stdatomic.h>
+#import <libproc.h>
+#import <math.h>
+#import <limits.h>
+#import <stdlib.h>
+#import <string.h>
+
+extern char **environ;
+
+// 本项目虚拟屏 vendor（与 P0-TahoeProbe/VDManager.m 的 kVendorID 保持一致）。
+static const uint32_t kP0VVirtualVendorID = 0x5030;
+
+#pragma mark - 私有符号
+
+typedef CGError (*P0VSLSConfigureDisplayEnabledFn)(CGDisplayConfigRef, CGDirectDisplayID, bool);
+typedef CGError (*P0VSLSGetDisplayListFn)(uint32_t, CGDirectDisplayID *, uint32_t *);
+
+static P0VSLSConfigureDisplayEnabledFn gConfigureDisplayEnabled = NULL;
+static P0VSLSGetDisplayListFn gGetDisplayList = NULL;
+static dispatch_once_t gSymbolOnce;
+
+static void P0VLoadPrivateSymbols(void) {
+    dispatch_once(&gSymbolOnce, ^{
+        void *sl = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight",
+                          RTLD_LAZY | RTLD_GLOBAL);
+        if (!sl) sl = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
+                             RTLD_LAZY | RTLD_GLOBAL);
+        if (!sl) {
+            P0Error(@"dlopen SkyLight 失败: %s", dlerror());
+            return;
+        }
+        gConfigureDisplayEnabled = (P0VSLSConfigureDisplayEnabledFn)dlsym(sl, "SLSConfigureDisplayEnabled");
+        gGetDisplayList = (P0VSLSGetDisplayListFn)dlsym(sl, "SLSGetDisplayList");
+        if (!gConfigureDisplayEnabled) P0Error(@"SLSConfigureDisplayEnabled 符号缺失");
+        if (!gGetDisplayList) P0Error(@"SLSGetDisplayList 符号缺失");
+    });
+}
+
+BOOL P0VPrivateDisplayControlAvailable(void) {
+    P0VLoadPrivateSymbols();
+    return gConfigureDisplayEnabled != NULL;
+}
+
+#pragma mark - 记录
+
+@implementation P0VDisplayRecord
+
+- (BOOL)isP0Virtual {
+    return self.vendorID == kP0VVirtualVendorID;
+}
+
+- (NSDictionary *)dictionaryRepresentation {
+    return @{
+        @"displayID": @(self.displayID),
+        @"bounds": @{
+            @"x": @(self.bounds.origin.x),
+            @"y": @(self.bounds.origin.y),
+            @"w": @(self.bounds.size.width),
+            @"h": @(self.bounds.size.height),
+        },
+        @"main": @(self.isMain),
+        @"builtin": @(self.isBuiltin),
+        @"online": @(self.online),
+        @"active": @(self.active),
+        @"vendorID": @(self.vendorID),
+        @"modelID": @(self.modelID),
+        @"serialNumber": @(self.serialNumber),
+        @"points": [NSString stringWithFormat:@"%zux%zu", self.pointWidth, self.pointHeight],
+        @"pixels": [NSString stringWithFormat:@"%zux%zu", self.pixelWidth, self.pixelHeight],
+        @"pointWidth": @(self.pointWidth),
+        @"pointHeight": @(self.pointHeight),
+        @"pixelWidth": @(self.pixelWidth),
+        @"pixelHeight": @(self.pixelHeight),
+        @"refreshRate": @(self.refreshRate),
+        @"mirrorOf": @(self.mirrorOf),
+        @"isP0Virtual": @(self.isP0Virtual),
+    };
+}
+
++ (instancetype)recordWithDictionary:(NSDictionary *)dict {
+    P0VDisplayRecord *r = [[P0VDisplayRecord alloc] init];
+    r.displayID = [dict[@"displayID"] unsignedIntValue];
+
+    NSDictionary *b = dict[@"bounds"];
+    if ([b isKindOfClass:[NSDictionary class]]) {
+        r.bounds = CGRectMake([b[@"x"] doubleValue], [b[@"y"] doubleValue],
+                              [b[@"w"] doubleValue], [b[@"h"] doubleValue]);
+    }
+    r.isMain = [dict[@"main"] boolValue];
+    r.isBuiltin = [dict[@"builtin"] boolValue];
+    r.online = [dict[@"online"] boolValue];
+    r.active = [dict[@"active"] boolValue];
+    r.vendorID = [dict[@"vendorID"] unsignedIntValue];
+    r.modelID = [dict[@"modelID"] unsignedIntValue];
+    r.serialNumber = [dict[@"serialNumber"] unsignedIntValue];
+    r.pointWidth = (size_t)[dict[@"pointWidth"] unsignedLongLongValue];
+    r.pointHeight = (size_t)[dict[@"pointHeight"] unsignedLongLongValue];
+    r.pixelWidth = (size_t)[dict[@"pixelWidth"] unsignedLongLongValue];
+    r.pixelHeight = (size_t)[dict[@"pixelHeight"] unsignedLongLongValue];
+    r.refreshRate = [dict[@"refreshRate"] doubleValue];
+    r.mirrorOf = [dict[@"mirrorOf"] unsignedIntValue];
+    return r;
+}
+
+@end
+
+#pragma mark - 快照
+
+@implementation P0VDisplaySnapshot
+
++ (instancetype)captureActive {
+    P0VDisplaySnapshot *snap = [[P0VDisplaySnapshot alloc] init];
+    snap.capturedAt = [[NSDate date] timeIntervalSince1970];
+
+    NSMutableArray<P0VDisplayRecord *> *records = [NSMutableArray array];
+    for (NSNumber *num in P0VActiveDisplayIDs()) {
+        CGDirectDisplayID did = num.unsignedIntValue;
+        P0VDisplayRecord *r = [[P0VDisplayRecord alloc] init];
+        r.displayID = did;
+        r.bounds = CGDisplayBounds(did);
+        r.isMain = CGDisplayIsMain(did);
+        r.isBuiltin = CGDisplayIsBuiltin(did);
+        r.online = CGDisplayIsOnline(did);
+        r.active = CGDisplayIsActive(did);
+        r.vendorID = CGDisplayVendorNumber(did);
+        r.modelID = CGDisplayModelNumber(did);
+        r.serialNumber = CGDisplaySerialNumber(did);
+        r.mirrorOf = CGDisplayMirrorsDisplay(did);
+
+        CGDisplayModeRef mode = CGDisplayCopyDisplayMode(did);
+        if (mode) {
+            r.pointWidth = CGDisplayModeGetWidth(mode);
+            r.pointHeight = CGDisplayModeGetHeight(mode);
+            r.pixelWidth = CGDisplayModeGetPixelWidth(mode);
+            r.pixelHeight = CGDisplayModeGetPixelHeight(mode);
+            r.refreshRate = CGDisplayModeGetRefreshRate(mode);
+            r.mode = CFBridgingRelease(mode);
+        }
+        [records addObject:r];
+    }
+    snap.displays = records;
+    return snap;
+}
+
++ (instancetype)loadFromFile:(NSString *)path {
+    NSDictionary *dict = P0ReadJSON(path);
+    if (![dict isKindOfClass:[NSDictionary class]]) return nil;
+    NSArray *rows = dict[@"displays"];
+    if (![rows isKindOfClass:[NSArray class]]) return nil;
+
+    P0VDisplaySnapshot *snap = [[P0VDisplaySnapshot alloc] init];
+    snap.capturedAt = [dict[@"capturedAt"] doubleValue];
+    NSMutableArray<P0VDisplayRecord *> *records = [NSMutableArray array];
+    for (NSDictionary *row in rows) {
+        if (![row isKindOfClass:[NSDictionary class]]) continue;
+        [records addObject:[P0VDisplayRecord recordWithDictionary:row]];
+    }
+    snap.displays = records;
+    return snap;
+}
+
+- (BOOL)writeToFile:(NSString *)path error:(NSError **)error {
+    NSMutableArray *rows = [NSMutableArray array];
+    for (P0VDisplayRecord *r in self.displays) [rows addObject:[r dictionaryRepresentation]];
+    NSDictionary *dict = @{
+        @"version": @1,
+        @"capturedAt": @(self.capturedAt),
+        @"os": P0SystemInfo(),
+        @"displays": rows,
+    };
+    return P0WriteJSON(dict, path, error);
+}
+
+- (P0VDisplayRecord *)recordForID:(CGDirectDisplayID)displayID {
+    for (P0VDisplayRecord *r in self.displays) {
+        if (r.displayID == displayID) return r;
+    }
+    return nil;
+}
+
+- (NSArray<NSNumber *> *)displayIDs {
+    NSMutableArray *ids = [NSMutableArray array];
+    for (P0VDisplayRecord *r in self.displays) [ids addObject:@(r.displayID)];
+    return ids;
+}
+
+@end
+
+#pragma mark - 查询
+
+static NSArray<NSNumber *> *P0VDisplayIDsFromCG(CGError (*fn)(uint32_t, CGDirectDisplayID *, uint32_t *)) {
+    uint32_t count = 0;
+    if (fn(0, NULL, &count) != kCGErrorSuccess || count == 0) return @[];
+    CGDirectDisplayID *buf = calloc(count, sizeof(CGDirectDisplayID));
+    if (!buf) return @[];
+    uint32_t got = count;
+    CGError err = fn(count, buf, &got);
+    NSMutableArray *out = [NSMutableArray array];
+    if (err == kCGErrorSuccess) {
+        for (uint32_t i = 0; i < got; i++) [out addObject:@(buf[i])];
+    }
+    free(buf);
+    [out sortUsingSelector:@selector(compare:)];
+    return out;
+}
+
+NSArray<NSNumber *> *P0VActiveDisplayIDs(void) {
+    return P0VDisplayIDsFromCG(CGGetActiveDisplayList);
+}
+
+NSArray<NSNumber *> *P0VOnlineDisplayIDs(void) {
+    return P0VDisplayIDsFromCG(CGGetOnlineDisplayList);
+}
+
+NSArray<NSNumber *> *P0VAllDisplayIDsFromSkyLight(void) {
+    P0VLoadPrivateSymbols();
+    if (!gGetDisplayList) return nil;
+    uint32_t cap = 64;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        CGDirectDisplayID *buf = calloc(cap, sizeof(CGDirectDisplayID));
+        if (!buf) return nil;
+        uint32_t got = cap;
+        CGError err = gGetDisplayList(cap, buf, &got);
+        if (err == kCGErrorSuccess && got < cap) {
+            NSMutableArray *out = [NSMutableArray array];
+            for (uint32_t i = 0; i < got; i++) [out addObject:@(buf[i])];
+            free(buf);
+            [out sortUsingSelector:@selector(compare:)];
+            return out;
+        }
+        free(buf);
+        if (got < cap) return @[];
+        cap *= 4;
+    }
+    return nil;
+}
+
+NSArray<NSNumber *> *P0VStaleVirtualSlotIDs(void) {
+    NSArray<NSNumber *> *sls = P0VAllDisplayIDsFromSkyLight();
+    if (!sls) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSNumber *num in sls) {
+        CGDirectDisplayID did = num.unsignedIntValue;
+        if (CGDisplayIsOnline(did) || CGDisplayIsActive(did)) continue;
+        if (CGDisplayVendorNumber(did) != UINT32_MAX) continue;
+        CGRect b = CGDisplayBounds(did);
+        if (b.size.width > 1 || b.size.height > 1) continue;
+        [out addObject:num];
+    }
+    return out;
+}
+
+NSArray<NSDictionary *> *P0VDisplayDictionaries(NSArray<NSNumber *> *displayIDs) {
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSNumber *num in displayIDs) {
+        CGDirectDisplayID did = num.unsignedIntValue;
+        CGRect bounds = CGDisplayBounds(did);
+        CGDisplayModeRef mode = CGDisplayCopyDisplayMode(did);
+        NSString *points = @"(nil)", *pixels = @"(nil)";
+        if (mode) {
+            points = [NSString stringWithFormat:@"%zux%zu",
+                      CGDisplayModeGetWidth(mode), CGDisplayModeGetHeight(mode)];
+            pixels = [NSString stringWithFormat:@"%zux%zu",
+                      CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode)];
+            CGDisplayModeRelease(mode);
+        }
+        [out addObject:@{
+            @"displayID": @(did),
+            @"bounds": P0RectString(bounds),
+            @"main": @(CGDisplayIsMain(did)),
+            @"builtin": @(CGDisplayIsBuiltin(did)),
+            @"online": @(CGDisplayIsOnline(did)),
+            @"active": @(CGDisplayIsActive(did)),
+            @"asleep": @(CGDisplayIsAsleep(did)),
+            @"mirrorOf": @(CGDisplayMirrorsDisplay(did)),
+            @"vendorID": @(CGDisplayVendorNumber(did)),
+            @"modelID": @(CGDisplayModelNumber(did)),
+            @"points": points,
+            @"pixels": pixels,
+        }];
+    }
+    return out;
+}
+
+#pragma mark - 事务
+
+// WindowServer 的显示配置 IPC 无系统级超时（P0 两次 watchdog 事故的根因）。
+// 这里把 begin+configure+commit 整个放进后台线程并加死线；超时后只置位、不重试。
+static atomic_bool gWindowServerHung = false;
+
+BOOL P0VWindowServerHung(void) { return atomic_load(&gWindowServerHung); }
+void P0VMarkWindowServerHung(void) { atomic_store(&gWindowServerHung, true); }
+void P0VResetWindowServerHung(void) { atomic_store(&gWindowServerHung, false); }
+
+static CGConfigureOption P0VOption(P0VCommitScope scope) {
+    return scope == P0VCommitScopePermanent ? kCGConfigurePermanently : kCGConfigureForSession;
+}
+
+// body 返回 detail；*shouldCommit=NO 时取消事务。
+// 返回 YES 仅当 begin 与 commit 都成功且未超时。
+static BOOL P0VPerformTransaction(P0VCommitScope scope,
+                                  int timeoutSec,
+                                  NSDictionary * (^body)(CGDisplayConfigRef cfg, BOOL *shouldCommit),
+                                  NSDictionary **outDetail,
+                                  NSError **error) {
+    if (P0VWindowServerHung()) {
+        if (error) *error = [NSError errorWithDomain:@"P0V" code:10
+            userInfo:@{NSLocalizedDescriptionKey: @"WindowServer 已判定挂起，拒绝发起新的显示配置事务"}];
+        return NO;
+    }
+    if (timeoutSec <= 0) timeoutSec = 20;
+
+    __block CGError beginErr = kCGErrorSuccess;
+    __block CGError commitErr = kCGErrorSuccess;
+    __block NSDictionary *detail = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        CGDisplayConfigRef cfg = NULL;
+        beginErr = CGBeginDisplayConfiguration(&cfg);
+        if (beginErr == kCGErrorSuccess && cfg) {
+            BOOL shouldCommit = YES;
+            detail = body(cfg, &shouldCommit);
+            if (shouldCommit) {
+                commitErr = CGCompleteDisplayConfiguration(cfg, P0VOption(scope));
+            } else {
+                CGCancelDisplayConfiguration(cfg);
+                commitErr = kCGErrorFailure;
+            }
+        }
+        dispatch_semaphore_signal(sem);
+    });
+
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                                                   (int64_t)timeoutSec * NSEC_PER_SEC)) != 0) {
+        atomic_store(&gWindowServerHung, true);
+        P0Error(@"显示配置事务 %ds 未返回：WindowServer 疑似挂起；不再重试，交由守护进程兜底恢复",
+                timeoutSec);
+        if (outDetail) {
+            *outDetail = @{ @"timedOut": @YES, @"timeoutSec": @(timeoutSec),
+                            @"warning": @"事务可能迟到生效，不要重复提交" };
+        }
+        if (error) *error = [NSError errorWithDomain:@"P0V" code:11
+            userInfo:@{NSLocalizedDescriptionKey: @"显示配置事务超时（WindowServer 疑似挂起）"}];
+        return NO;
+    }
+
+    NSMutableDictionary *merged = [detail mutableCopy] ?: [NSMutableDictionary dictionary];
+    merged[@"beginResult"] = @(beginErr);
+    merged[@"commitResult"] = @(commitErr);
+    if (outDetail) *outDetail = merged;
+
+    if (beginErr != kCGErrorSuccess || commitErr != kCGErrorSuccess) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"P0V" code:12
+                userInfo:@{NSLocalizedDescriptionKey:
+                    [NSString stringWithFormat:@"显示配置事务失败（begin=%d commit=%d）",
+                     (int)beginErr, (int)commitErr]}];
+        }
+        return NO;
+    }
+    return YES;
+}
+
+BOOL P0VApplyDisplayEnabledChanges(NSArray<NSNumber *> *toDisable,
+                                   NSArray<NSNumber *> *toEnable,
+                                   P0VCommitScope scope,
+                                   int timeoutSec,
+                                   NSDictionary **detail,
+                                   NSError **error) {
+    P0VLoadPrivateSymbols();
+    if (!gConfigureDisplayEnabled) {
+        if (error) *error = [NSError errorWithDomain:@"P0V" code:13
+            userInfo:@{NSLocalizedDescriptionKey: @"SLSConfigureDisplayEnabled 不可用"}];
+        return NO;
+    }
+    if (toDisable.count == 0 && toEnable.count == 0) {
+        if (detail) *detail = @{ @"noop": @YES };
+        return YES;
+    }
+
+    return P0VPerformTransaction(scope, timeoutSec, ^NSDictionary *(CGDisplayConfigRef cfg, BOOL *shouldCommit) {
+        NSMutableArray *ops = [NSMutableArray array];
+        NSMutableArray *errors = [NSMutableArray array];
+
+        for (NSNumber *num in toDisable) {
+            CGDirectDisplayID did = num.unsignedIntValue;
+            CGError e = gConfigureDisplayEnabled(cfg, did, false);
+            [ops addObject:@{ @"displayID": @(did), @"enabled": @NO, @"result": @(e) }];
+            if (e != kCGErrorSuccess) {
+                [errors addObject:[NSString stringWithFormat:@"disable %u -> CGError %d", did, (int)e]];
+                *shouldCommit = NO;
+                break;
+            }
+        }
+        if (*shouldCommit) {
+            for (NSNumber *num in toEnable) {
+                CGDirectDisplayID did = num.unsignedIntValue;
+                CGError e = gConfigureDisplayEnabled(cfg, did, true);
+                [ops addObject:@{ @"displayID": @(did), @"enabled": @YES, @"result": @(e) }];
+                if (e != kCGErrorSuccess) {
+                    [errors addObject:[NSString stringWithFormat:@"enable %u -> CGError %d", did, (int)e]];
+                    *shouldCommit = NO;
+                    break;
+                }
+            }
+        }
+        return @{ @"ops": ops, @"errors": errors };
+    }, detail, error);
+}
+
+static CGDisplayModeRef P0VLookupMode(CGDirectDisplayID did,
+                                      size_t pointW, size_t pointH,
+                                      size_t pixelW, size_t pixelH,
+                                      double refresh) CF_RETURNS_RETAINED {
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(did, NULL);
+    if (!modes) return NULL;
+
+    CGDisplayModeRef best = NULL;
+    double bestScore = INFINITY;
+    for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
+        CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+        size_t mw = CGDisplayModeGetWidth(m), mh = CGDisplayModeGetHeight(m);
+        size_t mpw = CGDisplayModeGetPixelWidth(m), mph = CGDisplayModeGetPixelHeight(m);
+        if (pointW && pointH && (mw != pointW || mh != pointH)) continue;
+        if (pixelW && pixelH && (mpw != pixelW || mph != pixelH)) continue;
+        double score = fabs(CGDisplayModeGetRefreshRate(m) - refresh);
+        if (score < bestScore) { bestScore = score; best = m; }
+    }
+    // 精确尺寸找不到时退到像素面积最接近的模式：宁可分辨率略有差异，也不能在恢复阶段
+    // 把屏留在 1x1 退化态。最终是否还原正确由调用方比较拓扑来判定。
+    if (!best) {
+        size_t wantArea = pixelW * pixelH;
+        size_t bestDelta = SIZE_MAX;
+        for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
+            CGDisplayModeRef m = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+            size_t area = CGDisplayModeGetPixelWidth(m) * CGDisplayModeGetPixelHeight(m);
+            size_t delta = area > wantArea ? area - wantArea : wantArea - area;
+            if (delta < bestDelta) { bestDelta = delta; best = m; }
+        }
+    }
+    if (best) CGDisplayModeRetain(best);
+    CFRelease(modes);
+    return best;
+}
+
+BOOL P0VRestoreSnapshot(P0VDisplaySnapshot *snapshot,
+                        P0VCommitScope scope,
+                        int timeoutSec,
+                        NSDictionary **detail,
+                        NSError **error) {
+    if (P0VWindowServerHung()) {
+        if (error) *error = [NSError errorWithDomain:@"P0V" code:14
+            userInfo:@{NSLocalizedDescriptionKey: @"WindowServer 已判定挂起，跳过恢复事务"}];
+        return NO;
+    }
+    NSArray<NSNumber *> *ids = [snapshot displayIDs];
+    if (ids.count == 0) {
+        if (detail) *detail = @{ @"note": @"快照为空，无可恢复项" };
+        return YES;
+    }
+
+    // 第一步：把快照里「当前不在 active list」的屏重新 enable。
+    // 已经 active 的屏必须跳过 —— 对已启用屏重复 enable 在部分 WindowServer
+    // 版本上会返回错误，导致整个恢复事务被取消。
+    NSSet *activeNow = [NSSet setWithArray:P0VActiveDisplayIDs()];
+    NSMutableArray<NSNumber *> *toEnable = [NSMutableArray array];
+    for (NSNumber *n in ids) if (![activeNow containsObject:n]) [toEnable addObject:n];
+
+    NSDictionary *enableDetail = nil;
+    NSError *enableError = nil;
+    BOOL enableOK = YES;
+    if (toEnable.count > 0) {
+        enableOK = P0VApplyDisplayEnabledChanges(@[], toEnable, scope, timeoutSec, &enableDetail, &enableError);
+    } else {
+        enableDetail = @{ @"skipped": @"all-snapshot-displays-already-active" };
+    }
+    if (!enableOK) {
+        if (detail) *detail = @{ @"phase": @"enable", @"enable": enableDetail ?: @{} };
+        if (error) *error = enableError;
+        return NO;
+    }
+    P0SleepMs(800);
+
+    // 第二步：恢复 mirror / mode / origin。逐项尽力而为，不因某一项失败取消整个事务，
+    // 否则会把「只差原点」的拓扑留在更糟的状态。
+    NSDictionary *topologyDetail = nil;
+    NSError *topologyError = nil;
+    BOOL topologyOK = P0VPerformTransaction(scope, timeoutSec, ^NSDictionary *(CGDisplayConfigRef cfg, BOOL *shouldCommit) {
+        NSMutableArray *ops = [NSMutableArray array];
+        NSMutableArray *errors = [NSMutableArray array];
+
+        for (P0VDisplayRecord *r in snapshot.displays) {
+            CGDirectDisplayID did = r.displayID;
+
+            CGError mirrorErr = CGConfigureDisplayMirrorOfDisplay(cfg, did, r.mirrorOf);
+            [ops addObject:@{ @"displayID": @(did), @"op": @"mirror",
+                              @"mirrorOf": @(r.mirrorOf), @"result": @(mirrorErr) }];
+            if (mirrorErr != kCGErrorSuccess) {
+                [errors addObject:[NSString stringWithFormat:@"mirror %u -> %d", did, (int)mirrorErr]];
+            }
+
+            CGDisplayModeRef mode = NULL;
+            if (r.mode) {
+                mode = (CGDisplayModeRef)CFBridgingRetain(r.mode);
+            } else {
+                mode = P0VLookupMode(did, r.pointWidth, r.pointHeight,
+                                     r.pixelWidth, r.pixelHeight, r.refreshRate);
+            }
+            if (mode) {
+                CGError modeErr = CGConfigureDisplayWithDisplayMode(cfg, did, mode, NULL);
+                [ops addObject:@{ @"displayID": @(did), @"op": @"mode",
+                                  @"points": [NSString stringWithFormat:@"%zux%zu", r.pointWidth, r.pointHeight],
+                                  @"result": @(modeErr) }];
+                if (modeErr != kCGErrorSuccess) {
+                    [errors addObject:[NSString stringWithFormat:@"mode %u -> %d", did, (int)modeErr]];
+                }
+                CFRelease(mode);
+            } else {
+                [ops addObject:@{ @"displayID": @(did), @"op": @"mode", @"result": @"no-match" }];
+                [errors addObject:[NSString stringWithFormat:@"mode %u: 无匹配模式", did]];
+            }
+
+            CGError originErr = CGConfigureDisplayOrigin(cfg, did,
+                                                         (int32_t)llround(r.bounds.origin.x),
+                                                         (int32_t)llround(r.bounds.origin.y));
+            [ops addObject:@{ @"displayID": @(did), @"op": @"origin",
+                              @"origin": [NSString stringWithFormat:@"%.0f,%.0f",
+                                          r.bounds.origin.x, r.bounds.origin.y],
+                              @"result": @(originErr) }];
+            if (originErr != kCGErrorSuccess) {
+                [errors addObject:[NSString stringWithFormat:@"origin %u -> %d", did, (int)originErr]];
+            }
+        }
+        return @{ @"ops": ops, @"errors": errors };
+    }, &topologyDetail, &topologyError);
+
+    if (detail) {
+        *detail = @{
+            @"enable": enableDetail ?: @{},
+            @"topology": topologyDetail ?: @{},
+            @"ok": @(topologyOK),
+        };
+    }
+    if (!topologyOK && error) *error = topologyError;
+    return topologyOK;
+}
+
+#pragma mark - 守护进程
+
+static NSString *P0VGuardianLogPath(void) { return @"/tmp/p0v-display-guardian.log"; }
+
+static BOOL P0VFileExists(NSString *path) {
+    return [[NSFileManager defaultManager] fileExistsAtPath:path];
+}
+
+static void P0VWriteGuardianResult(NSString *snapshotPath, NSDictionary *result) {
+    NSString *path = [snapshotPath stringByAppendingString:@".guardian-result.json"];
+    NSError *err = nil;
+    if (!P0WriteJSON(result, path, &err)) {
+        P0Error(@"守护进程写结果失败: %@", err.localizedDescription);
+    }
+}
+
+int P0VRunGuardian(NSString *snapshotPath, pid_t parentPID) {
+    // 守护进程在独立进程组里，但仍显式忽略终端信号，避免被同组操作误杀。
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+
+    char rawPath[PATH_MAX] = {0};
+    uint32_t size = sizeof(rawPath);
+    if (_NSGetExecutablePath(rawPath, &size) != 0) rawPath[0] = '\0';
+    // proc_pidpath 返回的是 exec 时的真实路径；这里同样 realpath，
+    // 否则符号链接路径与真实路径不等，守护进程会误判父进程已退出。
+    char selfPath[PATH_MAX] = {0};
+    if (rawPath[0]) {
+        if (!realpath(rawPath, selfPath)) strlcpy(selfPath, rawPath, sizeof(selfPath));
+    }
+
+    P0Log(@"守护进程启动：parent=%d snapshot=%@", parentPID, snapshotPath);
+
+    while (1) {
+        if (kill(parentPID, 0) != 0) break;
+        // PID 被回收后可能复用给别的进程；路径不同即视为父进程已退出。
+        char parentPath[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(parentPID, parentPath, sizeof(parentPath)) <= 0) break;
+        if (selfPath[0] && strcmp(parentPath, selfPath) != 0) break;
+        usleep(250 * 1000);
+    }
+
+    // 父进程正常收尾时会先写 .done；给它一点时间落盘。
+    usleep(400 * 1000);
+    NSString *donePath = [snapshotPath stringByAppendingString:@".done"];
+    if (P0VFileExists(donePath)) {
+        P0Log(@"父进程已正常恢复并写 done，守护进程退出");
+        P0VWriteGuardianResult(snapshotPath, @{ @"acted": @NO, @"reason": @"parent-clean" });
+        return 0;
+    }
+
+    P0Error(@"父进程未正常收尾，守护进程开始兜底恢复物理屏");
+    P0VDisplaySnapshot *snap = [P0VDisplaySnapshot loadFromFile:snapshotPath];
+    if (!snap) {
+        P0Error(@"守护进程无法读取快照: %@", snapshotPath);
+        P0VWriteGuardianResult(snapshotPath, @{ @"acted": @YES, @"ok": @NO, @"error": @"snapshot-unreadable" });
+        return 2;
+    }
+
+    NSDictionary *detail = nil;
+    NSError *err = nil;
+    BOOL ok = P0VRestoreSnapshot(snap, P0VCommitScopeSession, 20, &detail, &err);
+    if (!ok && !P0VWindowServerHung()) {
+        P0Log(@"首次兜底恢复失败，1s 后重试一次");
+        P0SleepMs(1000);
+        ok = P0VRestoreSnapshot(snap, P0VCommitScopeSession, 20, &detail, NULL);
+    }
+
+    NSDictionary *result = @{
+        @"acted": @YES,
+        @"ok": @(ok),
+        @"error": err.localizedDescription ?: @"",
+        @"detail": detail ?: @{},
+        @"activeIDs": P0VActiveDisplayIDs(),
+        @"snapshotIDs": [snap displayIDs],
+    };
+    P0Log(@"守护进程兜底恢复 %@", ok ? @"成功" : @"失败");
+    P0VWriteGuardianResult(snapshotPath, result);
+    return ok ? 0 : 3;
+}
+
+BOOL P0VStartGuardian(NSString *snapshotPath, pid_t parentPID, NSError **error) {
+    char exe[PATH_MAX] = {0};
+    uint32_t size = sizeof(exe);
+    if (_NSGetExecutablePath(exe, &size) != 0) {
+        if (error) *error = [NSError errorWithDomain:@"P0V" code:20
+            userInfo:@{NSLocalizedDescriptionKey: @"无法取得自身可执行文件路径"}];
+        return NO;
+    }
+    char resolved[PATH_MAX] = {0};
+    if (!realpath(exe, resolved)) strlcpy(resolved, exe, sizeof(resolved));
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    const char *logPath = P0VGuardianLogPath().fileSystemRepresentation;
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, logPath,
+                                     O_WRONLY | O_CREAT | O_APPEND, 0644);
+    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, logPath,
+                                     O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    // 独立进程组：终端 Ctrl+C 只打到探针本身，守护进程留下完成兜底恢复。
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&attr, 0);
+
+    char pidArg[32];
+    snprintf(pidArg, sizeof(pidArg), "%d", parentPID);
+    char *argv[] = {
+        resolved,
+        "--guardian",
+        (char *)snapshotPath.fileSystemRepresentation,
+        "--parent-pid",
+        pidArg,
+        NULL,
+    };
+
+    pid_t child = 0;
+    int rc = posix_spawn(&child, resolved, &actions, &attr, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    posix_spawnattr_destroy(&attr);
+
+    if (rc != 0) {
+        if (error) *error = [NSError errorWithDomain:@"P0V" code:21
+            userInfo:@{NSLocalizedDescriptionKey:
+                [NSString stringWithFormat:@"posix_spawn 守护进程失败: %s", strerror(rc)]}];
+        return NO;
+    }
+    P0Log(@"已启动守护进程 pid=%d（日志 %@）", (int)child, P0VGuardianLogPath());
+    return YES;
+}
