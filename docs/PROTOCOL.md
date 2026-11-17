@@ -4,7 +4,7 @@
 |---|---|
 | 版本 | protocol v1-draft |
 | 日期 | 2026-11-16 |
-| 状态 | 草稿，随 DESIGN.md v0.2-draft 评审；D-01（帧通道传输）决策后冻结 |
+| 状态 | 草稿；**D-01 已决（QUIC datagram，见 `DECISIONS.md`）**，待评审后冻结 v1 |
 | 上位文档 | `docs/DESIGN.md` §3.2 / §4.3 / §5 |
 
 ---
@@ -14,7 +14,7 @@
 | 通道 | 传输 | 默认端口 | 内容 |
 |---|---|---|---|
 | 控制通道 | TLS 1.3 over TCP | 47990 | 配对、信令、输入事件、心跳、关键帧请求 |
-| 帧通道 | D-01 待定（QUIC 建议 / UDP 自研） | 47991 | 编码帧分片 |
+| 帧通道 | **QUIC over UDP（unreliable datagram，D-01 已定）** | 47991/udp | 编码帧分片 |
 | 发现 | Bonjour/mDNS `_macos-rdp._tcp` | — | Host 广播：名称、协议版本范围、配对状态 |
 
 控制通道消息：4 字节大端长度前缀 + UTF-8 JSON。帧通道二进制头见 §4。
@@ -80,11 +80,13 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 | 8 | frameSeq | 4 | 单调递增，重组与丢帧判据 |
 | 12 | fragIdx | 1 | 分片序号 |
 | 13 | fragCount | 1 | 总分片数（≤255） |
-| 14 | payloadLen | 2 | 本分片载荷字节数（MTU 安全 ≤1200） |
+| 14 | payloadLen | 2 | 本分片载荷字节数（≤1200，见下方 D-01 说明） |
 
 载荷：AVCC（长度前缀 NALU）；关键帧分片带 SPS/PPS（flags bit2）。pts 不随帧传——实时流以到达时间渲染，延迟统计走控制通道 `heartbeat.ts` 回环。
 
-丢帧策略：FrameReceiver 检测 frameSeq 缺口 → 丢弃该帧全部分片 → `keyframe-request`；解码器在关键帧到达前不产出。旧帧迟到直接丢弃（实时性优先）。
+丢帧策略：FrameReceiver 检测 frameSeq 缺口 → 丢弃该帧全部分片 → `keyframe-request`；解码器在关键帧到达前不产出。旧帧迟到直接丢弃（实时性优先）。已由 `P1FrameReassembler` 实现并单测。
+
+**D-01 补充**：帧通道已定为 QUIC datagram（`nw_quic_set_stream_is_datagram`）。QUIC short header + AEAD tag 约 20–30 B，实际下发建议按 **1150 B** 分片（当前实现常量 1200，需在 P2 联调前下调并同步单测）。
 
 ## 5. 错误码（session-error.code）
 
@@ -100,12 +102,12 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 
 ## 6. 安全要求
 
-- 控制通道强制 TLS 1.3；帧通道加密随 D-01（QUIC 自带；自研 UDP 用会话密钥 AES-256-GCM，密钥由控制通道协商分发）。
+- 控制通道强制 TLS 1.3；帧通道由 **QUIC 的 TLS 1.3** 提供加密与身份校验（D-01 已定，不再自研 AES-GCM）。
 - 未配对指纹的连接在 `hello` 后即断；配对码 5 分钟有效、试错 5 次锁定 10 分钟。
 - 输入注入仅接受 STREAMING 态会话；`bye`/断线后立即清空修饰键状态。
 
 ## 7. 待决与变更
 
-- D-01 决策后补充帧通道握手/拥塞控制细节，本协议冻结为 v1。
+- D-01 已决（2026-11-17，QUIC datagram）；待补帧通道握手/ALPN/拥塞控制参数后冻结为 v1。
 - 光标通道（FR-10, P2）预留 `type:"cursor"`，本期不实现。
-- 变更记录：v1-draft 2026-11-16 首次起草。
+- 变更记录：v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram），并标注分片 1150 B 待调。

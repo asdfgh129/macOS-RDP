@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  P0-V root daemon 探针。
+  RunAtLoad=false：不随开机自动跑，避免未经确认就抓屏；
+  由 `sudo launchctl kickstart -k system/com.p0v.rootprobe` 手动触发一次。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.p0v.rootprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/P0VRootProbe.app/Contents/MacOS/p0vprobe</string>
+        <string>daemon-run</string>
+    </array>
+    <key>RunAtLoad</key><false/>
+    <key>KeepAlive</key><false/>
+    <key>UserName</key><string>root</string>
+    <key>GroupName</key><string>wheel</string>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardErrorPath</key><string>/tmp/p0v-root-stderr.log</string>
+    <key>StandardOutPath</key><string>/tmp/p0v-root-stdout.log</string>
+    <key>AbandonProcessGroup</key><true/>
+</dict>
+</plist>

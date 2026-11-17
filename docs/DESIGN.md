@@ -2,10 +2,10 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v0.2-draft |
-| 日期 | 2026-11-16 |
-| 状态 | **草稿，待评审**；含「待验证假设」（§2.5），定稿前须关闭 A-01 / A-02 |
-| 关联工程 | `P0-TahoeProbe/`（可行性探针，Sequoia 基线已通过，见其 README §12.6） |
+| 文档版本 | v0.3-draft |
+| 日期 | 2026-11-17 |
+| 状态 | **草稿，待评审**；A-01 已于 2026-11-17 关闭（单屏 P0 通过），定稿仍须关闭 A-02 |
+| 关联工程 | `P0-TahoeProbe/`（可行性探针；Tahoe 26.5.2 建屏/捕获/编码/HiDPI 全通过，见其 README §13–§15）；`P0V-SessionRecon/`（独占会话能力侦察，见其 README）；`P1-ClientProbe/`（协议编解码 + 坐标变换） |
 | 评审记录 | 无（首次起草） |
 
 ---
@@ -14,11 +14,13 @@
 
 ### 1.1 目的
 
-为「Intel Mac + macOS 13–26（Ventura–Tahoe）无头被控端 + 非 VNC 远程桌面」产品给出可评审、可追溯、可分阶段实施的软件设计方案。本文档承接 P0 探针的实证结论，把已验证事实与待验证假设严格分开，作为后续骨架开发（M1）的唯一设计依据。
+为「Intel Mac + macOS 13–26（Ventura–Tahoe）**独占式会话**远程桌面」产品给出可评审、可追溯、可分阶段实施的软件设计方案。**产品形态在 2026-11-17 明确为「会话模式」：控制端登入后被控端置黑/锁定，控制端看到的是按自己规格新建的桌面，不是被控端物理屏的镜像**（见 §2.1、D-04）。本文档承接 P0 探针的实证结论，把已验证事实与待验证假设严格分开，作为后续骨架开发（M1）的唯一设计依据。
 
 ### 1.2 范围
 
-**本期（M1–M3）覆盖**：虚拟屏管理、SCK 捕获、H.264 硬编、局域网传输、控制端解码渲染、键鼠注入、多屏会话、断线恢复、无人值守运行。
+**本期（M1–M3）覆盖**：独占式会话生命周期（认证→解锁→建虚拟屏→物理屏置黑→断开恢复锁屏）、虚拟屏管理、SCK 捕获、H.264 硬编、局域网传输、控制端解码渲染、键鼠注入、多屏会话、断线恢复、无人值守运行。
+
+**明确不做**：捕获被控端物理屏、把被控端多块物理屏一一映射到控制端（VNC/镜像语义）。
 
 **本期不做**（列入后续相位，见 §10）：音频、剪贴板、文件传输、互联网穿透（NAT/中继）、Apple Silicon 适配、macOS 27+ 适配。
 
@@ -26,8 +28,8 @@
 
 | 术语 | 含义 |
 |---|---|
-| Host / 被控端 | Intel Mac，macOS **13 Ventura – 26 Tahoe**（P0 目标验证机：26.7.3），无物理显示器（无头），建虚拟屏并采集编码 |
-| Client / 控制端 | Intel Mac，macOS **13 Ventura – 26 Tahoe**（P0 基线验证机：15.5 Sequoia），解码渲染并采集键鼠 |
+| Host / 被控端 | Intel Mac，macOS **13 Ventura – 26 Tahoe**（P0 目标验证机：**26.5.2 / 25F84**，2026-11-17 实机复核；早前文档写的 26.7.3 未在该机复现），无物理显示器（无头），建虚拟屏并采集编码 |
+| Client / 控制端 | Intel Mac，macOS **13 Ventura – 26 Tahoe**（P0 基线验证机：15.5 Sequoia，历史记录），解码渲染并采集键鼠 |
 | 虚拟屏 | `CGVirtualDisplay` 私有 SPI 创建的显示器，SCK 可捕获 |
 | identity | 虚拟屏的 vendor/product/serial 三元组；Tahoe 上可能被 WindowServer 缓存污染 |
 | glass-to-glass | 控制端输入动作到画面回显的端到端延迟 |
@@ -47,22 +49,26 @@
 
 ### 2.1 角色与场景
 
-- **主场景**：用户把无头 Intel Mac（Ventura–Tahoe）放在机房/角落，用另一台 Intel Mac（同范围，接 N 块物理屏）在局域网内把它当作「本机扩展桌面」使用：键鼠直接操作远端桌面，多屏一一对应，延迟接近本地。
+- **主场景（独占会话）**：用户把 Intel Mac（Ventura–Tahoe）放在机房/角落，从另一台 Intel Mac 连过去。**被控端无需有屏、有几块屏都无关**：控制端登入后，被控端进入独占状态（物理屏置黑 + 锁定，现场无法使用也无法旁观），控制端按自己的规格得到 N 路桌面（客户端说几块、多大，就几块、多大），键鼠直接操作，延迟接近本地。会话结束，虚拟屏销毁、物理屏恢复、被控端重新锁屏。
+- **反场景（不是产品）**：把被控端物理屏内容镜像到控制端；被控端几块屏就在控制端摆几块窗口。
 - **运维场景**：Host 断电重启后无人值守自动恢复服务；系统安全更新后自动/手动回归验证私有 SPI 未漂移。
 
 ### 2.2 功能需求
 
 | 编号 | 需求 | 优先级 | 验收要点 |
 |---|---|---|---|
-| FR-01 | Host 创建/销毁 1–N 块虚拟屏（默认 2，上限待 A-04 实测） | P0 | 每屏 online+active+SCK 可见，mode 落到目标分辨率 |
+| FR-00 | **会话独占**：控制端认证通过后，Host 进入独占态（物理屏 disable + 本地键鼠输入被吞掉并上报），断开后恢复物理屏并进入**待机壳**（黑屏 + 吞输入，不锁屏；高安全档可配置为真锁屏，见 D-07） | P0 | 会话期间现场屏不可见内容、本地输入不进入会话；断开 5s 内恢复；现场手势可夺回控制权（D-06 §3） |
+| FR-01 | **只建虚拟屏，绝不捕获物理屏**：按控制端规格建 N 块 `CGVirtualDisplay`（块数与分辨率由客户端决定），会话结束全部销毁 | P0 | 每屏 online+active+SCK 可见、mode 落到客户端目标；`capture` 的 displayID 全部为会话内新建的虚拟屏；会话期间 `CGGetActiveDisplayList` **只返回这 N 块**（C-09） |
 | FR-02 | 虚拟屏故障自恢复：stale 检测、identity walk、原子解除自动镜像、SPI 熔断 | P0 | 注入故障后 30s 内恢复或明确报错，绝不拖挂 WindowServer |
 | FR-03 | SCK 逐屏捕获 + VideoToolbox H.264 硬编（IOSurface 零拷贝） | P0 | 1080p60 非黑帧，编码产出连续 |
 | FR-04 | 局域网会话：发现、配对认证、加密传输 | P0 | 未配对设备无法连接；链路加密 |
 | FR-05 | Client 解码（VT 硬解）+ Metal 渲染，N 个无边框全屏窗口落到 N 块物理屏 | P0 | 坐标变换正确（负坐标/混合缩放），首帧 < 1s |
 | FR-06 | 键鼠采集与注入：`CGEventPost` + display ID 路由、中文输入法、修饰键同步 | P0 | 中文输入可用；Cmd-Tab 等系统快捷键可按策略拦截/放行 |
-| FR-07 | 分辨率/屏数由控制端动态协商，Host 原地重建或 applySettings | P1 | 协商失败事务性回退，不掉会话 |
+| FR-07 | 分辨率/屏数/相对布局由控制端动态协商，Host 原地重建或 applySettings | P1 | 协商失败事务性回退，不掉会话；布局变化后指针约束仍成立（C-09） |
 | FR-08 | 断线检测与自动重连，重连后桌面状态保持 | P1 | 拔网线 10s 恢复后会话继续 |
-| FR-09 | 无人值守：自动登录 + LaunchAgent 开机自启 + 崩溃自重启 | P1 | 断电重启后 2min 内可连 |
+| FR-09 | 无人值守：自动登录 + LaunchAgent 开机自启 + 崩溃自重启 + **禁止闲置锁屏**（Host 保持登录态） | P1 | 断电重启后 2min 内可连；连续 24h 无操作后仍可直接连接（D-07） |
+| FR-12 | **现场取回控制权**：现场用户可用手势力夺回机器，不依赖远程方同意 | P0 | 手势触发后 ≤10s 恢复物理屏并锁屏；远程端收到明确原因（D-06 §3） |
+| FR-13 | **远程登录**：Host 处于锁屏/登录窗态时，客户端可在**虚拟屏**上看到登录界面、输密码解锁，解锁后无缝转入桌面采集 | P1（V-04 通过则升 P0） | V-04a/b/c/d 全过；物理屏全程无内容泄露（C-09 仍成立） |
 | FR-10 | 光标独立通道（低延迟本地光标渲染） | P2 | 光标移动不依赖帧回环 |
 | FR-11 | 音频转发、剪贴板同步 | P2 | 后续相位单独设计 |
 
@@ -83,24 +89,29 @@
 
 | 编号 | 约束 | 来源 |
 |---|---|---|
-| C-01 | **双端适配 macOS 13 Ventura – 26 Tahoe，仅 Intel x86_64**；每台部署机器锁定具体 build（如 26.7.3/25Gxxx）；不追 macOS 27+（仅 Apple Silicon，Intel 不可装） | 用户需求 2026-11-16；README §0/§8 |
+| C-01 | **双端适配 macOS 13 Ventura – 26 Tahoe，仅 Intel x86_64**；每台部署机器锁定具体 build（实测基线 **26.5.2/25F84**）；不追 macOS 27+（仅 Apple Silicon，Intel 不可装） | 用户需求 2026-11-16；README §0/§8/§13 |
 | C-02 | 产品基座只用 MIT 组件（SideScreen MacHost / VirtualDisplayKit）；OpenDisplay GPL-3.0 仅参考行为结论，**禁止复制源码或 fork 主线** | README §10 |
-| C-03 | 必须在已登录 Aqua GUI 会话运行（LaunchAgent，非 Daemon）；TCC 屏幕录制/辅助功能授权归属父 App | README §3 |
+| C-03 | **Host 双组件**：root LaunchDaemon（特权：显示配置/禁物理屏、登录窗捕获、定向注入、开机引导）+ 用户态 LaunchAgent（会话内：建虚拟屏、SCK 采集、编码、常规注入）。TCC 按二进制逐个授权，daemon 无 UI 会话弹不出授权框，须手动拖入授权列表或 MDM PPPC 下发 | D-08；README §3 |
 | C-04 | 私有 SPI 无兼容性承诺；所有 SPI 调用必须带死线 + 熔断（P0 事故教训） | README §12 |
 | C-05 | 官方高性能屏幕共享要求双端 Apple Silicon，Intel 无系统级退路；唯一硬件退路是 EDID 假插头（牺牲动态分辨率） | README §0/§8 |
 | C-06 | Ventura 13 / Sonoma 14 已超出 Apple 常规安全更新窗口（以 Apple 公告为准）：可以适配，但部署文档必须提示「老版本不再收到安全补丁」的风险，由用户自担 | Apple 支持周期 |
+| **C-07** | **禁止镜像语义**：不得捕获物理屏、不得把被控端屏数映射到控制端。控制端显示规格唯一来源是客户端请求 | 用户需求 2026-11-17（明确否决 VNC 模式） |
+| **C-08** | **单会话模型，不做多会话并发**：macOS 的 Aqua 会话创建被 `com.apple.private.aqua.createSession` 独占（仅 loginwindow 持有），第三方无法新建并行会话。产品用「同一 console 会话内独占」实现隔离语义，**不是 Windows RDP 的多会话** | 本机 entitlement 取证，见 `P0V-SessionRecon/README.md` §1.2 |
+| **C-09** | **显示空间隔离（硬约束）**：会话期间 Host 全局坐标空间**只能包含本会话的虚拟屏**。物理屏必须 `disable`（移出空间），**不得**只做「置黑 / 高窗口层遮罩但仍启用」。任何使指针可落入物理屏区域、或使窗口可被拖入物理屏区域的实现一律判不合格。屏数恒等于客户端请求数，与 Host 物理屏数量无关 | 用户需求 2026-11-17（"不能在 4 块屏里移动"）；决策见 D-05 |
 
 ### 2.5 待验证假设（定稿前必须关闭 A-01/A-02）
 
 | 编号 | 假设 | 验证方式 | 不成立时的回退 |
 |---|---|---|---|
-| **A-01** | Tahoe 26.7.3 Intel 上私有 SPI 可用，identity walk + 保守 canvas→promote 能恢复 stale/poisoned | 明天真机 `run_p0.sh`，回传诊断包（README §11） | 逐 selector 重逆向；极端情况 EDID 假插头（C-05） |
+| **A-01** | Tahoe **26.5.2 (25F84)** Intel 上私有 SPI 可用，identity walk + 保守 canvas→promote 能恢复 stale/poisoned | ✅ **已关闭**（2026-11-17 11:55）：单屏 `verify` 返回 `pass=1`、`visibility` 一次命中、`capture=HAS_CONTENT`、`identityOffset=0`（本次未触发 walk）。见 README §14 | 逐 selector 重逆向；极端情况 EDID 假插头（C-05） |
 | **A-02** | 双机 1080p60 采集+编码 < 30ms、总链路 < 50ms | P2 双机 spike | 降分辨率/帧率；编码参数调优；传输换 QUIC |
 | A-03 | `CGEventKeyboardSetUnicodeString` 中文注入与修饰键同步在 Tahoe 可用 | P1 控制端探针 + 双机联调 | 改 IOHIDPostEvent / 输入法状态机同步 |
-| A-04 | Intel+Tahoe 扩展虚拟屏上限 ≥ 2（社区经验约 4） | 真机 3/4 屏压测 | 产品规格按实测上限写死 |
+| A-04 | Intel+Tahoe 扩展虚拟屏上限 ≥ 2（社区经验约 4） | ✅ **已关闭 2026-11-17**：实测 **2 物理 + 4 虚拟 = 6 块 display 同时 online/active 且全部可捕获**（README §16.1）。虚拟屏走 WindowServer 软件合成，不占 Intel DDI 通道，与物理屏数量**解耦** | — |
 | A-05 | HiDPI（2x points/pixels）与混合缩放渲染正确 | P1 渲染探针 | 本期只支持 1x，HiDPI 降级为 P2 |
 | A-06 | 安全更新不破坏私有 SPI | 每次更新后 probe+verify 回归（NFR-08） | 版本锁定回滚 + 社区补丁跟进 |
 | A-07 | Ventura 13 / Sonoma 14 上私有 SPI 与 Sequoia 行为一致（selector 已在 15/26/27 复核一致，13/14 未实测） | 各版本真机 probe+verify（P0-R，M3 前关闭） | OS 策略按版本加分支；个别版本不支持则从适配范围剔除并记录 |
+| **A-08** | 独占态的物理屏可以「只对现场置黑」，且不影响虚拟屏的建屏与捕获：`SLSConfigureDisplayEnabled` 在显示配置事务内可提交 | **P0-V**：V-01 禁用**一块**物理屏后虚拟屏仍 `HAS_CONTENT`，且按键/触控板/触控 ID 等唤醒事件**不会**把物理屏重新 enable；V-03 禁用**全部**物理屏（只剩虚拟屏）后系统仍可建屏/捕获/注入输入（C-09 的极限情形）；V-02 锁屏态下 a) 能否捕获到锁屏界面而非黑帧、b) 能否把键鼠注入 loginwindow、c) 能否用注入密码完成解锁 | 退化为公开 API：`CGDisplayCapture` 独占物理屏 + 高窗口层遮罩 + **强制光标接管**（D-05 §3），并把「非绝对安全」写进产品说明 |
+| **A-09** | Host 在锁屏 / 登录窗态下，远程仍能拿到登录界面并完成登录（从而"断开后锁屏"与"可重连"同时成立） | **P0-V V-04a/b/c/d**（root daemon：SCK 捕获登录窗、定向注入、注入密码解锁、登录窗态建虚拟屏）。见 D-08 | 四项任一失败 → 退回 Path B：Host 常驻登录态、禁闲置锁屏、"断开后锁屏"降级为可选（D-07） |
 
 ---
 
@@ -138,12 +149,13 @@
 | 通道 | 承载 | 传输 | 理由 |
 |---|---|---|---|
 | 控制通道 | 配对、能力协商、输入事件、心跳、关键帧请求 | TLS/TCP（可靠） | 输入与信令不可丢 |
-| 帧通道 | 编码帧分片 | UDP/QUIC（D-01 待定） | 帧可丢旧不可等旧，避免 TCP 队头阻塞毁掉延迟 |
+| 帧通道 | 编码帧分片 | **QUIC over UDP 47991（D-01 已定，见 DECISIONS.md）** | 帧可丢旧不可等旧，避免 TCP 队头阻塞毁掉延迟 |
 | 光标通道（P2） | 光标位置/形状 | 并入控制通道或独立 UDP | 本地渲染光标，绕开帧回环延迟 |
 
 ### 3.3 部署视图
 
-- Host：自动登录 + 关 FileVault + LaunchAgent（GUI 会话内）；TCC 授权给产品 App；看门狗脚本崩溃自重启。
+- Host：双组件（root LaunchDaemon + 用户态 LaunchAgent，C-03）；自动登录 + 关 FileVault；看门狗崩溃自重启；安装器负责 daemon 注册与 TCC 授权引导。
+- **安全前置条件分两档**：Path A（V-04 通过，D-08）→ 断开后可真锁屏，物理安全要求回到常规水平，与 Apple 高性能屏幕共享同档；Path B（V-04 失败，D-07）→ 机器必须放在物理可信场所，且等价于一台**永不锁屏的已登录 Mac**，场地安全是唯一屏障，须写进部署文档。
 - Client：普通 App，N 块物理屏各一个全屏窗口；辅助功能授权用于全局键鼠捕获。
 - 两端均锁定具体 OS build；每次安全更新后跑回归（§7）。
 
@@ -155,7 +167,7 @@
 | 虚拟屏 SPI 声明 | 自研 protocol 重声明（P0 已验证） | 自有 | 参考 DeskPad（MIT）selector 名 |
 | 捕获/编码/解码 | ScreenCaptureKit + VideoToolbox（系统框架） | 系统 | P0 已实证 Intel QuickSync 硬编可用 |
 | 渲染 | Metal + IOSurface | 系统 | 零拷贝 |
-| 传输 | 待定 D-01（候选：自研 UDP vs QUIC 库） | 需 MIT/BSD/Apache | GPL 组件一律排除 |
+| 传输 | **QUIC（Network.framework 原生，D-01 已定）** | 系统框架，无第三方依赖 | GPL 组件一律排除；第三方 C 库（msquic/quiche）已否决 |
 | 语言 | Swift 为主 + ObjC 桥（P0 的 VDManager/PipelineProbe 可近乎原样搬入） | — | 私有 SPI 留 ObjC，产品逻辑 Swift |
 | 行为策略参考 | OpenDisplay PR #219/#288、issue #171 | **GPL-3.0，仅参考结论** | 合规红线见 C-02 |
 
@@ -165,7 +177,7 @@
 
 | 大版本 | 建屏策略 | identity | 失败重试 | 实证状态 |
 |---|---|---|---|---|
-| 26 Tahoe | 保守 canvas 1280×800 → SCK 可见 → promote | walk + 持久化成功 offset | 最多 4 组 | 社区已实锤坑位；真机待 A-01 |
+| 26 Tahoe | 保守 canvas 1280×800 → SCK 可见 → promote | walk + 持久化成功 offset | 最多 4 组 | 已实测（26.5.2）：offset=0 直接可用，未触发 walk；**HiDPI 必须在 `initWithDescriptor:` 一次给足（事后 `applySettings` 返回 YES 但静默无效，mode 永久锁 1x）；且不得对同屏重复提交相同模式（会清屏为纯黑）**，见 README §15.2 |
 | 15 Sequoia | 直建目标分辨率 + 原子 unmirror | 固定 | 失败即止（1 次） | **本机基线已通过（2026-11-16）** |
 | 14 Sonoma / 13 Ventura | 同 Sequoia 最小风险路径（P0 归入 Other 分支） | 固定 | 失败即止（1 次） | 未实测，A-07 待 P0-R 回归 |
 
@@ -201,7 +213,7 @@
 
 ### 4.3 控制协议（草案）
 
-JSON 信令 + 二进制帧头。信令消息：`hello/capabilities`、`pair-request/pair-confirm`、`session-start{specs[]}`、`session-update{specs[]}`、`input{type,payload,displayID}`、`keyframe-request{displayID}`、`heartbeat`、`bye{reason}`。帧头：`magic | version | displayID | frameSeq | flags(keyframe) | pts | fragIdx/fragCount | payloadLen`。协议版本号从 1 起，双端协商取小。
+JSON 信令 + 二进制帧头（细则以 `docs/PROTOCOL.md` 为准）。信令消息：`hello/capabilities`、`pair-request/pair-confirm`、`session-start{specs[]}`、`session-update{specs[]}`、`input{type,payload,displayID}`、`keyframe-request{displayID}`、`heartbeat`、`bye{reason}`。帧头（16 字节）：`magic | version | flags(keyframe/帧末分片/含SPS-PPS) | displayID | frameSeq | fragIdx | fragCount | payloadLen`。**pts 不随帧传输**（实时流按到达时间渲染，延迟统计走 `heartbeat.ts` 回环），与本文早前写的「帧头含 pts」冲突处已按 PROTOCOL 修正。协议版本号从 1 起，双端协商取小。
 
 ---
 
@@ -236,7 +248,7 @@ Client 窗口坐标 → 归一化到对应虚拟屏坐标 → 控制通道 → H
 ## 6. 安全设计
 
 - **配对认证**：首次 TOFU + 配对码（Host 本地显示/日志），之后证书绑定；未配对连接一律拒绝。
-- **加密**：控制通道 TLS 1.3；帧通道加密随 D-01 选型（QUIC 自带 TLS；自研 UDP 需 Noise/DTLS 或 AES-GCM 会话密钥）。
+- **加密**：控制通道 TLS 1.3；帧通道由 QUIC 的 TLS 1.3 提供（D-01 已定），不再自研 AES-GCM/DTLS。
 - **注入边界**：InputInjector 只接受已认证会话的事件；事件速率限制；Host 本地可一键断开所有会话。
 - **最小权限**：TCC 仅屏幕录制+辅助功能；不请求多余权限；配对凭据存 Keychain。
 - **审计日志**：会话建立/断开、配对、熔断事件落本地日志，诊断包不含凭据。
@@ -263,16 +275,17 @@ Client 窗口坐标 → 归一化到对应虚拟屏坐标 → 控制通道 → H
 | 阶段 | 内容 | 出口准则 | 状态 |
 |---|---|---|---|
 | P0 | 被控端链路探针（Sequoia 基线） | verify pass（双屏+编码环回） | **已完成 2026-11-16** |
-| P0-T | Tahoe 真机 P0（README §11 交接清单） | 真机 verdict.pass=true，诊断包回传 | 待明天执行（A-01） |
+| P0-T | Tahoe 真机 P0（README §11 交接清单） | 真机 verdict.pass=true，诊断包回传 | ✅ **建屏/捕获/编码/HiDPI/多屏容量 全部通过 2026-11-17**（`encode_rc=0 hidpi_rc=0`；2 物理+4 虚拟=6 屏在线，README §14–§16）。注：§16.2「捕获优先」结论已作废（镜像语义，见 D-04） |
+| **P0-V** | **独占会话能力验证**：物理屏 disable 后可与虚拟屏共存且不被唤醒事件重新 enable（V-01）、全部物理屏 disable 的极限情形（V-03）、锁屏态下建屏与采集（V-02） | A-08 关闭：`SLSConfigureDisplayEnabled` 在事务内提交成功且虚拟屏仍 `HAS_CONTENT` | 侦察已完成（`P0V-SessionRecon/`，能力全部存在）；**root daemon 探针已就绪（`P0V-RootDaemon/`，构建通过、用户态冒烟通过）；V-01/V-02/V-03/V-04 待执行，M1 会话层开工前必须关闭** |
 | P0-R | Ventura/Sonoma 真机回归（probe+verify，可借测机器，与 P1 并行） | 13/14 各出基线报告（A-07 关闭） | M3 前完成 |
 | P1 | 控制端探针 `P1-ClientProbe/`：硬解+Metal 渲染、N 窗口坐标、IME 注入 | §7 四项各出实证报告 | 待启动 |
 | P2 | 双机联调 spike：glass-to-glass 延迟 | NFR-01/02 达标或降级结论（A-02 关闭） | 依赖 P0-T、P1 |
-| **M1** | 产品骨架：MIT 基座集成 + 本文档模块划分落地 + 控制协议 v1 | 单屏会话端到端跑通（发现/配对/推流/输入） | **A-01/A-02 关闭后启动** |
+| **M1** | 产品骨架：MIT 基座集成 + 本文档模块划分落地 + 控制协议 v1 | 单屏会话端到端跑通（发现/配对/推流/输入） | A-01 已关闭；**仍待 A-02**（glass-to-glass 延迟），M1 可先做不依赖延迟数据的骨架工作 |
 | M2 | 多屏 + 完整输入（IME/修饰键/沉浸模式）+ 动态协商 | FR-05/06/07 验收 | |
 | M3 | 断线重连 + 无人值守 + 安全加固 + soak | FR-08/09、NFR-06/07、72h soak | |
 | M4（后续） | 光标独立通道、音频、剪贴板 | 单独设计评审 | |
 
-**方案定稿条件**：A-01、A-02 关闭 + D-01 传输选型决策 + 本文档评审通过。在此之前 M1 只做不依赖待验证假设的准备工作（基座源码审计、协议骨架、坐标变换单测）。
+**方案定稿条件**：A-02 关闭 + D-01 传输选型决策 + 本文档评审通过（A-01 已于 2026-11-17 关闭）。在此之前 M1 只做不依赖待验证假设的准备工作（基座源码审计、协议骨架、坐标变换单测）。
 
 ---
 
@@ -289,8 +302,8 @@ Client 窗口坐标 → 归一化到对应虚拟屏坐标 → 控制通道 → H
 
 | 编号 | 问题 | 候选与建议 | 决策期限 |
 |---|---|---|---|
-| D-01 | 帧通道传输 | ① 自研 UDP（序号+分片+NACK 关键帧请求，可控但工作量大）② QUIC 库（MIT/BSD 候选，自带加密与拥塞控制，**建议**）③ TCP 起步（最简单，队头阻塞风险，仅作 M1 临时） | M1 启动前 |
-| D-02 | 产品形态 | Swift App + ObjC 桥（建议，P0 代码可搬入）vs 纯 ObjC | M1 启动前 |
+| D-01 | 帧通道传输 | ✅ **已定（2026-11-17）：QUIC + unreliable datagram，Network.framework 原生实现**；API 已在 26.5 SDK 实测可构造。详见 `docs/DECISIONS.md` | M1 启动前 |
+| D-02 | 产品形态 | ✅ **已定（2026-11-17）：Swift 主工程 + ObjC 桥（RDPKit ObjC / RDPApp Swift）**，P0 的 VDManager/PipelineProbe 直接搬入。详见 `docs/DECISIONS.md` | M1 启动前 |
 | D-03 | 互联网远程 | 本期仅 LAN；后续 Tailscale/WireGuard 组网 vs 自建中继 | M3 评审 |
 | D-04 | 光标通道相位 | P2（FR-10），若 NFR-02 实测光标拖影明显则提前 | P2 后 |
 | D-05 | 音频/剪贴板 | M4 单独设计 | M3 后 |
@@ -303,3 +316,8 @@ Client 窗口坐标 → 归一化到对应虚拟屏坐标 → 控制通道 → H
 |---|---|---|---|
 | v0.1-draft | 2026-11-16 | 首次起草：承接 P0 Sequoia 基线通过结论，A-01/A-02 标记为定稿前置 | Qoder 协助起草 |
 | v0.2-draft | 2026-11-16 | 需求变更：双端 OS 适配范围放宽为 Ventura 13 – Tahoe 26（仅 Intel）；新增 §3.5 适配矩阵、A-07、P0-R 回归里程碑、C-06 老版本安全补丁风险提示 | Qoder 协助起草 |
+| v0.3-draft | 2026-11-17 | 环境事实校正：被控机实测 build 由 26.7.3 更正为 **26.5.2 / 25F84**（影响 §1.3、C-01、A-01、§8 P0-T 状态）；A-01 由「待明天执行」更新为「前置已就绪、待跑 verify」 | WorkBuddy 协助核对 |
+| v0.4-draft | 2026-11-17 | A-01 关闭：Tahoe 26.5.2 单屏 `verify` 通过（`pass=1`、offset=0、未触发 walk）；P0-T 标为单屏通过，双屏+编码待补；新增建屏耗时 11.3s 的性能风险与 M1 优化项（见 README §14） | WorkBuddy 协助核对 |
+| v0.5-draft | 2026-11-17 | 编码面与 HiDPI 面通过（`encode_rc=0 hidpi_rc=0`）；新增两条硬约束：**HiDPI 必须在 `initWithDescriptor:` 一次给足（事后 `applySettings` 静默无效）**、**不得对同屏重复提交相同模式（会清屏为纯黑）**；P0-T 仅剩双虚拟屏未测；协议 D-01/D-02 已定 | WorkBuddy 协助核对 |
+| v0.6-draft | 2026-11-17 | **架构修正**：实测 2 物理+4 虚拟=6 屏在线，虚拟屏不占 Intel DDI 通道 → 推翻「UHD 630 三屏上限会卡住虚拟屏」的错误推论，A-04 关闭；新增 **D-03 捕获优先**（有物理屏则 0 建屏直接采，首帧 124ms）并据此改写 FR-01；明确与 RDP 的本质差距是「会话隔离」而非「屏数」 | WorkBuddy 协助核对 |
+| v0.7-draft | 2026-11-17 | **产品形态澄清（用户纠正）**：目标是独占式会话，不是 VNC 镜像 —— 新增 FR-00 独占、改写 FR-01 为「只建虚拟屏、绝不捕获物理屏」、新增 C-07 禁止镜像 / C-08 单会话模型、A-08 物理屏置黑假设、P0-V 里程碑；作废 D-03 捕获优先 | WorkBuddy 协助核对 |
