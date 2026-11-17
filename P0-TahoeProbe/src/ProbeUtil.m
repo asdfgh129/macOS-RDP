@@ -94,6 +94,25 @@ static NSString *P0SysctlString(const char *key) {
     return s;
 }
 
+// hw.physicalcpu / hw.logicalcpu 是 int32 而不是 C 字符串。用 P0SysctlString 读它
+// 会把 4 字节整数当字符串解析，输出 "\u0006" 这类控制字符（2026-11-17 实测踩到）。
+static int P0SysctlInt(const char *key, int fallback) {
+    int value = 0;
+    size_t size = sizeof(value);
+    if (sysctlbyname(key, &value, &size, NULL, 0) != 0) return fallback;
+    return value;
+}
+
+// GUI 会话判据：CGSessionCopyCurrentDictionary 只在已登录的 Aqua 会话里返回非 NULL。
+// 旧实现用 getuid() != 0 判断，对任何非 root 进程恒为真，等于没有判据；
+// 而 README §11.4 把 GUI_SESSION 当作第二道闸门，判错会让整轮结论作废。
+static BOOL P0IsLoggedInGUI(void) {
+    CFDictionaryRef session = CGSessionCopyCurrentDictionary();
+    BOOL gui = (session != NULL);
+    if (session) CFRelease(session);
+    return gui;
+}
+
 NSDictionary *P0SystemInfo(void) {
     NSProcessInfo *pi = [NSProcessInfo processInfo];
     NSOperatingSystemVersion v = pi.operatingSystemVersion;
@@ -117,12 +136,13 @@ NSDictionary *P0SystemInfo(void) {
         @"arch": arch,
         @"cpuBrand": P0SysctlString("machdep.cpu.brand_string"),
         @"model": P0SysctlString("hw.model"),
-        @"physicalCores": P0SysctlString("hw.physicalcpu"),
+        @"physicalCores": @(P0SysctlInt("hw.physicalcpu", -1)),
+        @"logicalCores": @(P0SysctlInt("hw.logicalcpu", -1)),
         @"bundleId": bundle.bundleIdentifier ?: @"(command line tool)",
         @"pid": @(getpid()),
         @"parentApp": parent,
         @"uid": @(getuid()),
-        @"isLoggedInGUI": @(getuid() != 0),  // 粗判；真正判据见 README 的 CGWindowList 检查
+        @"isLoggedInGUI": @(P0IsLoggedInGUI()),
     };
 }
 

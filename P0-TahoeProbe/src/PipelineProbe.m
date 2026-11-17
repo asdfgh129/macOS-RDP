@@ -11,6 +11,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <stdatomic.h>
+#import <math.h>
 
 // 解码回调在编码回调里被引用，先给前向声明。
 static void P0DecompressionOutput(void *refCon, void *sourceFrameRefCon, OSStatus status,
@@ -128,6 +129,14 @@ static void P0DecompressionOutput(void *refCon, void *sourceFrameRefCon, OSStatu
 
 // 从 Y plane 做 8x8 网格采样，返回亮度均值与方差。
 // 全黑判定只作提示：Tahoe 的深色壁纸本来就偏暗，务必结合帧数与肉眼截图一起看。
+//
+// 注意色彩范围：捕获配置用的是 kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange，
+// 视频范围下 Y ∈ [16,235]，纯黑是 16 而不是 0。早期实现按「Y<8」判黑，
+// 在任何视频范围的帧上都不可能命中，等于关掉了 MOSTLY_BLACK 判据、
+// 会让真黑屏被误判为 HAS_CONTENT（假通过）。这里按 16 + 容差取阈值。
+static const double kP0VideoRangeBlackY = 16.0;
+static const double kP0BlackMeanTolerance = 4.0;   // 16 + 4，容忍少量抖动/压缩噪声
+static const double kP0BlackVarianceMax = 4.0;     // 近无空间变化
 static NSDictionary *P0LumaStats(CVPixelBufferRef pb) {
     if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
         return @{ @"mean": @(-1), @"variance": @(-1) };
@@ -203,8 +212,8 @@ static NSDictionary *P0LumaStats(CVPixelBufferRef pb) {
     double var  = [luma[@"variance"] doubleValue];
     if (mean >= 0 && mean < _worstLumaMean) _worstLumaMean = mean;
     if (var > _bestLumaVariance) _bestLumaVariance = var;
-    // 「全黑帧」= 亮度几乎为 0 且几乎无空间变化
-    if (mean >= 0 && mean < 8 && var < 4) _blackFrames++;
+    // 「全黑帧」= 亮度贴近视频范围黑电平 16 且几乎无空间变化
+    if (mean >= 0 && mean < kP0VideoRangeBlackY + kP0BlackMeanTolerance && var < kP0BlackVarianceMax) _blackFrames++;
 
     if (_withEncoder) [self encodePixelBuffer:pb pts:CMSampleBufferGetPresentationTimeStamp(sampleBuffer)];
 }
@@ -403,8 +412,20 @@ static NSDictionary *P0LumaStats(CVPixelBufferRef pb) {
 
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:target excludingWindows:@[]];
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
-    cfg.width = target.width;
-    cfg.height = target.height;
+    // SCStreamConfiguration.width/height 的单位是【像素】，而 SCDisplay.width/height 是【点】。
+    // 1x 虚拟屏两者相等；HiDPI(2x) 屏若不乘 pointPixelScale，就会把 2x 画面降采样成 1x 再编码，
+    // 使 HiDPI 验证（A-05）测到的其实是半分辨率流。宽高另按 H.264 要求取偶数。
+    // pointPixelScale 从 macOS 14 起才有；Ventura 13 上退回 1.0（13 上暂无 HiDPI 需求）。
+    CGFloat scale = 1.0;
+    if (@available(macOS 14.0, *)) {
+        if (filter.pointPixelScale > 0) scale = filter.pointPixelScale;
+    }
+    size_t outW = (size_t)llround(target.width * scale);
+    size_t outH = (size_t)llround(target.height * scale);
+    outW -= outW % 2;
+    outH -= outH % 2;
+    cfg.width = outW;
+    cfg.height = outH;
     cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     cfg.minimumFrameInterval = CMTimeMake(1, 60);
     cfg.queueDepth = 4;
@@ -444,8 +465,8 @@ static NSDictionary *P0LumaStats(CVPixelBufferRef pb) {
                       : @"startCapture 5s 未回调（WindowServer 疑似异常），已中止捕获" };
     }
 
-    P0Log(@"开始捕获 display %u (%zux%zu)，持续 %d ms", displayID,
-          (size_t)target.width, (size_t)target.height, durationMs);
+    P0Log(@"开始捕获 display %u (%zux%zu px, scale %.0f)，持续 %d ms", displayID,
+          outW, outH, (double)scale, durationMs);
     P0SleepMs(durationMs);
 
     dispatch_semaphore_t stopped = dispatch_semaphore_create(0);
@@ -470,7 +491,8 @@ static NSDictionary *P0LumaStats(CVPixelBufferRef pb) {
     return @{
         @"displayID": @(displayID),
         @"ok": @(frames > 0),
-        @"raster": [NSString stringWithFormat:@"%zux%zu", (size_t)target.width, (size_t)target.height],
+        @"raster": [NSString stringWithFormat:@"%zux%zu", outW, outH],
+        @"rasterScale": @((double)scale),
         @"durationMs": @(durationMs),
         @"frames": @(frames),
         @"fps": @((int)(frames / seconds)),

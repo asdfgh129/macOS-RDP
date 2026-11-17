@@ -75,6 +75,19 @@ if ! "$CLANG" \
 fi
 
 echo ""
+# 自动 ad-hoc 签名（2026-11-17 实测结论，务必保留）：
+#   TCC 对命令行工具按「路径 + cdhash」记账。未签名的二进制每次重建都会丢掉
+#   屏幕录制授权；更糟的是**未签名状态下连「委托给责任进程」都不成立**，
+#   会直接回落到 "The user declined TCCs" 而看不出原因。
+#   固定 identifier 让 TCC 记录在多次重建之间保持可识别。
+if command -v codesign >/dev/null 2>&1; then
+  if codesign --force --sign - --identifier "com.p0.tahoeprobe" --timestamp=none ./p0probe 2>/dev/null; then
+    echo "已 ad-hoc 签名（identifier=com.p0.tahoeprobe）"
+  else
+    echo "警告：ad-hoc 签名失败，重建后屏幕录制授权可能失效" >&2
+  fi
+fi
+
 echo "构建完成：./p0probe"
 echo "先跑：./p0probe probe --capabilities"
 echo "记得给「终端」授权：系统设置 → 隐私与安全性 → 屏幕录制（以及辅助功能）"

@@ -117,7 +117,9 @@ static int P0CommandProbe(NSDictionary *args) {
     P0Emit(@"sck-before", @{
         @"error": err.localizedDescription ?: @"",
         @"visibleDisplayIDs": ids ?: @[],
-        @"screenRecordingGranted": @(ids != nil),
+        // 注意：必须显式转 BOOL，否则 `ids != nil` 是 int，@() 会装箱成 1/0，
+        // 而 README 判读表与外部脚本按 true/false 匹配（2026-11-17 已踩坑两次）
+        @"screenRecordingGranted": @((BOOL)(ids != nil)),
     });
     if (!ids) {
         P0Error(@"屏幕录制权限未就绪。请给「%@」在 系统设置 → 隐私与安全性 → 屏幕录制 授权，然后重开终端。",
@@ -132,6 +134,80 @@ static int P0CommandCapabilities(void) {
     P0Emit(@"env", P0SystemInfo());
     P0Emit(@"encoder-capabilities", [PipelineProbe encoderCapabilities]);
     return 0;
+}
+
+// capture 子命令：**完全不建屏**，直接捕获系统里已有的 display。
+// 用途：验证「捕获优先」架构 —— 被控机本来就有物理屏时，直接采它就行，
+// 既没有 11 秒建屏开销，也不涉及 identity walk。
+// 参数：--display all|<id>[,<id>...]  --duration N  --no-encode
+static int P0CommandCapture(NSDictionary *args) {
+    P0Emit(@"env", P0SystemInfo());
+
+    NSError *err = nil;
+    NSArray *ids = [PipelineProbe shareableDisplayIDsWithError:&err];
+    P0Emit(@"sck", @{
+        @"visibleDisplayIDs": ids ?: @[],
+        @"error": err.localizedDescription ?: @"",
+        @"screenRecordingGranted": @((BOOL)(ids != nil)),
+    });
+    if (!ids) {
+        P0Error(@"屏幕录制权限未就绪");
+        return 1;
+    }
+
+    NSMutableArray *targets = [NSMutableArray array];
+    NSString *want = args[@"display"];
+    if (!want || [want isEqualToString:@"all"]) {
+        [targets addObjectsFromArray:ids];
+    } else {
+        for (NSString *s in [want componentsSeparatedByString:@","]) {
+            NSString *t = [s stringByTrimmingCharactersInSet:
+                           [NSCharacterSet whitespaceCharacterSet]];
+            if (t.length) [targets addObject:@((unsigned int)[t longLongValue])];
+        }
+    }
+    if (targets.count == 0) {
+        P0Error(@"没有可捕获的 display");
+        return 1;
+    }
+
+    int duration = P0IntArg(args, @"duration", 4000);
+    BOOL withEncoder = args[@"no-encode"] ? NO : YES;
+    int perDisplay = MAX(1000, duration / (int)targets.count);
+
+    P0Emit(@"plan", @{
+        @"mode": @"capture-only",
+        @"targets": targets,
+        @"durationMs": @(duration),
+        @"withEncoder": @(withEncoder),
+    });
+
+    NSMutableArray *results = [NSMutableArray array];
+    NSDate *t0 = [NSDate date];
+    for (NSNumber *did in targets) {
+        NSDictionary *r = [PipelineProbe captureDisplayID:did.unsignedIntValue
+                                              durationMs:perDisplay
+                                             withEncoder:withEncoder];
+        [results addObject:r];
+        P0Emit(@"capture", r);
+    }
+    double elapsedMs = -[t0 timeIntervalSinceNow] * 1000.0;
+
+    BOOL allOK = YES;
+    for (NSDictionary *r in results) {
+        if (![r[@"ok"] boolValue] || [r[@"frames"] intValue] == 0) allOK = NO;
+        if ([r[@"suspectedBlackFrames"] intValue] > [r[@"frames"] intValue] * 0.8) allOK = NO;
+    }
+
+    P0Emit(@"verdict", @{
+        @"pass": @(allOK),
+        @"mode": @"capture-only",
+        @"displayCount": @(results.count),
+        @"elapsedMs": @(llround(elapsedMs)),
+        @"note": @"未创建任何虚拟屏；这是「捕获优先」路径的可行性验证",
+        @"capture": results,
+    });
+    return allOK ? 0 : 1;
 }
 
 // 建屏 + visibility。策略按 OS 版本分流（P0OSPolicy）：
@@ -288,7 +364,7 @@ static int P0CommandVerify(NSDictionary *args, BOOL hold) {
     P0Emit(@"sck-before", @{
         @"visibleDisplayIDs": before ?: @[],
         @"error": tccErr.localizedDescription ?: @"",
-        @"screenRecordingGranted": @(before != nil),  // 与 README 第 5 节判读表对齐
+        @"screenRecordingGranted": @((BOOL)(before != nil)),  // 与 README 第 5 节判读表对齐
     });
     if (!before) {
         P0Error(@"屏幕录制权限未就绪，先运行 `p0probe probe` 并按提示授权");
@@ -345,26 +421,47 @@ static int P0CommandVerify(NSDictionary *args, BOOL hold) {
 
     // 通过判据必须包含「达到目标分辨率」：promote 失败回退后捕获仍可能成功，
     // 但那只是保守 canvas 跑通，不代表目标分辨率可用（README 第 5 节）。
+    // hiDPI 判定不能读 descriptor 的 hiDPI 字段：2026-11-17 实测请求 hiDPI=0 却回报 2，
+    // 而 modePoints == modePixels，说明该字段只是"支持 2x"的能力位。必须看真实像素尺寸。
     BOOL targetReached = YES;
+    NSMutableArray *modeChecks = [NSMutableArray array];
     for (NSUInteger i = 0; i < configs.count && i < mgr.displayIDs.count; i++) {
         CGDisplayModeRef m = CGDisplayCopyDisplayMode(mgr.displayIDs[i].unsignedIntValue);
         NSUInteger w = [configs[i][@"width"] unsignedIntegerValue];
         NSUInteger h = [configs[i][@"height"] unsignedIntegerValue];
-        BOOL match = m && CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h;
+        BOOL wantHiDPI = [configs[i][@"hiDPI"] boolValue];
+        NSUInteger pw = m ? CGDisplayModeGetPixelWidth(m) : 0;
+        NSUInteger ph = m ? CGDisplayModeGetPixelHeight(m) : 0;
+        BOOL pointsOK = m && CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h;
+        BOOL pixelsOK = !wantHiDPI || (pw == w * 2 && ph == h * 2);
+        if (!(pointsOK && pixelsOK)) targetReached = NO;
+        [modeChecks addObject:@{
+            @"displayID": mgr.displayIDs[i],
+            @"hiDPIRequested": @(wantHiDPI),
+            @"requestedPoints": [NSString stringWithFormat:@"%lux%lu", (unsigned long)w, (unsigned long)h],
+            @"modePoints": m ? [NSString stringWithFormat:@"%zux%zu",
+                                CGDisplayModeGetWidth(m), CGDisplayModeGetHeight(m)] : @"(nil)",
+            @"modePixels": m ? [NSString stringWithFormat:@"%zux%zu", pw, ph] : @"(nil)",
+            @"pointsOK": @(pointsOK),
+            @"pixelsOK": @(pixelsOK),
+        }];
         if (m) CGDisplayModeRelease(m);
-        if (!match) targetReached = NO;
     }
 
+    BOOL passed = allCaptured && noBlack && targetReached && (!withEncoder || encodedOK);
+
     NSDictionary *summary = @{
-        @"pass": @(allCaptured && noBlack && targetReached && (!withEncoder || encodedOK)),
+        @"pass": @(passed),
         @"allCaptured": @(allCaptured),
         @"noBlackFrames": @(noBlack),
         @"targetResolutionReached": @(targetReached),
-        @"encoderProducedFrames": @(encodedOK),
+        @"modes": modeChecks,
+        // 不编码时这条判据没有任何意义：输出 null，避免被误读成"编码链路已验证"
+        @"encoderProducedFrames": withEncoder ? @(encodedOK) : [NSNull null],
         @"identityOffset": @(usedOffset),
         @"displays": mgr.displayIDs,
         @"capture": captureResults,
-        @"next": allCaptured && noBlack
+        @"next": passed
             ? @"P0 通过：继续做 CGEvent 坐标注入 spike 与双机 P2P glass-to-glass 延迟"
             : @"P0 未通过：按 verdict 字段定位是 TCC / stale identity / 黑屏 / 编码器哪一环",
     };
@@ -394,6 +491,8 @@ int main(int argc, const char *argv[]) {
             rc = P0CommandProbe(args);
         } else if ([cmd isEqualToString:@"capabilities"]) {
             rc = P0CommandCapabilities();
+        } else if ([cmd isEqualToString:@"capture"]) {
+            rc = P0CommandCapture(args);
         } else if ([cmd isEqualToString:@"verify"]) {
             rc = P0CommandVerify(args, NO);
         } else if ([cmd isEqualToString:@"hold"]) {
@@ -403,6 +502,8 @@ int main(int argc, const char *argv[]) {
                 "P0-TahoeProbe — Intel Mac 虚拟屏 P0 验证（自动识别 Tahoe 26 / Sequoia 15 并分流）\n\n"
                 "  p0probe probe  --capabilities              环境与私有 API 签名探测\n"
                 "  p0probe capabilities                       仅探测 VideoToolbox 编码档位\n"
+                "  p0probe capture [--display all|ID,ID] [--duration 4000] [--no-encode]\n"
+                "                                             捕获现有屏，不建屏（捕获优先路径验证）\n"
                 "  p0probe verify [--spec 1920x1080x0,2560x1440x0]\n"
                 "                 [--duration 4000] [--no-encode] [--direct]\n"
                 "                 [--offset N] [--fresh] [--max-retries N]\n"

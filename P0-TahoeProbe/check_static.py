@@ -160,13 +160,22 @@ def check_sources() -> None:
 def check_args() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     main = (SRC / "main.m").read_text(encoding="utf-8")
-    # 两边统一成不带 -- 前缀的参数名
-    doc = set(re.findall(r"--([a-z][a-z-]*)", readme))
+    # 只从「描述本工具用法」的行里取参数。文档里同时会引用别的命令行工具
+    # （codesign --force、xcode-select --install、tccutil reset …），
+    # 这些同名 flag 不属于 p0probe，整份 README 一把抓会产生误报。
+    foreign = ("codesign", "xcode-select", "clang", "sqlite3", "tccutil",
+               "sw_vers", "launchctl", "defaults", "networksetup", "scutil")
+    doc = set()
+    for line in readme.splitlines():
+        if any(cmd in line for cmd in foreign):
+            continue
+        doc |= set(re.findall(r"--([a-z][a-z-]*)", line))
     code = set(re.findall(r"--([a-z][a-z-]*)", main))
     code |= set(re.findall(r'isEqualToString:@"([a-z][a-z-]*)"', main))
     code |= set(re.findall(r'args\[@"([a-z][a-z-]*)"\]', main))
-    # 这些不是本工具的 flag：子命令名、内部 key、README 里的 xcode-select 参数
-    noise = {"help", "command", "probe", "capabilities", "verify", "hold", "install"}
+    # 这些不是本工具的 flag：子命令名、内部 key、命令行取值（如 --display all）
+    noise = {"help", "command", "probe", "capabilities", "verify", "hold",
+             "install", "capture", "all"}
     undocumented = sorted((code - doc) - noise)
     ghost = sorted((doc - code) - noise)
     detail = []

@@ -99,10 +99,21 @@ static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nu
 - (NSDictionary *)effectiveConfigForIndex:(NSUInteger)i conservative:(BOOL)conservative {
     NSDictionary *cfg = _configs[i];
     if (!conservative) return cfg;
+
     NSUInteger w = [cfg[@"width"] unsignedIntegerValue];
     NSUInteger h = [cfg[@"height"] unsignedIntegerValue];
-    if (w <= 1280 && h <= 800 && [cfg[@"hiDPI"] unsignedIntValue] == 0) return cfg;
-    return @{ @"width": @1280, @"height": @800, @"hiDPI": @0,
+    unsigned int hiDPI = [cfg[@"hiDPI"] unsignedIntValue];
+
+    // 保守 canvas 只缩「点」尺寸，**绝不改 hiDPI**。
+    // 2026-11-17 实测（Tahoe 26.5.2）：hiDPI 在 initWithDescriptor: 时就固化进 display，
+    // 之后 applySettings 再改 settings.hiDPI 会返回 YES 但静默无效 —— mode 永久停在 1x。
+    // 旧代码在保守阶段把 hiDPI 抹成 0，导致 spec 里 x1 的屏 promote 后仍是 1x
+    // （modePoints == modePixels == 1280x720，pixelsOK=false）。保留标志后 promote 才生效。
+    NSUInteger cw = MIN(w, (NSUInteger)1280);
+    NSUInteger ch = MIN(h, (NSUInteger)800);
+    if (cw == w && ch == h) return cfg;  // 目标本身已足够小，无需保守缩水
+
+    return @{ @"width": @(cw), @"height": @(ch), @"hiDPI": @(hiDPI),
               @"refreshRate": cfg[@"refreshRate"] ?: @60 };
 }
 
@@ -360,6 +371,29 @@ static id _Nullable P0CallSPIWithTimeout(NSString *label, VDManager *mgr, id _Nu
 
 - (BOOL)promoteToTarget {
     if (!_conservativeFirst) return YES;
+
+    // 幂等保护：若保守阶段已等于目标（例如目标本身就 ≤1280x800，或 HiDPI 目标太小无需缩水），
+    // promote 就是对同一块屏重复提交一个尺寸完全相同的模式。
+    // 2026-11-17 实测（Tahoe 26.5.2, 1280x720x1）：重复 applySettings 会把已渲染的
+    // 桌面清成纯黑且不重绘 —— capture 得到 minLumaMean=16 / maxLumaVariance=0 /
+    // 全部 suspectedBlackFrames，而同样规格走 --direct 则 HAS_CONTENT（mean=151）。
+    BOOL needed = NO;
+    for (NSUInteger i = 0; i < _configs.count; i++) {
+        NSDictionary *c = [self effectiveConfigForIndex:i conservative:YES];
+        NSDictionary *t = _configs[i];
+        if ([c[@"width"] unsignedIntegerValue]      != [t[@"width"] unsignedIntegerValue] ||
+            [c[@"height"] unsignedIntegerValue]     != [t[@"height"] unsignedIntegerValue] ||
+            [c[@"hiDPI"] unsignedIntegerValue]      != [t[@"hiDPI"] unsignedIntegerValue]) {
+            needed = YES;
+            break;
+        }
+    }
+    if (!needed) {
+        P0Log(@"保守 canvas 已等于目标，跳过重复 applySettings（避免清屏）");
+        _promoted = YES;
+        return YES;
+    }
+
     BOOL ok = [self applyConfiguredDimsConservative:NO];
     _promoted = ok;
     return ok;

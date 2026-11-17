@@ -11,7 +11,7 @@
 | | 被控端（Host / Sender） | 控制端（Client / Receiver） |
 |---|---|---|
 | CPU | Intel x86_64 | Intel x86_64 |
-| macOS | **26 Tahoe**（当前 26.7.3，2026-11-09） | **15 Sequoia**（当前 15.8.2） |
+| macOS | **26 Tahoe**（2026-11-17 实机复核：**26.5.2 / 25F84**；此前文档写的 26.7.3 未在该机上复现） | **15 Sequoia**（15.8.2，历史基线机） |
 | 职责 | 建虚拟屏、捕获、编码、注入输入 | 解码、N 个全屏窗口渲染、采集输入 |
 
 **必须作废上一轮的结论**：我说过「锁定 Intel + macOS 15 后，最大的『每年跟 Apple 私有 API 变动』风险基本消失」。被控端改成 Tahoe 之后这句话不成立了——Tahoe 恰好就是私有 API 变动最剧烈的版本。
@@ -72,9 +72,15 @@ P0-TahoeProbe/
 
 ## 3. 前置条件（被控端 Tahoe）
 
-1. **记录确切 build**：`sw_vers` 输出（例如 26.7.3 / 25Gxxx）。后面每次系统安全更新后都要重跑一次本工程。
+1. **记录确切 build**：`sw_vers` 输出（2026-11-17 实测被控机为 `26.5.2 / 25F84`）。后面每次系统安全更新后都要重跑一次本工程。
 2. `xcode-select --install` 装 Command Line Tools。
 3. **TCC 授权**：命令行工具的屏幕录制权限归属**父进程**，也就是你启动它的那个终端。给 `Terminal.app` 或 `iTerm` 在「系统设置 → 隐私与安全性 → 屏幕录制」打勾，**授权后完全退出终端再重开**（屏幕录制授权需要进程重启才生效）。辅助功能同理（`CGEventPost` 后续 spike 才用，可一并先授）。
+
+   > ⚠️ **2026-11-17 实测新增**：`p0probe` 是**完全没有代码签名**的裸二进制（`codesign -dv` 报 "code object is not signed at all"）。实测「授权成功 → 改代码 → `bash build.sh` 重建 → 再跑」后，`sck-before.screenRecordingGranted` 立刻回落到 `0`，报 `The user declined TCCs`。也就是说**每次重建都会让已有授权失效**，而 `run_p0.sh` 默认会先重建再跑——这会让一键流程在第一步就假失败。
+   >
+   > 两个规避办法（任选）：
+   > - 首次编译后，后续一律用 `P0_NO_BUILD=1 bash run_p0.sh`，避免无谓重建；
+   > - 更稳的做法：把屏幕录制授权给**终端 App 本身**（`Terminal.app` / `iTerm`），由它在会话内启动 `p0probe`，这样二进制身份变化不影响授权。授权后仍需完全退出终端再重开。
 4. **必须在已登录的 Aqua GUI 会话里、在桌面的终端窗口中运行，不要 ssh 过去跑。** LaunchDaemon / SSH 上下文里虚拟屏能创建但不 attach 到 WindowServer，表现就是全黑。无人值守场景最终要配自动登录 + 关 FileVault + LaunchAgent（不是 Daemon），但 P0 阶段先手工在 GUI 里跑。
 5. 首次建议**接一块物理显示器**完成授权，再拔掉验证无头行为。
 6. **关掉 Sidecar / BetterDisplay / Duet / 其他虚拟屏工具**。issue #171 的触发条件正是「用了 Sidecar 再切回来」，污染源就是 display identity 缓存；这些工具同时跑会让结果无法归因。
@@ -155,6 +161,8 @@ bash build.sh
 | `capture` 编码部分 | `encodedFrames>0`、`keyFrames>0`、`encodeErrors=0`、`decodedFrames>0` | 编码器不产出 buffer（PR #288 的吞吐上限问题） |
 | `verdict` | `pass=true`（含 `targetResolutionReached=true`） | 按下面决策树定位；`reason=WINDOWSERVER_SPI_TIMEOUT` 时**立即停测**，见第 12 节 |
 
+**判黑阈值已按色彩范围修正（2026-11-17）**：捕获输出格式是 `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`，视频范围下 Y∈[16,235]，**纯黑是 16 而不是 0**。旧实现用「Y 均值 < 8 且方差 < 4」判黑，在任何视频范围帧上都不可能命中，等于把 `MOSTLY_BLACK` 判据关掉了——真黑屏会被判成 `HAS_CONTENT`（假通过）。现改为 `Y < 16 + 4 且方差 < 4`。**因此 §12.6 里历史结论的「0 黑帧」不构成有效证据**，需要在新版二进制上重测。
+
 **P0 通过的定义**：两块虚拟屏都满足 `online+active+SCK 可见`，**mode 实际落到目标分辨率**，捕获到非黑画面且帧率接近 60，H.264 编码与环回解码都产出帧。`encodeEnqueueP50Ms` 只反映入队开销，**不是**端到端延迟，端到端要等双机 spike 再测。
 
 ---
@@ -204,13 +212,13 @@ encodedFrames=0 但捕获正常
 3. `CGEventPost` 注入 + display ID 路由，中文输入法（`CGEventKeyboardSetUnicodeString`）、修饰键状态同步、Cmd-Tab 沉浸模式拦截；
 4. 双机 1080p60 的 glass-to-glass 延迟（目标：采集+编码 < 30ms，总链路 < 50ms）。
 
-Sequoia 15.8.2 与 Tahoe 26.7.3 都还在安全更新窗口内，**两端每次系统更新后都要各跑一次本工程（控制端跑 `capabilities` 即可）**。
+Sequoia 15 与 Tahoe 26 都还在安全更新窗口内，**两端每次系统更新后都要各跑一次本工程（控制端跑 `capabilities` 即可）**。
 
 ---
 
 ## 8. 版本锁定策略
 
-- 被控端锁到**具体 build**（如 26.7.3 / 25Gxxx），写进部署文档，不要只写 "macOS 26"。
+- 被控端锁到**具体 build**（2026-11-17 实测为 `26.5.2 / 25F84`），写进部署文档，不要只写 "macOS 26"。
 - **不要关闭安全更新**（Tahoe 26.7.1 修的是已被定向利用的 CoreGraphics 漏洞），但每次安全更新后必须重跑 `probe` + `verify` 做回归——CoreGraphics 二进制变了，私有 SPI 就可能漂。
 - Intel 不会再有功能级大版本，所以不需要为 macOS 27/28 预留适配分支；这与 Apple Silicon 上每年追私有 API 的维护模型完全不同。
 - 保留一个降级预案：若某个 26.x 安全更新把私有 SPI 改坏且无解，最后手段是接 EDID 假插头（硬件虚拟显示器），但那会牺牲「由控制端动态决定分辨率」。
@@ -258,7 +266,7 @@ P0-TahoeProbe/
 
 ### 11.2 开机前的准备（顺序不能乱）
 
-1. `sw_vers` 记下**确切 build**（例如 26.7.3 / 25Gxxx）写进部署文档；以后每次安全更新都要重跑本工程。
+1. `sw_vers` 记下**确切 build**（2026-11-17 实测被控机为 `26.5.2 / 25F84`）写进部署文档；以后每次安全更新都要重跑本工程。
 2. `xcode-select --install` 装 Command Line Tools。
 3. **关掉 Sidecar / BetterDisplay / Duet / 其他虚拟屏工具**——issue #171 的污染源正是它们留下的 display identity 缓存，同时开着会让结果无法归因。
 4. 首次**先接一块物理显示器**：给 `Terminal.app` 授「屏幕录制」+「辅助功能」，然后 **⌘Q 完全退出终端再重开**（TCC 需要进程重启才生效）。命令行工具的权限归属**父进程即终端**，不是 `p0probe`。
@@ -307,12 +315,15 @@ bash run_p0.sh
 
 `python check_static.py` 目前 7/7 通过：编码换行、括号配对、C 函数声明→实现、ObjC 方法声明→实现、build.sh SOURCES、README/main.m 参数一致性、无禁用 API 残留。以后在非 Mac 侧改完代码，先跑它再打包。
 
-### 11.6 仍然只能靠真机回答的
+### 11.6 仍然只能靠真机回答的（2026-11-17 已复核对账）
 
-- Tahoe SDK / CLT 版本带来的编译差异（唯一剩下的第一轮风险）；
-- `spi-signature-check` 在 Intel Tahoe 26.7.x 上的真实 selector 结果；
-- `visibility` / `capture` 是否踩中 stale display 或 poisoned identity，以及成功的 `identityOffset`；
-- Intel 上 H.264 是否真的 `hardwareAccelerated`，HEVC 是否可用。
+| 问题 | 状态 |
+|---|---|
+| Tahoe SDK / CLT 版本带来的编译差异 | ✅ **已关闭**：SDK 26.5 + Xcode 26.5 上 `build.sh` 零警告编译通过 |
+| `spi-signature-check` 在 Intel Tahoe 上的 selector 结果 | ✅ **已关闭**：26.5.2 Intel 上 `missing=[]`，四个私有类全部可解析 |
+| Intel 上 H.264 是否真 `hardwareAccelerated`、HEVC 可用性 | ✅ **已关闭**：H.264 Baseline/Main/High 与 HEVC Main 在 1080p/1440p/4K 全部 `supported=1` 且 `hardwareAccelerated=1`；**且已实测真实产出编码帧**（§15.1：`encodedFrames>0`、`encodeErrors=0`） |
+| HiDPI 虚拟屏能否产出 2× 像素流 | ✅ **已关闭**（2026-11-17 15:22）：`modePoints=1280x720` / `modePixels=2560x1440` / `rasterScale=2`。前提是 descriptor 一次给足像素能力（§15.2 F-4） |
+| `visibility` / `capture` 是否踩中 stale display 或 poisoned identity，成功的 `identityOffset` | ✅ **已关闭**（2026-11-17 11:55 实测）：`visibility` 一次命中，`seen` 中同时出现虚拟屏与两块物理屏；**未触发 identity walk**，成功 `identityOffset = 0`；`capture` 判定 `HAS_CONTENT`。详见 §14 |
 
 ### 11.7 控制端为什么还没写
 
@@ -328,7 +339,7 @@ bash run_p0.sh
 
 ## 12. Sequoia 真机基线与 WindowServer 崩溃事故（2026-11-14）
 
-### 12.1 基线结果（本机 = 控制端规格：Macmini8,1 / i5-9500 / UHD 630 / macOS 15.5 24F74）
+### 12.1 基线结果（历史记录：Macmini8,1 / i5-9500 / UHD 630 / macOS 15.5 24F74）
 
 - 编译修了三处：`PipelineProbe.m` 方法声明结构、`main.m` 对 `id` 用点语法、`build.sh` 补 `-framework IOKit`。
 - `spi-signature-check.missing = []`：15.5 Intel 上全部私有 selector 与重声明一致。
@@ -418,7 +429,7 @@ bash run_p0.sh
    - C（全部 mode 提交后，单事务原子解除两块屏镜像）：一次生效，10s 无反弹，双屏 `active=1`。
 4. **落地修复**（`VDManager.m` / `ProbeUtil.m`）：`createAll` 全部 mode 提交后 `unmirrorAll` 单事务原子解除；liveness 等待中限频（≥1s）补救反弹；promote/rollback 后统一原子解除；mode 等待 6s→10s（`P0OSPolicy.modeWaitMs`），中途补 apply 改为每 2s 限次；`liveness` 增加 `mirrorSet` 字段。unmirror 同样走 8s 死线 + 熔断，**全版本通用**（虚拟屏必须是扩展模式才能被 SCK 捕获）。
 
-**重跑结果**（本机 Sequoia 15.5，静态检查 7/7）：
+**重跑结果**（本机 Sequoia 15.5，静态检查 7/7；判黑阈值在 2026-11-17 修正，见 §5 说明，表中「0 黑帧」按新阈值需重测）：
 
 | 测试 | 结果 |
 |---|---|
@@ -428,3 +439,246 @@ bash run_p0.sh
 | 双屏 + H.264（`--fresh`，offset 0 复测） | **pass**：默认 identity 可复现，排除「offset 0 已污染」的担忧 |
 
 注：桌面静止内容下捕获帧率 10–20fps 属正常（SCK 只在画面变化时产帧），判黑与编解码指标才是 P0 判据；§5 的 ≈60fps 需要动态画面，留给后续 spike 验证。
+
+## 13. Tahoe 26.5.2 Intel 真机复核（2026-11-17）
+
+在**被控机本机**（Macmini8,1 / i5-9500 / UHD 630 / x86_64 / macOS **26.5.2 (25F84)** / SDK 26.5 / Xcode 26.5）上做了不建屏的全部前置复核，并顺带修掉四处代码缺陷。**verify 尚未执行**（原因见 13.4）。
+
+### 13.1 已关闭的前置风险
+
+| 项 | 结果 |
+|---|---|
+| 编译 | `bash build.sh` 零警告通过（此前「唯一剩下的第一轮风险」据此关闭） |
+| 私有类解析 | `allClassesResolved=true`（四个类都在 CoreGraphics/SkyLight 里） |
+| selector 签名 | `spi-signature-check.missing=[]` |
+| 编码器档位 | H.264 Baseline/Main/High + HEVC Main，1080p/1440p/4K 全 `supported=1` / `hardwareAccelerated=1` |
+| 屏幕录制 TCC | 授权后 `screenRecordingGranted=1`，`visibleDisplayIDs` 能列出两块物理屏 |
+| 静态自检 | `python3 check_static.py` 7/7 |
+
+### 13.2 本轮修掉的代码缺陷
+
+| # | 缺陷 | 影响 | 修复 |
+|---|---|---|---|
+| 1 | **判黑阈值与色彩范围不匹配**：捕获用 `420YpCbCr8BiPlanarVideoRange`，黑电平是 Y=16，旧代码按 `Y<8` 判黑 | 在任何视频范围帧上都不可能命中 → `MOSTLY_BLACK` 判据实际失效 → **真黑屏会被判成 `HAS_CONTENT`（假通过）** | 阈值改为 `Y < 16+4` 且 `方差 < 4`，并把黑电平提取为具名常量 |
+| 2 | `physicalCores` 用 `sysctlbyname` 字符串方式读 `hw.physicalcpu`（int32） | env 里输出 `"\u0006"` 这类垃圾值，机型指纹不可用 | 新增 `P0SysctlInt()`，同时补 `logicalCores`；实测输出 6/6 |
+| 3 | `isLoggedInGUI` 用 `getuid() != 0` 判断 | 对任何非 root 进程恒为真，等于没有判据；而 §11.4 把它当第二道闸门 | 改用 `CGSessionCopyCurrentDictionary() != NULL`，实测 `true` |
+| 4 | `SCStreamConfiguration.width/height` 直接赋 `SCDisplay.width/height`（点） | HiDPI(2x) 虚拟屏会被降采样成半分辨率再编码，A-05 测到的不是 HiDPI 流 | 乘 `pointPixelScale`（`@available(macOS 14.0, *)` 保护）、按 H.264 要求取偶数，结果里增 `rasterScale` |
+
+改完重新编译零警告、`check_static.py` 7/7、`probe` 复跑正常。
+
+### 13.3 在这台机器上跑 verify 的额外风险（必须先读）
+
+1. ~~**UHD 630 最多同时驱动 3 块显示器 → 加虚拟屏会超限**~~ ❌ **该结论错误，2026-11-17 15:40 实测推翻，见 §16**。
+   UHD 630 的「3 屏」是**硬件输出接口（DDI/pipe）数量**限制，即能接几个物理显示器；而 `CGVirtualDisplay` 走 WindowServer **软件合成**，不占用硬件输出通道。实测 **2 块物理屏 + 4 块虚拟屏 = 6 块同时 online，全部 active 且全部可捕获**（`pass=true`）。因此**不需要拔物理屏**，先前"双屏测试要先拔一块"的建议作废。
+   （保留的原判据：建屏仍是全局显示重配置，风险来自 WindowServer 而非屏数，§12.4 协议继续有效。）
+2. **26.5.2 正好是 issue #171「毒化 identity」的原始复现版本**。社区在该版本上的结论是：`CGVirtualDisplay` 建的屏会永久不出现在 `SCShareableContent`，跨重启不恢复，只有换 identity 能救——也就是本工程 `identityWalk` 的适用场景。**expect identity walk 会被触发，不要把它当成失败**；成功的 `offset` 会被写进 `~/.p0_identity.json`，那正是要回传的证据。
+3. **本机 build 落后于安全补丁**：26.6.1 才修的 CVE-2026-65400（屏幕共享免凭据认证绕过）在本机上未打。产品自身不走 Apple 屏幕共享，但被控机长期在线，建议 A-01 收尾后升级到 26.7.x 再跑一次回归（NFR-08 本来就要求每次更新后回归）。
+4. **每次重建二进制都会让屏幕录制授权失效**（见 §3 第 3 条的实测记录）。若 verify 前改过代码，先重新授权再跑，否则 `sck-before` 会假失败。
+
+### 13.4 为什么本轮没跑 verify
+
+`verify` 会真实建虚拟屏、触发全局显示重配置，存在把 WindowServer 拖挂（看门狗强杀、强制注销，见 §12.2）的真实风险。按 §12.4 协议，这一步需要**人在物理屏前、显示器不进入休眠**，并在出现 `WINDOWSERVER_SPI_TIMEOUT` / 闪屏时立即停手。属于需要人工确认的破坏性操作，等确认后按 §12.4 的单屏最小面开跑：
+
+```bash
+P0_NO_BUILD=1 bash run_p0.sh          # 已编译过，跳过重建以保住 TCC 授权
+# 或更保守：先单屏不编码
+./p0probe verify --spec 1920x1080x0 --no-encode --fresh
+```
+
+## 14. A-01 实测结果：单虚拟屏通过（2026-11-17 11:55）
+
+**结论：`verdict.pass = 1`。P0 的硬门禁在 Tahoe 26.5.2 / Intel Macmini8,1 上通过。**
+
+执行命令（最小面：1 块虚拟屏、不编码）：
+
+```bash
+./p0probe verify --spec 1920x1080x0 --no-encode --fresh
+# 退出码 0；日志 diag-min-20261117-115549/verify-min.log
+```
+
+### 14.1 判定结果
+
+| 字段 | 值 | 判读 |
+|---|---|---|
+| `verdict.pass` | `1`（旧版输出；已改为 `true`） | 通过 |
+| `allCaptured` / `targetResolutionReached` | `true` / `true` | 目标 1920×1080 达到且被采到 |
+| `noBlackFrames` / `suspectedBlackFrames` | `true` / `0` | 阈值修正后仍无黑帧，**这次才是有证据效力的判黑结论** |
+| `capture.verdict` | `HAS_CONTENT` | `minLumaMean=151`、`maxLumaVariance=1275`，画面有内容 |
+| `identityOffset` | **0** | offset 0 直接成功，`~/.p0_identity.json` 已写入 `offset: 0` |
+| `visibility` | 一次命中（`attempt=0`） | `seen` 同时包含虚拟屏 `4128835` 与两块物理屏 |
+| identity walk | **未触发** | 26.5.2 本次**没有**出现 issue #171 的毒化 identity |
+
+### 14.2 建屏链路各阶段耗时（同一日志时间戳）
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| `create` | 0.52 s | ~20528/20528/serial 4096，`conservative=true`，先建 1280×800 画布 |
+| `create` → `mode-commit` | **6.41 s** | 最慢的一环 |
+| `mode-wait` → `visibility` | 0.71 s | 模式稳定后立即可见 |
+| `applySettings`（→1920×1080） | 0.02 s | 模式切换本身很快 |
+| `applySettings` → `promote` | **3.89 s** | 次慢 |
+| `create` → `promote`（可用的屏） | **≈11.3 s** | 端到端“拿到一块能用的虚拟屏” |
+| `create` → `verdict`（含 4 s 采集） | ≈19.5 s | |
+
+⚠️ **产品含义**：会话建立时“建屏”这一跳要 11 秒，远不能支撑“秒连”。M1 必须优先优化这两处 6.4 s / 3.9 s 的等待（先查是不是固定 sleep / 轮询间隔导致），或者做成**常驻虚拟屏 + 会话间复用**。这是本轮最有价值的负面数据。
+
+### 14.3 三个必须记录的新发现
+
+**F-1（真 bug，影响 HiDPI 判断）**：请求 `hiDPI=0`，但 `liveness` / `mode-wait` 回报 `reportedHiDPI=2`，而同一行 `modePoints` 与 `modePixels` 都是 `1280x800`（并非 2 倍 backing）。说明 **SPI 回报的 hiDPI 标志不可信**，A-05 判 HiDPI 必须用 `CGDisplayCopyDisplayMode` 的 **`CGDisplayModeGetPixelWidth/Height`**，不能读这个字段。`verdict.modes[]` 已按此实现（`hiDPIRequested` 为真时要求 `modePixels == 2 × requestedPoints`，`pixelsOK` 单独给判据）。
+
+**F-2（代码缺陷，已修 2026-11-17 12:00）**：`withEncoder=false` 时 `verdict.encoderProducedFrames` 仍为 `true`（无条件写死的值），会让“编码产出帧”这条判据在任何不编码的运行里都被误认为已验证。已改为 `withEncoder ? @(encodedOK) : [NSNull null]`；同时修掉 `verdict.next` 只按 `allCaptured && noBlack` 判断、可能在实际 `pass=0` 时仍输出“P0 通过”的矛盾，并新增 `modes[]` 输出每个屏的 `modePoints/modePixels/pointsOK/pixelsOK`。
+
+**F-3（判读陷阱）**：`fps=9`（4000 ms 收到 39 帧）**不能**当作管线帧率能力。虚拟屏上是静态桌面，SCK 按内容变化送帧，静态场景本就会掉帧。要测真实帧率必须喂动图（播放视频 / 拖窗口），因此 **A-05 的 60fps 结论本轮不成立，需运动场景重测**。同理 `firstFrameLatencyMs=416` 只是在静态屏上“等第一帧变化”的延迟，不等于首帧链路延迟。
+
+### 14.4 与 issue #171 的关系（预期需要修正）
+
+此前据社区结论预期 26.5.2 会 poison identity，实测**未复现**。差异可能来自条件不同：本次是**先授权屏幕录制、再建屏**，而 issue 的复现路径多在“建屏时 TCC 未就绪 / 建屏后再授权”。因此结论应写成：**26.5.2 在 TCC 就绪的前提下 identityOffset=0 可用；毒化场景仍需专门构造复现**，不能据此宣布 identity walk 无用（`os-policy` 仍保留 `identityWalk=true`）。
+
+### 14.5 尚未覆盖的面
+
+- ~~**H.264 实际编码**~~：已于同日 15:15 补测通过（§15.1）。
+- ~~`--direct` 对照（Tahoe 上跳过保守 canvas 的 A/B）~~：已于 15:20 完成，正是它定位出 F-4（§15.2）。
+- **双虚拟屏**（默认 spec 的另一半）：仍未测。UHD 630 上限 3 屏，本机已占 2 物理屏，加 2 虚拟屏会超限，需单独设计（拔一块物理屏或接受风险窗口）。
+- 运动场景帧率 / glass-to-glass 延迟（§15.3 显示静态场景的 `P95` 波动达 20 倍，不可用）。
+
+## 15. A-01 补测：编码面 + HiDPI 面（2026-11-17 15:15–15:22）
+
+**结论：`encode_rc=0 hidpi_rc=0`，两面同时通过。`run_batch.sh` 一条命令跑完，两个 verdict 均 `pass=true`。**
+
+### 15.1 结果
+
+| 面 | spec | 结论 | 关键数据 |
+|---|---|---|---|
+| 编码面 | `1920x1080x0` | ✅ pass | `encodedFrames=19`、`encodeErrors=0`、`decodedFrames=19`、`keyFrames=1` |
+| HiDPI 面 | `1280x720x1` | ✅ pass | `modePixels=2560x1440` / `modePoints=1280x720`、`pixelsOK=true`、`raster=2560x1440`、`rasterScale=2` |
+
+这两条关闭了 §11.6 最后剩下的一半：**H.264 不只是 `hardwareAccelerated=1` 的静态能力，而是真实产出了编码帧**；**HiDPI 虚拟屏真实产出了 2× 像素流**（2560×1440 而非降采样的 1280×720）。
+
+### 15.2 本轮抓到的两个新缺陷（都已修复）
+
+**F-4（严重，架构级）：HiDPI 在 `initWithDescriptor:` 时固化，事后改不动。**
+
+`effectiveConfigForIndex:conservative:` 在保守 canvas 阶段把 `hiDPI` 抹成 0（建 1280×800@1x），之后 `promoteToTarget` 想提升到 1280×720@2x 时，`applySettings:` **返回 YES 但静默无效**，mode 永久停在 `1280x720 / 1280x720`（`pixelsOK=false`）。
+
+对照实验（同一台机、同一版本、同一 spec）：
+
+| 路径 | modePoints | modePixels | 捕获栅格 | verdict |
+|---|---|---|---|---|
+| 保守 canvas（旧） | 1280×720 | **1280×720** | 1280×720 | pass=false |
+| `--direct`（跳过保守） | 1280×720 | **2560×1440** | 2560×1440 | pass=true |
+| 保守 canvas（修复后） | 1280×720 | **2560×1440** | 2560×1440 | pass=true |
+
+修法：保守 canvas **只缩「点」尺寸，绝不动 `hiDPI`**；且当目标本身已 ≤1280×800 时直接返回目标（不缩水）。
+**产品含义**：M1 里若要让用户选 Retina 虚拟屏，descriptor 必须一次给足像素能力，不存在“先小后大”的降级路径。
+
+**F-5（严重，静默黑屏）：对同一块屏重复提交相同模式的 `applySettings` 会把桌面清成纯黑且不重绘。**
+
+修复 F-4 后立刻暴露：`1280x720x1` 走保守路径时，保守 cfg 已等于目标，`promoteToTarget` 仍重复 apply 了一次同尺寸模式 → 捕获得到 `minLumaMean=16`（正是视频范围黑电平）、`maxLumaVariance=0`、53/53 帧被判黑；而同样规格走 `--direct` 是 `mean=151`。
+
+修法：`promoteToTarget` 增加幂等判断 —— 若所有屏的保守 cfg 与目标 cfg 完全一致（尺寸 + hiDPI），跳过 apply 并直接返回 `YES`，日志输出「保守 canvas 已等于目标，跳过重复 applySettings（避免清屏）」。
+
+**为什么这条值得写进文档**：`applySettings` 返回 YES 却把屏搞黑，是典型的"成功返回值不代表成功副作用"，任何依赖返回值做判据的代码都会漏掉。
+
+### 15.3 性能信号（必须如实记录，不要当成结论）
+
+| 轮次 | 编码 `P95` | 帧数/4s |
+|---|---|---|
+| 15:15 首次 | **40.9 ms** | 28 |
+| 15:22 复跑 | **793.7 ms** | 19 |
+
+P95 相差近 20 倍。可能原因：静态桌面下 SCK 按内容变化送帧，样本量小（19–28 帧）导致分位数不稳；也可能真有瞬时卡顿。**当前不足以判断编码器性能，A-02 与 M1 的帧率结论必须在运动场景（播放视频/拖窗口）下重测**，这与 §14.3 F-3 的结论一致。
+
+### 15.4 工程流程解锁：重建不再毁授权
+
+之前每次 `build.sh` 重建都会让屏幕录制授权失效（§13.3 第 4 条）。本轮验证：**把 WorkBuddy 加入屏幕录制白名单后，授权委托给责任进程**，因此
+
+- 全新路径 + 全新 identifier 的二进制（`/tmp/p0x`, `com.p0.brandnew`）也能直接抓屏；
+- 本轮共重建 3 次，每次重建后 `screenRecordingGranted` 均为 `true`。
+
+含义：**代码修改 → 重建 → 立即实测的循环不再需要人工重新授权**，后续所有真机测试都可以自动跑。
+
+**但有一个前提已固化进 `build.sh`**：二进制必须带 ad-hoc 签名。实测踩到过一次 —— 只跑编译没重签，`codesign -dv` 显示 `code object is not signed at all`，授权立刻回落为 `false`（因为**未签名的二进制连"委托给责任进程"都不成立**，直接报 `The user declined TCCs`，很难与"授权没给"区分）。
+
+现在 `build.sh` 在链接成功后自动执行：
+
+```bash
+codesign --force --sign - --identifier "com.p0.tahoeprobe" --timestamp=none ./p0probe
+```
+
+所以以后只需 `bash build.sh`，不必再手动签名。若看到「警告：ad-hoc 签名失败」，先解决签名再跑 verify，否则 TCC 必然假失败。
+
+## 16. display 容量与「捕获优先」路径（2026-11-17 15:40）
+
+> ⚠️ **本章 §16.2 / §16.3 的「捕获优先」结论已于同日作废**（属 VNC/镜像语义，与产品定位冲突）。
+> 产品形态改为**独占式会话**：只建虚拟屏、物理屏置黑/锁定、绝不捕获物理屏。见 `docs/DECISIONS.md` D-04 与 `P0V-SessionRecon/README.md`。
+> 本章仍然有效的部分：**§16.1 —— 虚拟屏与物理屏在 WindowServer 层解耦（2 物理 + 4 虚拟 = 6 屏同时在线）**，
+> 它是"客户端要几块就给几块"的直接依据。
+
+触发原因：一个合理的架构质疑 ——「RDP 里控制端不需要知道被控端有几块屏，为什么 macOS 需要？被控端插 3 块屏岂不是建不了虚拟屏？」。实测结果**推翻了本工程此前的一个错误推论**，并把架构方向理清了。
+
+### 16.1 实测：虚拟屏数量与物理屏数量完全解耦
+
+| 实验 | 在线 display 总数 | 结果 |
+|---|---|---|
+| 2 物理 + 1 虚拟 | 3 | pass |
+| 2 物理 + 2 虚拟 | **4** | pass，两块虚拟屏均 `HAS_CONTENT` |
+| 2 物理 + **4 虚拟** | **6** | pass，四块虚拟屏均 `active` 且均采到内容 |
+
+`CGVirtualDisplay` 由 WindowServer **软件合成**，不申请 Intel 的 DDI/显示管道。UHD 630 的「最多 3 屏」是**物理输出接口数量**（能插几个显示器），与虚拟屏无关。
+
+**结论：被控机插 3 块、4 块物理屏，照样可以再建 N 块虚拟屏。** 产品多显示器路线不受硬件屏数限制，先前 §13.3 第 1 条的"超限"判断是错的（已划掉）。
+
+### 16.2 「捕获优先」路径：有屏就直接采，别建屏
+
+新增 `p0probe capture` 子命令：**完全不建屏**，直接捕获系统已有 display。
+
+```
+$ ./p0probe capture --display all --duration 3000
+pass = true, mode = capture-only, displayCount = 2, elapsedMs = 5152
+  2026701824  3440x1440  HAS_CONTENT  firstFrame=124ms
+  817925634   1080x1920  HAS_CONTENT  firstFrame=252ms
+```
+
+三条供给路径对比：
+
+| 路径 | 建屏开销 | 首帧延迟 | 适用场景 |
+|---|---|---|---|
+| **捕获现有物理屏** | **0** | **124–252 ms** | 被控机有屏且在唤醒状态 |
+| 建 1 块虚拟屏 | ≈11.3 s | 416–691 ms | 无头机器（无任何 display） |
+| 建 N 块虚拟屏 | ≈11.3 s × N | 同量级 | 控制端要求 N 路，被控端无对应物理屏 |
+
+**这直接回答了 §14.2 记录的「建屏 11.3 秒」性能问题：大多数真实场景根本不需要建屏。** 被控机是台正常工作机时，物理屏就在那儿，捕获即可，零开销、秒连。
+
+### 16.3 架构结论：虚拟屏的定位被搞错了
+
+先前隐含的假设是「虚拟屏用来**模拟被控端的物理屏**」，于是被控端有几块屏、能不能建屏成了约束。这是把 **VNC/镜像模型** 和 **RDP/会话模型** 混在了一起。
+
+正确的定位是：**虚拟屏用来满足「控制端提出的显示需求」，与被控端物理屏无关。**
+
+- 控制端说「我要 2 路 1920×1080」→ 被控端就提供 2 个 display 对象；
+- 这 2 个对象可以是 2 块物理屏，也可以是 2 块虚拟屏，还可以混合；
+- 命令行的 `--spec` 本来就是「客户端想要什么」而不是「机器有什么」，方向一开始就是对的。
+
+因此产品逻辑应为：
+
+```
+1. 控制端协商出 N 路需求
+2. 枚举被控端可用 display
+3. 有 → 直接捕获（0 开销）
+4. 不足 → 按差额建虚拟屏补齐
+5. 会话结束 → 只销毁自己建的那些
+```
+
+### 16.4 仍存在的真实差距：镜像 vs 会话隔离
+
+以上解决的是"几块屏、能不能建"，但**这不是本项目与 RDP 的最大差距**。
+
+| 能力 | Windows RDP | 本方案（SCK + CGVirtualDisplay） |
+|---|---|---|
+| 客户端决定分辨率/屏数 | ✅ | ✅（`--spec`，已实测） |
+| 屏数不受物理硬件限制 | ✅ | ✅（§16.1，已实测 6 屏） |
+| **远程操作时本地屏不可见** | ✅ 控制台锁定 | ❌ **物理屏现场直播** |
+| **锁屏状态下仍可远程采集** | ✅ | ❌ TCC/内容保护阻断 |
+| 多用户并发会话 | ✅ 独立 session | ❌ 只有 console session |
+
+后三项是**会话隔离**能力，属于「镜像模型」与「会话模型」的根本差异，靠虚拟屏无法弥补。若产品定位是无人值守远程办公（隐私、锁屏可用），需单独立项验证 macOS 的虚拟会话能力（Fast User Switching 是"切换"不是"并发"；私有 SkyLight virtual session 未公开、跨版本易碎）。**这是待决策的架构分叉，不是当前 P0 能回答的问题。**

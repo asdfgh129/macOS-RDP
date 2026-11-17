@@ -126,7 +126,7 @@ fi
   grep -h '"stage":"encoder-capabilities"' "$DIAG"/*.jsonl 2>/dev/null | head -2 || echo "(无)"
 } > "$DIAG/SUMMARY.txt" 2>&1
 
-if grep -q '"screenRecordingGranted":false' "$DIAG"/*.jsonl 2>/dev/null; then
+if ! grep -qE '"screenRecordingGranted":(1|true)' "$DIAG"/*.jsonl 2>/dev/null; then
   log "!! sck-before 显示屏幕录制权限未就绪：给「$(ps -o comm= -p "$PPID" 2>/dev/null)」授权后，"
   log "   完全退出终端再重开，然后重跑本脚本。否则后面全部是假失败。"
 fi
