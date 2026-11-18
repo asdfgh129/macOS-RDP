@@ -191,6 +191,39 @@
 
 ---
 
+### 5.5 QUIC datagram 帧通道实测（M1-A 第 1/2 步，2026-11-18 17:0x，Tahoe）
+
+`quic_probe`：Network.framework QUIC datagram flow（D-13），本机环回 127.0.0.1，客户端与服务端同进程。
+压测走的是生产同一条路径：`M1FrameSender`（16B 帧头 + 1150B 分片）直接接在 QUIC sink 上。
+
+| 项 | 数值 |
+|---|---|
+| 协商 datagram 上限 | **1497 B**（`nw_quic_get_stream_usable_datagram_frame_size`） |
+| 分片投递（400 帧 × 3000B，2ms 节奏） | 1200/1200 分片、**1,219,200 B**、完整帧 400/400 |
+| 丢失 / 重复 / 乱序 / 载荷错 | **0 / 0 / 0 / 0** |
+| 吞吐 | 9.6 Mbps（1.01s 跨度），全程无背压失败 |
+| 超限拒发 | 3000B > 1497B → 本地拒绝（未交给 QUIC 截断） |
+| 错误指纹 | 12–25ms 内 `failed`，报出期望/实际指纹前缀 |
+| 握手耗时 | p50 ≈ 17ms（10 次：13.1–83.6ms），另有 2 次 **6.2s / 10.9s** 离群 |
+| **瞬时突发 1200 分片** | 7.0ms 内全发完 → 完整 677、**整帧丢失 523（43.6%）**、零重复零乱序 |
+
+**判读**：
+
+1. **D-01 的 QUIC datagram 路径在 Tahoe 上成立**：零丢失零乱序，1500B 级 datagram 可用，
+   1150B 分片距 1497B 上限还有 23% 余量。
+2. **瞬时突发丢 43.6%** 是本次最关键的工程事实：QUIC datagram 没有重传，拥塞窗口满即丢，
+   且是整帧级别的丢弃（分片同批发出，一起被丢）。⇒ 发送侧必须按 `targetFps` 节奏投递，
+   「先攒后发 / 有多少发多少」的写法会直接毁掉画面。反过来，这也证明 PROTOCOL §4
+   的「缺口 → 请求关键帧」不是过度设计。
+3. **偶发 6–11s 握手**是 UX 级问题（用户看到「连接中」卡住），疑为 QUIC Initial 重传退避；
+   在接控制通道（第 3 步）前必须定位，否则会被误判成「服务端没响应」。
+4. 指纹拒绝路径必须**主动取消连接**：仅 `complete(false)` 时客户端会吊在 preparing，
+   实测 20s 仍无结论（见 D-13 C-13.3）。
+
+数据：`/tmp/m1-quic-probe-1200.json`、`/tmp/m1-quic-probe.json`。
+
+---
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe |
@@ -215,3 +248,4 @@
 - v0.8-draft 2026-11-18 15:35：**真 loginwindow 补测正式延后 M2 借测机（D-11）**，主力机不再承担需登出中断会话的测试。新增只读前置探针 `P0V-SessionRecon/gui_session_probe.m`——用 `CGSessionCopyCurrentDictionary` 判定是否在 GUI 会话、逐屏 `CGDisplayCreateImage` 采样算 luma，输出三态结论（`READY_FOR_LOGINWINDOW_PROBE` / `NOT_IN_GUI_SESSION` / `GUI_BUT_NO_CONTENT`），严格不动显示配置；实测当前主力机 2 屏 `HAS_CONTENT`、判定 READY，逻辑自洽。`run_loginwindow_probe.sh` 改造为借测机可一次跑通：前置检查移到日志重定向之前（失败原因可见）、preflight 自动区分「不在 GUI 会话」(exit 10) 与「在会话但 TCC 拒绝抓屏」(exit 11)、不在会话时遍历 `loginwindow` pid 逐个 `bsexec` 并自动重入自身。**A-09 在 `loginDone=1` 锁屏态的结论不变，仅 `loginDone=0` 场景待验。**
 - v0.9-draft 2026-11-18 16:20：**新增 §5.3 负结果（首次禁屏独占实测致整机黑屏）**。不是 SPI/WindowServer 故障，而是探针兜底链路四处断裂：① 宿主未实现 `--guardian`，守护进程 exit(2) 后父进程仍禁屏；② 快照在建虚拟屏之后才拍，虚拟屏被当成 main；③ `keepIDs:@[]` 把虚拟屏一起禁掉 → 零显示；④ C-09 判据对空集恒真，零显示被放行。另 `@finally` 是唯一恢复出口，信号直接终止进程时不执行。已按 D-12 修完：守护就绪握手（`<snapshot>.guardian-ready`，失败即禁止禁屏）、快照前移建屏前、keep 并入会话虚拟屏并自检 active 非空、`M1IsolationViolation()` 拒绝空 active、信号自管道 + 看门狗、守护兜底额外清孤儿虚拟屏。新增负向测试 `tests/guardian_handshake_test.m` 与 `--preflight` 预检；单测 120 断言全过。禁屏条件下的帧管线数据仍为空。
 - v0.10-draft 2026-11-18 16:40：**修复后首次取得禁屏独占有效数据（§5.4）**：1080p20 环回 181/181 帧、零丢零错、稳态 ≈20.6fps（全窗口 14.2fps 被 3.9s 首帧拖低），码率 610kbps、平均分片 1072B。D-10 的 20fps 档在禁屏条件下可达；首帧 3924ms 明显劣于 M1-Pre 的 739–1031ms，新增待查项；60fps 仍无证据，A-02 保持开放。同时修掉 `M1FramePipeline` 在 `stop` 后把采集尺寸报成 0×0 的问题（尺寸随统计一起固化）。
+- v0.11-draft 2026-11-18 17:10：**新增 §5.5 QUIC datagram 帧通道实测（M1-A 第 1/2 步）**。400 帧/1200 分片/1.22MB 环回零丢失零重复零乱序，协商上限 1497B，9.6Mbps。两条硬结论：① 瞬时突发 1200 片丢 43.6%（整帧级），发送必须按帧节奏投递；② 指纹不符只 `complete(false)` 会吊在 preparing（20s 无结论），必须主动 cancel（D-13 C-13.3）。待查：偶发 6–11s 握手离群。

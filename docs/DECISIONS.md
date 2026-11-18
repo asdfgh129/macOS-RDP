@@ -589,6 +589,59 @@ V-04b/c 用用户授权的真实凭据（仅经 `P0V_PW` 环境变量在运行�
 
 ---
 
+## D-13 传输层落地形态：Network.framework QUIC datagram flow + 指纹钉死
+
+**状态**：已实现并实测（2026-11-18，Tahoe / Intel 本机环回）。
+
+### 背景
+
+D-01 只定了「帧通道用 QUIC unreliable datagram」，没定在 macOS 上怎么实现。开工前存在
+一个关键未知：Network.framework 是否会暴露 RFC 9221 datagram frame —— 若不暴露，就只能
+退回裸 UDP 自建加密/握手，工作量与安全风险都会上一个台阶。
+
+### 事实核对（先查 SDK 再写代码）
+
+在 `Network.framework/Headers/quic_options.h` 中确认以下符号存在，均为 macOS 13.0+：
+
+| 符号 | 用途 |
+|---|---|
+| `nw_quic_set_stream_is_datagram` / `nw_quic_get_stream_is_datagram` | 把连接标记为 QUIC datagram flow（每连接仅一条） |
+| `nw_quic_set_max_datagram_frame_size` | 声明本端愿接收的单帧上限 |
+| `nw_quic_get_stream_usable_datagram_frame_size(metadata)` | 握手后查询**协商出来的**可用载荷上限 |
+| `nw_quic_stream_type_datagram` | stream type 枚举 |
+
+⇒ 「Network.framework 不支持 QUIC datagram」的判断**不成立**，D-01 可按原设计实现，
+TLS 1.3 由 QUIC 自带，无需自建加密层。
+
+### 决策
+
+| 编号 | 决策 | 落点 |
+|---|---|---|
+| C-13.1 | 帧通道 = Network.framework QUIC datagram flow；一次 `nw_connection_send(..., is_complete=true)` 即一个 datagram 边界 | `M1QuicTransport.sendDatagram:error:` |
+| C-13.2 | TLS 身份用自签 p12（`gen_quic_identity.sh` 生成，`.state/` gitignore）；叶子证书 SHA-256 小写 hex 即 TOFU 指纹 | `peerCertificateSHA256` |
+| C-13.3 | 指纹钉死由 `expectedPeerFingerprint` + verify block 实现；**不符时必须主动 `nw_connection_cancel`** | `M1QuicTransport.m` verify block |
+| C-13.4 | 超过协商上限的 datagram 本地直接拒绝，不交给 QUIC 截断 | `sendDatagram:error:` 前置检查 |
+| C-13.5 | 帧发送必须按帧节奏/拥塞窗口投递，禁止瞬时突发 | 见下方实测 |
+
+C-13.3 的理由是实测出来的：只让 verify block `complete(false)` 时，QUIC 不会立刻进入
+`failed`，客户端会一直吊在 `preparing`（实测 20s 仍无结论），上层无法向用户解释「为什么连不上」。
+主动取消后拒绝在 12–25ms 内完成，并带出「期望/实际」指纹前缀。
+
+### 实测结论（详见 `RESULTS-BY-OS.md` §5.5）
+
+- 协商上限 1497B；1150B 分片留 23% 余量，安全。
+- 2ms 节奏 400 帧：1200/1200 分片、1,219,200B **零丢失零重复零乱序零载荷错**，9.6 Mbps。
+- **瞬时突发 1200 分片（7ms 内发完）：523 整帧丢失 = 43.6%**，零重复零乱序（纯拥塞丢弃）。
+  ⇒ 发送侧必须按 `targetFps` 节奏投递；这也是 PROTOCOL §4「缺口→请求关键帧」存在的实证依据。
+- 握手 p50 ≈ 17ms（10 次 13–84ms），偶发 6–11s 离群，疑为 QUIC Initial 重传退避，列入待查。
+
+### 未决
+
+- 偶发 6–11s 握手离群（UX 上等于「连接中卡住」），需在接控制通道前定位；
+- 双向并发（客户端也发输入帧）时 datagram flow 的单流特性是否成为瓶颈，待 M1-C 验证。
+
+---
+
 ## 附：协议实现进度（2026-11-17）
 
 | 模块 | 状态 | 测试 |

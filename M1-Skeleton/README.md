@@ -38,6 +38,7 @@ bash build_driver.sh    # 编译 M1RDPDriver + M1InputInjector 重依赖层
 ./driver_probe          # 只读侦察：active 屏 / 私有符号 / loginwindow PID / stale 槽位（不改显示配置）
 bash build_pipeline.sh  # 帧管线（不建屏/不禁屏）
 bash build_kiosk_probe.sh  # 禁屏独占实测探针
+bash build_quic_probe.sh   # 真实传输层（QUIC datagram + 指纹钉死），自带测试身份生成
 ```
 
 覆盖：配对码格式/过期/试错锁定/指纹变更拒绝/持久化；Shift 手势阈值/缓冲到期/延后封顶/
@@ -82,6 +83,45 @@ fail-safe 立即；会话 start/end 步骤顺序、带登录时注入在禁屏�
 真禁屏期间如果探针被 `kill -9`（信号拦不住），守护进程读到快照后恢复物理屏，并额外
 禁用不属于快照的 P0 虚拟屏（孤儿槽位），恢复结果写在 `<snapshot>.guardian-result.json`。
 
+## 真实传输层（M1-A 第 1/2 步，D-13）
+
+`M1QuicTransport.{h,m}` 是 `M1DatagramSink` 的生产实现：Network.framework 的 **QUIC
+datagram flow**（`nw_quic_set_stream_is_datagram`，macOS 13+），一次 `nw_connection_send`
+= 一个 datagram 边界，不重传、不排序——正是 D-01 要的语义。
+
+> 开工前先核对了 SDK 头文件：`nw_quic_stream_type_datagram` / `nw_quic_set_max_datagram_frame_size`
+> / `nw_quic_get_stream_usable_datagram_frame_size` 都存在且 macOS 13 起可用。原先担心的
+> 「Network.framework 不暴露 RFC 9221 datagram、只能退回裸 UDP」**不成立**，不需要自建加密。
+
+TLS 1.3 随连接建立，自签证书的叶子证书 SHA-256 就是 TOFU 锚点：
+`peerCertificateSHA256` 读出指纹，`expectedPeerFingerprint` 钉死。指纹不符时**主动取消连接
+并报 `M1QuicErrorFingerprintMismatch`**——只 `complete(false)` 的话 QUIC 会吊在 preparing
+直到 idle 超时（实测 20s 都没结论），上层拿不到任何可报的错。
+
+```bash
+bash build_quic_probe.sh                 # 内含 gen_quic_identity.sh，生成本地测试 p12（.state/，已 gitignore）
+./quic_probe --frames 400 --frame-bytes 3000 --pace-ms 2 --burst 1200
+M1_QUIC_DEBUG=1 ./quic_probe ...         # 打印握手/状态/证书细节
+```
+
+探针四阶段：A 不校验连上并读出指纹 → B 用该指纹钉死并跑分片压测（**走的是生产同一条
+16B 帧头 + 1150B 分片路径**，`M1FrameSender` 直接接在 QUIC sink 上）→ C 用错误指纹必须被拒
+→ D 瞬时突发（信息性，观测拥塞窗口满时的丢弃）。
+
+实测（2026-11-18，本机环回）：
+
+| 项 | 结果 |
+|---|---|
+| 协商 datagram 上限 | 1497 B（1150B 分片占 77%，安全） |
+| 分片投递（2ms 节奏，400 帧） | 1200/1200 分片、1,219,200 B **零丢失/零重复/零乱序/零载荷错**，9.6 Mbps |
+| 超限拒发 | 3000B > 1497B 本地即拒，不交给 QUIC 静默截断 |
+| 错误指纹 | 12–25ms 内 `failed` 并给出指纹差异 |
+| 握手耗时 | p50 约 17ms（10 次 13–84ms），偶发 6–11s 离群（待查） |
+| **瞬时突发 1200 分片** | 7.0ms 内全发 → **523 整帧丢失（43.6%）**，零重复零乱序 |
+
+最后一行是本次最重要的工程结论：**QUIC datagram 在瞬时突发下会成片丢弃**，帧发送必须
+按节奏/拥塞窗口投递，不能「有多少发多少」。这也反证了 PROTOCOL §4 的关键帧重建策略是必需的。
+
 ## Swift App 层（D-02，见 `../RDPApp/`）
 
 `RDPApp` 用「Swift 主 + ObjC 静态库」结构：clang 把本目录 ObjC 模块编成 `libRDPKit.a`，
@@ -90,7 +130,8 @@ protocol 注入协调器、Swift 调 ObjC 纯函数/类），会话序列端到�
 
 ## M1 剩余工作（依赖帧管线 / 需人为决策）
 
-1. **帧管线**（D-10）：SCK `SCStream` → VT H.264 → QUIC datagram，参数默认 20fps/1080p/关键帧 2s；
+1. **帧管线接入真实传输**：SCK `SCStream` → VT H.264 → `M1QuicTransport`，把 `pipeline_probe`
+   的环回换成两个进程；发送必须按帧节奏投递（突发实测丢 43.6%）；
 2. **Metal 渲染 + 多窗口**（帧管线就绪后）；MIT 基座集成；
 3. ~~真 loginwindow（`loginDone=0`）补测~~ → **延后 M2 借测机（D-11）**，不占主力机。资产已备齐：
    `P0V-SessionRecon/gui_session_probe`（只读判定 GUI 会话 + 抓屏 luma）与 `run_loginwindow_probe.sh`
