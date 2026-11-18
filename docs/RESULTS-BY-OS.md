@@ -272,8 +272,8 @@ ACL 判定不符 → 走授权 → 阻塞。所以现象才会像「同一张证
 
 修复后同一张曾「必挂」的证书 13.5–19.3ms 稳定握手。
 
-> 副作用待清：早期实现已往登录钥匙串写了若干 `CN=macOS-RDP M1 dev` 测试证书
-> （`security find-certificate -c "macOS-RDP M1 dev"` 可见），可手工删除，不影响功能。
+> 副作用已清（2026-11-18 19:00）：早期实现写进登录钥匙串的 30 张 `CN=macOS-RDP M1 dev`
+> 测试证书已删除，见 NEG-04。后续可用 `M1-Skeleton/cleanup_stale_identities.sh` 复查。
 
 #### NEG-01（结论更正）QUIC stream 模式并非不可用
 
@@ -293,6 +293,53 @@ D-14 因此改为按「一个 `nw_connection` 只能承载一条流」立论，�
 | 证书材料随机损坏（重生成就好） | 同一 p12 在修复前 8 次全挂、修复后同文件稳定通过 | 排除，是 ACL 不是材料 |
 | 重复导入 p12 破坏私钥 | 单次导入仍阻塞；临时钥匙串 + ACL 后两次导入也无碍 | 排除（缓存仍保留，理由变为避免重复条目） |
 | 新编出的二进制才有问题 | 同一二进制在 securityd 条目被授权后行为改变 | 假象：真实变量是钥匙串里那条 ACL |
+
+#### NEG-04 反复弹出「wants to sign using key "imported Private Key"」授权框
+
+**现象**：修复 NEG-02 之后，运行探针时屏幕上仍会不断弹出钥匙串授权框：
+
+```
+quic_probe wants to sign using key "Imported Private Key" in your keychain.
+The authenticity of "Imported Private Key" cannot be verified. To allow this,
+enter the "login" keychain password.      [Password: ____]  [Always Allow] [Deny] [Allow]
+```
+
+一次压测会同时堆出十几二十个（每个握手一次），全部盖在桌面上。
+
+**根因**（两个叠加）：
+
+1. **仓库里有旧二进制**。所有探针共用 `M1QuicTransport`，但 NEG-02 只改了源码，
+   `quic_probe`（18:01）、`pipeline_probe`（17:07）、`pipeline_kiosk_probe`（17:07）、
+   `driver_probe`（16:27）都是修复前（18:48）编的，仍走「导入登录钥匙串 + 持久 ACL」的旧路径，
+   每个握手都会触发一次授权判定。弹窗里出现 `quic_probe` / `rdpd` / `control_probe`
+   三个不同进程名，正是这三拨二进制各自在跑。
+2. **代码里留着降级分支**。临时钥匙串创建失败时，原实现会静默回退到默认（登录）钥匙串——
+   那正好是产生持久 ACL 条目的路径。一次 `SecKeychainCreate` 失败就能让弹窗重新长出来。
+
+**修复**：
+
+1. 全部探针重建（`build_quic_probe.sh` / `build_pipeline.sh` / `build_kiosk_probe.sh` /
+   `build_driver.sh` / `build_control_probe.sh` / `build_tests.sh`）；
+2. `M1CopyIdentity` **删掉回退分支**：临时钥匙串拿不到就明确失败并给出原因，
+   宁可不握手也不写登录钥匙串；
+3. 临时钥匙串文件名含 PID，`kill -9` 会留残留导致下次 `SecKeychainCreate` 报「已存在」，
+   创建前先 unlink（文件名含本进程 PID，不可能是别人的）；
+4. 新增 `cleanup_stale_identities.sh`：默认只列出登录钥匙串里 `CN=macOS-RDP M1 dev` 的
+   残留证书，`--delete` 才删（只删证书，不删私钥——删除私钥本身还会弹授权框且不可逆）；
+5. 已执行清理：删除 30 张残留证书，`security find-certificate` 复查为 0。
+
+**验证**（清理后同一台机器）：
+
+| 项 | 结果 |
+|---|---|
+| `control_probe --self --rounds 5` | 5/5 通过，握手 12.4–14.7ms |
+| `quic_probe` 默认参数（500 帧） | 退出码 0，500 帧→493 完整，缺片 0 |
+| `test_skeleton` | 148 断言全过 |
+| 跑完上述全部后 `pgrep -x SecurityAgent` | **无进程**（即未产生任何授权请求） |
+
+**遗留**：登录钥匙串里仍有 29 条 `Imported Private Key` 私钥条目（对应已删的证书）。
+它们已没有调用方，不会再弹框；删除需要 `SecItemDelete` 且会触发授权框，故未处理。
+如需彻底清掉，可在「钥匙串访问 → 登录 → 密钥」里按标签手工删除。
 
 ---
 
@@ -322,3 +369,4 @@ D-14 因此改为按「一个 `nw_connection` 只能承载一条流」立论，�
 - v0.10-draft 2026-11-18 16:40：**修复后首次取得禁屏独占有效数据（§5.4）**：1080p20 环回 181/181 帧、零丢零错、稳态 ≈20.6fps（全窗口 14.2fps 被 3.9s 首帧拖低），码率 610kbps、平均分片 1072B。D-10 的 20fps 档在禁屏条件下可达；首帧 3924ms 明显劣于 M1-Pre 的 739–1031ms，新增待查项；60fps 仍无证据，A-02 保持开放。同时修掉 `M1FramePipeline` 在 `stop` 后把采集尺寸报成 0×0 的问题（尺寸随统计一起固化）。
 - v0.11-draft 2026-11-18 17:10：**新增 §5.5 QUIC datagram 帧通道实测（M1-A 第 1/2 步）**。400 帧/1200 分片/1.22MB 环回零丢失零重复零乱序，协商上限 1497B，9.6Mbps。两条硬结论：① 瞬时突发 1200 片丢 43.6%（整帧级），发送必须按帧节奏投递；② 指纹不符只 `complete(false)` 会吊在 preparing（20s 无结论），必须主动 cancel（D-13 C-13.3）。待查：偶发 6–11s 握手离群。
 - v0.12-draft 2026-11-18 18:55：**新增 §5.6 控制通道端到端 + 两个结论更正**。控制通道 8 态在真实 QUIC 连接上跑通（`--self` 5/5、两进程 host/client 通过、148 单测全过、握手 13.5–19.3ms）。三处更正：① **§5.5 的「6–11s 离群疑为 QUIC Initial 退避」作废**——真因是 p12 私钥的 keychain ACL 触发 securityd 授权阻塞，`SecKeyCreateSignature` 卡在 `mach_msg`，服务端发不出 `CertificateVerify`，客户端永停 `preparing` 且无错误码（NEG-02）；② **「QUIC stream 模式不可用」作废**——复核握手 64.6/80.4ms 正常，此前失败同因（NEG-01），D-14 改按「一个连接一条流」立论；③ 「证书材料随机损坏」假象撤回。修复：临时钥匙串 + ACL 信任当前进程 + 进程内单次导入。
+- v0.13-draft 2026-11-18 19:10：**新增 NEG-04 授权弹窗复发根因与清理**。NEG-02 修完之后弹窗仍在，原因是 ① 仓库里 `quic_probe`/`pipeline_probe`/`pipeline_kiosk_probe`/`driver_probe` 四份二进制是修复前编的，仍走登录钥匙串旧路径；② `M1CopyIdentity` 在临时钥匙串创建失败时静默回退到登录钥匙串。修法：全部重建、删除回退分支（失败即报错）、临时钥匙串先 unlink 防 PID 复用残留、新增 `cleanup_stale_identities.sh`，并清掉登录钥匙串里 30 张残留测试证书。验证：`--self` 5/5（12.4–14.7ms）、`quic_probe` 默认 500 帧退出码 0、148 断言全过，且跑完后 `SecurityAgent` 不再出现。

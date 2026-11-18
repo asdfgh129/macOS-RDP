@@ -70,10 +70,16 @@ static SecKeychainRef M1TempKeychain(void) {
             stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"m1rdp-identity-%d.keychain", getpid()]];
         const char *pw = "m1rdp-ephemeral";
+        // PID 可能被复用：上次异常退出（kill -9 / 崩溃，atexit 不执行）会留下同名文件，
+        // 此时 SecKeychainCreate 直接报「已存在」，身份就会被无谓地拒绝。先清掉残留
+        // ——文件名含本进程 PID，只可能是已死进程留下的。
+        [[NSFileManager defaultManager] removeItemAtPath:path error:NULL];
         OSStatus st = SecKeychainCreate(path.fileSystemRepresentation,
                                        (UInt32)strlen(pw), pw, false, NULL, &gM1TempKeychain);
         if (st != errSecSuccess || !gM1TempKeychain) {
-            M1QLOG("临时钥匙串创建失败 st=%d（回退到默认钥匙串）", (int)st);
+            // 不降级到登录钥匙串：那条路径会写持久 ACL，之后每次签名都可能拉起
+            // SecurityAgent 授权框（用户看到的是「一直弹要密码的窗口」），见 NEG-04。
+            M1QLOG("临时钥匙串创建失败 st=%d → 身份导入将被拒绝", (int)st);
             gM1TempKeychain = NULL;
             return;
         }
@@ -106,8 +112,17 @@ static SecIdentityRef M1CopyIdentity(NSString *path, NSString *password,
     NSMutableDictionary *opts = [@{ (__bridge id)kSecImportExportPassphrase: password ?: @"" }
                                  mutableCopy];
     if (access) opts[(__bridge id)kSecImportExportAccess] = (__bridge id)access;
+    // 只允许导入进程私有钥匙串。宁可这次握手失败，也不能回退到登录钥匙串——
+    // 回退会留下带持久 ACL 的私钥条目，表现为反复弹出无密码的「允许签名」授权框，
+    // 并且每次重建二进制都会再来一次。
     SecKeychainRef kc = M1TempKeychain();
-    if (kc) opts[(__bridge id)kSecImportExportKeychain] = (__bridge id)kc;
+    if (!kc) {
+        if (access) CFRelease(access);
+        if (error) *error = M1QuicErr(M1QuicErrorIdentityUnusable,
+            @"无法创建进程私有临时钥匙串，拒绝导入到登录钥匙串（否则会持续弹出授权框）");
+        return NULL;
+    }
+    opts[(__bridge id)kSecImportExportKeychain] = (__bridge id)kc;
     CFArrayRef items = NULL;
     OSStatus st = SecPKCS12Import((__bridge CFDataRef)p12,
                                   (__bridge CFDictionaryRef)opts, &items);
