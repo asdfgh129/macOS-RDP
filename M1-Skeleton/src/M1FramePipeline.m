@@ -5,6 +5,14 @@
 
 #import "M1FramePipeline.h"
 #include <stdatomic.h>
+#include <stdio.h>
+#include <time.h>
+
+static double NowMs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 
 // 连续多少帧因超 255 片失败后，升级为一次明确告警（而不是每帧刷同一条错误）。
 static const NSUInteger kM1FragFailureAlertThreshold = 3;
@@ -38,6 +46,7 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
 @property (nonatomic, assign) uint64_t payloadBytesSent;
 @property (nonatomic, assign) uint64_t fragmentsSent;
 @property (nonatomic, assign) double firstFrameLatencyMs;
+@property (nonatomic, assign) double encoderSessionCreateMs;
 @end
 
 @implementation M1FramePipelineStats
@@ -46,11 +55,11 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
     return [NSString stringWithFormat:
             @"captured=%llu encoded=%llu sent=%llu dropPreEnc=%llu "
             @"encFail=%llu sendFail=%llu key=%llu frags=%llu payload=%lluB "
-            @"firstFrame=%.0fms",
+            @"firstFrame=%.0fms encInit=%.0fms",
             self.framesCaptured, self.framesEncoded, self.framesSent,
             self.framesDroppedBeforeEncoder, self.encodeFailures, self.sendFailures,
             self.keyframes, self.fragmentsSent, self.payloadBytesSent,
-            self.firstFrameLatencyMs];
+            self.firstFrameLatencyMs, self.encoderSessionCreateMs];
 }
 
 @end
@@ -177,16 +186,39 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
 }
 
 - (void)stop {
-    _running = NO;
-    // 先停采集（不再来新帧），再排空编码器（不再有回调）。
-    [_capture stop];
-    [_encoder stop];
-    // capture/encoder 的统计随对象消失，释放前必须先固化，否则 stop 后读到全 0。
-    _stoppedWidth = _capture.pixelWidth;
-    _stoppedHeight = _capture.pixelHeight;
-    _finalSnapshot = [self liveStats];
-    _capture = nil;
-    _encoder = nil;
+    // 并发双停防护：onSessionClosed 里停一次（控制收包队列），主线程收尾再停一次。
+    // 不串行化的话两边会同时进 _capture/_encoder 的 stop，触发二次释放而崩溃。
+    // 先摘快照再释放，锁外做真正耗时的排空。
+    M1CapturePipeline *cap = nil;
+    M1VideoEncoder *enc = nil;
+    @synchronized (self) {
+        if (!_running && !_capture && !_encoder) return;   // 已停过，幂等返回
+        _running = NO;
+        cap = _capture;
+        enc = _encoder;
+        // 尺寸必须在摘掉 _capture 之前固化，否则并发的 pixelWidth 会读到 0。
+        _stoppedWidth = _capture ? _capture.pixelWidth : _stoppedWidth;
+        _stoppedHeight = _capture ? _capture.pixelHeight : _stoppedHeight;
+        // 先停采集（不再来新帧），再排空编码器（不再有回调）。
+        _capture = nil;
+        _encoder = nil;
+    }
+    // 快照必须在真正停之前取：stop 里的 CompleteFrames/SCK 停止可能长时间阻塞，
+    // 一旦阻塞在这条线程上（对端 bye 触发的路径就在控制收包队列），后面的赋值永远到不了。
+    _finalSnapshot = [self liveStatsFromCapture:cap encoder:enc];
+
+    double t0 = NowMs();
+    [cap stop];
+    double tCap = NowMs() - t0;
+    t0 = NowMs();
+    [enc stop];
+    double tEnc = NowMs() - t0;
+    // 已知隐患：stop 偶尔会在这条线程上长时间阻塞（对端 bye 触发的路径就在控制
+    // 收包队列上）。默认不打印，需要定位时用 M1_STOP_TIMING=1 打开。
+    if (getenv("M1_STOP_TIMING")) {
+        fprintf(stderr, "[M1FramePipeline] stop cost: capture=%.0fms encoder=%.0fms\n",
+                tCap, tEnc);
+    }
 }
 
 - (void)requestKeyframe {
@@ -250,16 +282,23 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
 
 // 从当前存活对象读取统计（运行期与 stop 瞬间都用它）。
 - (M1FramePipelineStats *)liveStats {
+    return [self liveStatsFromCapture:_capture encoder:_encoder];
+}
+
+// stop 会把 _capture/_encoder 摘成 nil，所以统计必须在释放前用快照算出来。
+- (M1FramePipelineStats *)liveStatsFromCapture:(M1CapturePipeline *)capture
+                                       encoder:(M1VideoEncoder *)encoder {
     M1FramePipelineStats *s = [[M1FramePipelineStats alloc] init];
     s.framesCaptured = atomic_load(&_framesCaptured);
     s.framesDroppedBeforeEncoder = atomic_load(&_droppedBeforeEncoder);
     s.encodeFailures = atomic_load(&_encodeFailures);
     s.sendFailures = atomic_load(&_sendFailures);
-    s.firstFrameLatencyMs = _capture ? _capture.stats.firstFrameLatencyMs : 0;
+    s.firstFrameLatencyMs = capture ? capture.stats.firstFrameLatencyMs : 0;
 
-    M1EncoderStats *es = _encoder ? _encoder.stats : nil;
+    M1EncoderStats *es = encoder ? encoder.stats : nil;
     s.framesEncoded = es ? es.framesEncoded : 0;
     s.keyframes = es ? es.keyframes : 0;
+    s.encoderSessionCreateMs = es ? es.sessionCreateMs : 0;
 
     M1FrameSenderStats *ss = _sender.stats;
     s.framesSent = ss.framesSent;

@@ -30,9 +30,22 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) uint64_t decodeFailures;
 @property (nonatomic, readonly) uint64_t keyframeRequests;
 @property (nonatomic, readonly) double lastDecodeLatencyMs;
+// VTDecompressionSessionCreate 的实际耗时（建一次记一次，末次值）。
+// 预热生效后应落在几十 ms；首次且未预热时实测 260~1110ms。
+@property (nonatomic, readonly) double decoderCreateMs;
+// 进程级预热自身的耗时（0 表示本进程没做过预热）。
+@property (nonatomic, readonly) double decoderPrewarmMs;
 @end
 
 @interface M1FrameReceiver : NSObject
+
+// 进程级预热：VT 解码会话的首次初始化在进程内一次性发生，且与码流参数无关
+// （用一个不含 SPS/PPS 的裸 formatDescription 就能把它做掉）。实测 260~1110ms，
+// 正好压在首帧的关键路径上。在握手期间后台调一次即可。
+//
+// 幂等且线程安全；内部建的会话只用于预热，建完立刻销毁，绝不解码真实数据。
+// 预热宽度/高度只是让 VT 走到同一分辨率分支，无需与真实码流一致。
++ (void)prewarmDecoder;
 
 // onFrame 在调用 acceptDatagram 的线程上同步回调，pixelBuffer 仅回调期间有效。
 - (instancetype)initWithOnFrame:(void (^)(CVPixelBufferRef pixelBuffer, uint32_t frameSeq))onFrame

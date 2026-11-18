@@ -8,11 +8,19 @@
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <time.h>
 
 static NSError *M1RxErr(M1PipelineErrorCode code, NSString *msg) {
     return [NSError errorWithDomain:M1PipelineErrorDomain
                                code:code
                            userInfo:@{NSLocalizedDescriptionKey: msg}];
+}
+
+static double M1RxNowMs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
 // AVCC 载荷拆解：参数集（SPS type7 / PPS type8）收集为裸 NAL，
@@ -56,6 +64,8 @@ static BOOL M1SplitAVCC(NSData *payload,
 @property (nonatomic, assign) uint64_t decodeFailures;
 @property (nonatomic, assign) uint64_t keyframeRequests;
 @property (nonatomic, assign) double lastDecodeLatencyMs;
+@property (nonatomic, assign) double decoderCreateMs;
+@property (nonatomic, assign) double decoderPrewarmMs;
 @end
 
 @implementation M1FrameReceiverStats
@@ -78,6 +88,7 @@ static BOOL M1SplitAVCC(NSData *payload,
     atomic_uint_fast64_t _decodeFailures;
     atomic_uint_fast64_t _keyframeRequests;
     _Atomic double _lastDecodeLatencyMs;
+    _Atomic double _decoderCreateMs;
 }
 - (void)handleDecodedImage:(CVImageBufferRef)image status:(OSStatus)status;
 @end
@@ -99,7 +110,38 @@ static void M1DecoderOutput(void *decompressionOutputRefCon,
 
 #pragma mark - 接收器
 
+// 进程级预热结果（-1 表示本进程未预热）。dispatch_once 内只写一次，之后只读。
+static double gPrewarmMs = -1;
+
 @implementation M1FrameReceiver
+
++ (void)prewarmDecoder {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (getenv("M1_NO_PREWARM")) return;   // 诊断：关掉预热做 A/B 对照
+        double t0 = M1RxNowMs();
+        // 裸 formatDescription：不含 SPS/PPS。实测 VT 照样能建出会话，
+        // 说明首次建会话的开销与码流参数无关，纯粹是 VT 解码侧的一次性初始化。
+        CMFormatDescriptionRef bare = NULL;
+        OSStatus cs = CMVideoFormatDescriptionCreate(kCFAllocatorDefault,
+                                                     kCMVideoCodecType_H264,
+                                                     1920, 1080, NULL, &bare);
+        OSStatus ds = -1;
+        if (cs == noErr && bare) {
+            VTDecompressionSessionRef spare = NULL;
+            ds = VTDecompressionSessionCreate(kCFAllocatorDefault, bare,
+                                             NULL, NULL, NULL, &spare);
+            if (spare) {
+                VTDecompressionSessionInvalidate(spare);
+                CFRelease(spare);
+            }
+            CFRelease(bare);
+        }
+        gPrewarmMs = M1RxNowMs() - t0;
+        fprintf(stderr, "[M1FrameReceiver] 解码器预热 %.0fms (fmt=%d ses=%d)\n",
+                gPrewarmMs, (int)cs, (int)ds);
+    });
+}
 
 - (instancetype)initWithOnFrame:(void (^)(CVPixelBufferRef, uint32_t))onFrame
                   onNeedKeyframe:(void (^)(void))onNeedKeyframe {
@@ -118,6 +160,7 @@ static void M1DecoderOutput(void *decompressionOutputRefCon,
         atomic_init(&_decodeFailures, 0);
         atomic_init(&_keyframeRequests, 0);
         atomic_store(&_lastDecodeLatencyMs, 0.0);
+        atomic_store(&_decoderCreateMs, 0.0);
     }
     return self;
 }
@@ -244,8 +287,10 @@ static void M1DecoderOutput(void *decompressionOutputRefCon,
 
     if (!_decoder) {
         VTDecompressionOutputCallbackRecord cb = { M1DecoderOutput, (__bridge void *)self };
+        double t0 = M1RxNowMs();
         OSStatus ds = VTDecompressionSessionCreate(kCFAllocatorDefault, fmt,
                                                    NULL, NULL, &cb, &_decoder);
+        atomic_store(&_decoderCreateMs, M1RxNowMs() - t0);
         if (ds != noErr || !_decoder) {
             _decoder = NULL;
             atomic_fetch_add(&_decodeFailures, 1);
@@ -347,6 +392,8 @@ static void M1DecoderOutput(void *decompressionOutputRefCon,
     s.decodeFailures = atomic_load(&_decodeFailures);
     s.keyframeRequests = atomic_load(&_keyframeRequests);
     s.lastDecodeLatencyMs = atomic_load(&_lastDecodeLatencyMs);
+    s.decoderCreateMs = atomic_load(&_decoderCreateMs);
+    s.decoderPrewarmMs = (gPrewarmMs > 0) ? gPrewarmMs : 0;
     return s;
 }
 

@@ -8,11 +8,19 @@
 #import <CoreMedia/CoreMedia.h>
 #import <QuartzCore/QuartzCore.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <time.h>
 
 static NSError *M1EncoderErr(M1PipelineErrorCode code, NSString *msg) {
     return [NSError errorWithDomain:M1PipelineErrorDomain
                                code:code
                            userInfo:@{NSLocalizedDescriptionKey: msg}];
+}
+
+static double M1EncNowMs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
 #pragma mark - 配置
@@ -56,6 +64,7 @@ static NSError *M1EncoderErr(M1PipelineErrorCode code, NSString *msg) {
 @property (nonatomic, assign) uint64_t bytesTotal;
 @property (nonatomic, assign) double lastEncodeCallMs;
 @property (nonatomic, assign) double maxEncodeCallMs;
+@property (nonatomic, assign) double sessionCreateMs;
 @end
 
 @implementation M1EncoderStats
@@ -74,6 +83,7 @@ static NSError *M1EncoderErr(M1PipelineErrorCode code, NSString *msg) {
     atomic_uint_fast64_t _bytesTotal;
     _Atomic double _lastEncodeCallMs;
     _Atomic double _maxEncodeCallMs;
+    _Atomic double _sessionCreateMs;
     BOOL _running;
     BOOL _forceNextKeyframe;   // 下一帧强制 IDR（帧级选项，用完即复位）
 }
@@ -117,6 +127,25 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
 
 @implementation M1VideoEncoder
 
++ (void)prewarm {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (getenv("M1_NO_PREWARM")) return;   // 诊断：关掉预热做 A/B 对照
+        double t0 = M1EncNowMs();
+        VTCompressionSessionRef spare = NULL;
+        OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, 1920, 1080,
+                                                 kCMVideoCodecType_H264,
+                                                 NULL, NULL, NULL,
+                                                 NULL, NULL, &spare);
+        if (spare) {
+            VTCompressionSessionInvalidate(spare);
+            CFRelease(spare);
+        }
+        fprintf(stderr, "[M1VideoEncoder] 编码器预热 %.0fms (status=%d)\n",
+                M1EncNowMs() - t0, (int)st);
+    });
+}
+
 - (instancetype)initWithConfig:(M1EncoderConfig *)config
                      onEncoded:(void (^)(M1EncodedFrame *))onEncoded
                        onError:(void (^)(NSError *))onError {
@@ -133,6 +162,7 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
         atomic_init(&_bytesTotal, 0);
         atomic_store(&_lastEncodeCallMs, 0.0);
         atomic_store(&_maxEncodeCallMs, 0.0);
+        atomic_store(&_sessionCreateMs, 0.0);
         _running = NO;
     }
     return self;
@@ -149,6 +179,7 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
         return NO;
     }
 
+    double createT0 = M1EncNowMs();
     OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault,
                                              _config.width, _config.height,
                                              kCMVideoCodecType_H264,
@@ -194,6 +225,7 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
         return NO;
     }
 
+    atomic_store(&_sessionCreateMs, M1EncNowMs() - createT0);
     _running = YES;
     return YES;
 }
@@ -263,13 +295,20 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
 }
 
 - (void)stop {
-    if (!_session) { _running = NO; return; }
-    _running = NO;
-    // CompleteFrames 同步等内部队列排空——之后才不会有回调打到 self 上。
-    VTCompressionSessionCompleteFrames(_session, kCMTimeInvalid);
-    VTCompressionSessionInvalidate(_session);
-    CFRelease(_session);
-    _session = NULL;
+    // 必须可重入、可并发：对端 bye 触发的管线停止跑在控制收包队列上，主线程
+    // 收尾时还会再调一次；两者并发进到这里时，旧实现会对 _session 二次 CFRelease，
+    // 直接 SIGILL（EXC_BAD_INSTRUCTION，CFRelease 的 over-release 陷阱）。
+    // 先把 _session 摘走再释放，保证同一会话只会被释放一次。
+    VTCompressionSessionRef draining = NULL;
+    @synchronized (self) {
+        _running = NO;
+        draining = _session;
+        _session = NULL;
+    }
+    if (!draining) return;
+    VTCompressionSessionCompleteFrames(draining, kCMTimeInvalid);
+    VTCompressionSessionInvalidate(draining);
+    CFRelease(draining);
 }
 
 - (void)dealloc {
@@ -353,6 +392,7 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
     s.bytesTotal = atomic_load(&_bytesTotal);
     s.lastEncodeCallMs = atomic_load(&_lastEncodeCallMs);
     s.maxEncodeCallMs = atomic_load(&_maxEncodeCallMs);
+    s.sessionCreateMs = atomic_load(&_sessionCreateMs);
     return s;
 }
 

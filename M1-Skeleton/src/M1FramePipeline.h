@@ -46,6 +46,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) uint64_t payloadBytesSent;
 @property (nonatomic, readonly) uint64_t fragmentsSent;
 @property (nonatomic, readonly) double firstFrameLatencyMs;
+// 编码器 VTCompressionSessionCreate+Prepare 的耗时。预热是否生效看这一项。
+@property (nonatomic, readonly) double encoderSessionCreateMs;
 - (NSString *)summary;
 @end
 

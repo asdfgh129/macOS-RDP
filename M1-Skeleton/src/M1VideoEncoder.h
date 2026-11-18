@@ -44,9 +44,21 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) uint64_t bytesTotal;
 @property (nonatomic, readonly) double lastEncodeCallMs;   // 入队调用耗时（与 P0 探针同口径）
 @property (nonatomic, readonly) double maxEncodeCallMs;
+// VTCompressionSessionCreate + PrepareToEncodeFrames 的实际耗时。
+// 预热生效后应在百毫秒级；未预热时实测 340~1650ms（直接压首帧）。
+@property (nonatomic, readonly) double sessionCreateMs;
 @end
 
 @interface M1VideoEncoder : NSObject
+
+// 进程级预热：VT 的会话初始化在进程内是一次性的——首次 VTCompressionSessionCreate
+// 实测 340~1380ms（框架冷加载 + VTEncoderXPCService 握手），之后同进程只要 100ms 级。
+// 推流时这 1s 直接压在首帧延迟上（而且发生在采集已启动之后，期间的采集帧全被丢弃）。
+// 在握手 / 等待客户端接入期间后台调一次，把这次性开销挪出关键路径。
+//
+// 幂等且线程安全：可重复调用，只有第一次真正执行；在任何队列上调都安全。
+// 不依赖分辨率——空转会话建完立即销毁，从不接收真实像素。
++ (void)prewarm;
 
 // onEncoded / onError 在 VT 内部队列回调，不在调用方线程——上层需自行切回目标队列。
 - (instancetype)initWithConfig:(M1EncoderConfig *)config

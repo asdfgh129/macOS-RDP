@@ -35,6 +35,7 @@
 #import "M1ControlSession.h"
 #import "M1FramePipeline.h"
 #import "M1FrameReceiver.h"
+#import "M1VideoEncoder.h"
 
 static NSString *gIdentity = @".state/rdp-identity.p12";
 static NSString *gPass = @"rdpdev";
@@ -487,6 +488,15 @@ int main(int argc, char **argv) {
         }
         if (!hostMode && !clientMode) { PrintUsage(); return 1; }
 
+        // 进程级 VT 预热：与后面的握手并发进行。首次会话初始化实测 0.3~1.5s，
+        // 不预热就整段压在首帧延迟上。按角色只预热本端要用的那一侧，
+        // 避免主机/客户端两个方向混在一起测不出各自收益。
+        // 用 UTILITY：预热本身不急，不能和握手/首帧采集抢 CPU（i5 上实测会反噬）。
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (hostMode) [M1VideoEncoder prewarm];
+            else          [M1FrameReceiver prewarmDecoder];
+        });
+
         if (hostMode) {
             NSError *err = nil;
             NSString *localFp = M1QuicIdentityFingerprint(gIdentity, gPass, &err);
@@ -553,8 +563,15 @@ int main(int argc, char **argv) {
             };
 
             NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:durationMs / 1000.0];
+            double pipelineStartMs = NowMs();
+            double firstSentMs = 0;
             while (!stopped && [deadline timeIntervalSinceNow] > 0) {
-                [NSThread sleepForTimeInterval:0.05];
+                if (firstSentMs == 0 && pipe.nextFrameSeq > 0) {
+                    firstSentMs = NowMs();
+                    printf("  首帧发出：管线启动后 %.0f ms（采集首帧 %.0f ms）\n",
+                           firstSentMs - pipelineStartMs, pipe.stats.firstFrameLatencyMs);
+                }
+                [NSThread sleepForTimeInterval:0.01];
             }
             [pipe stop];
 
@@ -646,6 +663,8 @@ int main(int argc, char **argv) {
             ? client.firstFrameMs - client.streamStartMs : 0;
         printf("  解码尺寸 %dx%d  解码帧率 %.1f fps  首帧延迟 %.0f ms\n",
                client.decodedWidth, client.decodedHeight, decodeFps, firstFrameLatency);
+        printf("  解码器：进程预热 %.0f ms，真实建会话 %.0f ms\n",
+               rs.decoderPrewarmMs, rs.decoderCreateMs);
         printf("  控制包 %llu / 帧包 %llu / 未分流 %llu\n",
                client.controlDatagrams, client.frameDatagrams, client.unroutedDatagrams);
         printf("  帧队列单次处理最长 %.0f ms（推流 %.0f ms 处）\n",
@@ -673,6 +692,9 @@ int main(int argc, char **argv) {
         json[@"decodedWidth"] = @(client.decodedWidth);
         json[@"decodedHeight"] = @(client.decodedHeight);
         json[@"decodeFps"] = @(round(decodeFps * 10) / 10.0);
+        json[@"firstFrameLatencyMs"] = @(round(firstFrameLatency));
+        json[@"decoderPrewarmMs"] = @(round(rs.decoderPrewarmMs));
+        json[@"decoderCreateMs"] = @(round(rs.decoderCreateMs));
         json[@"controlDatagrams"] = @(client.controlDatagrams);
         json[@"frameDatagrams"] = @(client.frameDatagrams);
         json[@"maxControlGapMs"] = @(round(client.maxControlGapMs));
