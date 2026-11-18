@@ -6,13 +6,13 @@
 | 日期 | 2026-11-17 |
 | 上位文档 | `docs/DESIGN.md`（§4.3 传输、§5 模块）、`docs/PROTOCOL.md` |
 | 实测结论 | 按 OS 分离记录于 `docs/RESULTS-BY-OS.md`；决策中的实测证据均须标注 OS/build |
-| 状态 | **提议，待评审确认**。确认后 D-01 冻结 PROTOCOL v1 的帧通道细节 |
+| 状态 | **已评审通过（2026-11-18 11:20），作为 M1 基线**。D-01/D-02/D-09 已确认，PROTOCOL v1 已冻结；D-03 作废保留追溯 |
 
 ---
 
 ## D-01 帧通道传输：QUIC（Network.framework）+ 不可靠数据报
 
-**状态**：提议（2026-11-17），建议采纳。
+**状态**：✅ **已确认（2026-11-18 11:20 评审通过），PROTOCOL v1 已按此冻结**。
 
 ### 决定
 
@@ -61,7 +61,7 @@ nw_parameters_create_quic(^(nw_protocol_options_t quic) {
 
 ## D-02 产品形态：Swift 主工程 + ObjC 桥
 
-**状态**：提议（2026-11-17），建议采纳。
+**状态**：✅ **已确认（2026-11-18 11:20 评审通过），PROTOCOL v1 已按此冻结**。
 
 ### 决定
 
@@ -433,6 +433,159 @@ V-04b/c 用用户授权的真实凭据（仅经 `P0V_PW` 环境变量在运行�
 
 **遗留**：真 loginwindow 态（`loginDone=0`，未登录机器）未在本次覆盖，本次是
 `loginDone=true` 的已登录用户锁屏态；开机未登录场景仍待 M1 实测。
+
+---
+
+## D-09 采集主路径：CGDisplayCreateImage，SCK 降为对照/兼容分支
+
+**日期**：2026-11-18 11:20　**状态**：⚠️ **已确认但依据被 M1-Pre 实测部分修正（2026-11-18 11:30）**——路径可用性成立，但帧率目标不成立、SCK 黑帧结论需限定条件；主路径形态暂缓冻结，见文末「M1-Pre 实测更正」
+
+### 决定
+
+1. **主路径**：逐屏 `CGDisplayCreateImage(displayID)` 抓帧 → CVPixelBuffer → VideoToolbox H.264 硬编。
+2. **SCK `SCStream` 保留**：作为对照路径与 Sequoia 15.5 兼容分支；不再作为 Tahoe 零物理屏场景的唯一采集手段。
+3. **不再声称「全程零拷贝」**：公开抓屏 API 涉及位图拷贝，性能以 M1-Pre 实测为准。
+4. **不阻塞方案定稿**：吞吐/帧率/CPU 实测转入 M1-Pre 验收；不达标时按 NFR-04 逐级降规格，或按 D-05 第 3 条降级，不推翻独占会话形态。
+
+### 证据
+
+| 场景 | SCK | `CGDisplayCreateImage` |
+|---|---|---|
+| Tahoe 26.5.2 + 零 active 物理屏 | 4 次中 1 次全黑、2 次多数帧黑；`altprobe` 仅 2–4fps | 1280×720 `minMean=39/maxVar=1506`、1920×1080 `minMean=37/maxVar=1562`，0 黑采样，恢复 OK |
+| Tahoe 锁屏+屏亮 | 50 帧 `HAS_CONTENT` | `mean≈148/var≈1639` `HAS_CONTENT` |
+| Sequoia 15.5 | V-03 60fps `HAS_CONTENT` | 未测（SCK 在该版本稳定，保留为兼容分支） |
+
+数据来源：`docs/RESULTS-BY-OS.md` §5、`P0V-AltCapture/README.md`；证据 `/tmp/p0v-alt-tahoe3.json`、`/tmp/p0v-alt-tahoe-1080.json`。
+
+### 理由与代价
+
+- 合成层正常（系统截图有完整桌面），黑帧来自 Tahoe SCK 送帧异常，不是产品形态错误；换采集 API 是最小改动面。
+- 代价：`CGDisplayCreateImage` 是同步抓帧，需要按 displayID 逐屏调度并控制节奏；CPU/帧率上限必须实测，不能外推 SCK 的性能结论。
+- 真 loginwindow（`loginDone=0`）态尚未覆盖，M1 补测时两条路径都要跑。
+
+### 影响与待办
+
+- `docs/DESIGN.md` FR-03 / §3.1 / §4.1 / §5.3 已同步；`PROTOCOL.md` 帧通道不变（采编之后仍是 QUIC datagram）。
+- M1-Pre：新建采编探针，复用 `VDManager` + `P0VDisplayControl`（含守护恢复），锁定 1080p 吞吐/帧率/CPU 与黑帧判据；结果回填 `RESULTS-BY-OS.md`。
+
+### M1-Pre 实测更正（2026-11-18 11:30，`M1-Pre-CaptureCodec/`）
+
+三组端到端实测（`CGDisplayCreateImage → BGRA CVPixelBuffer → VT H.264 → VT 解码`）：
+
+| 场景 | 分辨率 | 链路 verdict | 实际 fps | 抓帧 avg/p95 ms | 整机 busy |
+|---|---|---|---|---|---|
+| `--no-disable` | 1920×1080 | PASS | 1 | 282 / 356 | 99% |
+| 禁全部物理屏 | 1920×1080 | PASS | 4 | 125 / 168 | 99% |
+| 禁全部物理屏 | 1280×720 | PASS | 7 | 95 / 124 | 77% |
+
+全部 0 黑帧、0 编码错误、编解码计数一致、恢复 OK。**两点必须记入决策**：
+
+1. **路径可用性确认**：D-09 选的链路在零物理屏下端到端成立，0 黑帧，恢复可靠 —— 决策方向上仍然正确。
+2. **性能目标不成立**：`CGDisplayCreateImage` 抓帧固定成本 95–282ms，是绝对瓶颈；720p 仅降到 95ms，说明不是像素拷贝而是系统级同步成本。**1080p60 / <30ms 达不到，差 4–8 倍**；整机 busy 77–99% 而本进程仅 0.14–0.21 核，开销在 WindowServer 合成侧。
+3. ~~**SCK 55fps**~~ **（11:35 撤销）**：该读数来自 `withEncoder:NO`（`encodedFrames=0`、首帧 847ms），是 SCK 按内容变化送帧的假象。`--sck-only` 带编码环回复测的真实帧率：SCK 禁屏 **18fps**、不禁屏 2fps；`CGDisplayCreateImage` 禁屏 4fps。详见 `RESULTS-BY-OS.md` §5.2。**这是本项目第三次「静态 SCK fps 不可当结论」的陷阱，已拦下。**
+
+**D-10（2026-11-18 11:40 用户确认）：B + C 组合，已定** ——
+
+1. **SCK 回主路径**：`SCStream → IOSurface → VideoToolbox H.264`，`CGDisplayCreateImage` 降为兜底/对照。依据：`--sck-only` 禁屏带编码 18fps、0 黑帧、原生零拷贝，相对优于 `CGDisplayCreateImage` 的 4fps。
+2. **目标帧率下调到 15–30fps**：NFR-03 由「稳定 60fps」修订为「15–30fps（Tahoe/Intel 实测档）」，产品文案与 NFR-04 安全点同步更新。60fps 在 Intel + 当前系统 API 下不现实，不再作为验收项。
+3. **流水线并行（原 D-10-A）不进 M1 关键路径**：作为 M1 完成后的独立优化验证，不阻塞骨架与单屏端到端。
+
+### 影响
+
+- `docs/DESIGN.md` FR-03 / 架构图 / §4.1 / §5.3 采集主路径改回 SCK；NFR-03 帧率目标修订；`PROTOCOL.md` 不变（帧率不在协议层）。
+- M1 骨架**不依赖帧率的部分**（会话编排、显示隔离、输入注入、配对协商）立即开工；帧管线模块接口预留，参数（码率/关键帧间隔/帧率）按 SCK + 20fps 默认，后续优化可替换而不改上层。
+- 首帧延迟 739–1031ms 与 NFR「首帧 <1s」的差距记入 FR-05 验收风险，双机联调（P2）时重点实测；不因该项阻塞 M1 骨架。
+
+---
+
+## D-11 真 loginwindow（`loginDone=0`）补测：延后到 M2 借测机
+
+**日期**：2026-11-18 15:30　**状态**：✅ 已定（用户选 B）
+**归属**：D-08 遗留项 / `DESIGN.md` A-09 的最后一块未覆盖场景
+
+### 决策
+
+该项**不在主力机（Macmini8,1）上执行**，推迟到 M2 的独立借测机完成。主力机继续用于 M1 帧管线与骨架开发，不承担需要登出中断会话的测试。
+
+### 为什么不在主力机做
+
+1. **必须登出**：真 loginwindow 态只能在「已登出、停在登录框」时出现，会关闭全部 app、中断当前会话。
+2. **SSH 场景有已知架构障碍**：Sequoia 15.5 实测记录（`DESIGN.md` A-09）—— root daemon 路径被「TCC 路径条目 + 无 GUI 会话」双重阻挡。SSH 起的 root 进程不在 Aqua session，`CGDisplayCreateImage` 会返回全黑。要绕过需 `launchctl bsexec` 挂进 loginwindow 会话或装 LoginWindow 域 launchd job，属需要现场反复试的活，不适合在主力机上反复登出登入。
+3. **收益与风险不匹配**：即便成功，结论也只是把 A-09 的适用范围从「已登录锁屏态」扩到「未登录登录窗态」；不影响 M1 已开工的任何模块。
+
+### 已备好的执行资产（M2 直接用）
+
+| 资产 | 路径 | 作用 |
+|---|---|---|
+| 前置只读探针 | `P0V-SessionRecon/gui_session_probe.m` | 判定是否在 GUI 会话、逐屏抓帧算 luma、输出 `READY_FOR_LOGINWINDOW_PROBE` / `NOT_IN_GUI_SESSION` / `GUI_BUT_NO_CONTENT`，**不改任何显示配置** |
+| 补测脚本 | `P0V-SessionRecon/run_loginwindow_probe.sh` | 守卫 `loginDone=0` → 自动 preflight → 不在 GUI 会话时遍历 `loginwindow` pid 逐个 `bsexec` 并**自动重入自身** → `caffeinate` 防屏睡 → 建 1280×720 虚拟屏 + 禁全部物理屏 + 截图采集 → 恢复 |
+
+关键设计：preflight 把「不在 GUI 会话」和「在会话但 TCC 拒绝抓屏」分开报（exit 10 vs 11），避免在借测机上把 TCC 授权问题误判成 API 不可用——这是本项目历史上踩过的假阴性类型。
+
+### M2 借测机执行流程
+
+1. 借测机接入项目目录（`/Volumes/Data/Code/macOS-RDP` 可读），构建 `p0vprobe` 与 `altprobe`；
+2. 开启远程登录（`sudo systemsetup -setremotelogin on`），**从另一台机器 SSH 试连确认可达**；
+3. 手动登出到登录框（`loginDone=0`）；
+4. SSH 进入后 `sudo bash P0V-SessionRecon/run_loginwindow_probe.sh`；
+5. 看 `disabled` 阶段截图是否出现用户名/密码框；结果回填 `RESULTS-BY-OS.md` 并关闭 A-09 遗留。
+
+### 影响
+
+- `DESIGN.md` A-09 行注明「`loginDone=0` 延后 M2，脚本与前置探针已就绪」；
+- M1 里程碑不受阻塞，A-08/A-09 在 `loginDone=1` 锁屏态的结论继续有效；
+- 若 M2 实测失败（loginwindow 态下虚拟屏拿不到登录 UI），触发 D-07 回退：Host 常驻登录态、禁闲置锁屏。
+
+---
+
+## D-12 禁屏兜底硬约束：无「就绪握手」不得改显示配置
+
+**日期**：2026-11-18 16:20　**状态**：✅ 已定（事故驱动，不可协商）
+**归属**：`P0VDisplayControl` 守护 / `M1RDPDriver` 会话 / `pipeline_kiosk_probe`
+
+### 事故
+
+`pipeline_kiosk_probe` 首次禁屏实测后，物理屏全黑、无法唤醒、无法回到系统，用户只能强制重启。
+
+### 根因（四处叠加，缺一不可）
+
+1. **守护进程是死胎**：`P0VStartGuardian` 只负责 `posix_spawn` 自身再带 `--guardian`，但探针的 `main`
+   没有处理这个参数 → 子进程打印用法后 exit(2)，父进程却按「已 spawn = 有兜底」继续禁屏。
+   **兜底从头到尾不存在。**
+2. **快照顺序错**：快照在 `createVirtualDisplays` 之后拍，虚拟屏被写进快照并成为 main；
+   恢复时先按虚拟屏还原拓扑，随后 `destroyAll` 把它销毁 → 物理屏留在错误原点（与恢复阶段
+   反复出现「布局缺口 / commit=0」的现象一致）。
+3. **零显示**：探针传 `keepIDs:@[]`，驱动把「active 减去 keep」全禁，连刚建好的虚拟屏一起关掉。
+   系统没有任何 active display，没有画面也没有落点，唤醒事件无处生效。
+4. **安全检查失效**：C-09 判据是 `active ⊆ 会话虚拟屏`，空集恒真 → 零显示被当成「隔离完美」放行。
+
+另外 `@finally` 是唯一恢复路径，而 `SIGINT/SIGTERM/SIGHUP` 的默认动作是直接终止进程，
+`@finally` 不会执行 —— 用户 Ctrl+C 或关终端窗口，物理屏就永久留在禁用态。
+
+### 约束（全部为强制项）
+
+| 编号 | 约束 | 落地 |
+|---|---|---|
+| C-12.1 | 禁屏前必须有「守护就绪握手」：守护写 `<snapshot>.guardian-ready`，父进程 3s 内等到才允许禁屏 | `P0VStartGuardian` / `P0VRunGuardian` |
+| C-12.2 | 宿主二进制必须自行实现 `--guardian <snapshot> --parent-pid <pid>` 并转调 `P0VRunGuardian` | 各探针 `main` 第一段 |
+| C-12.3 | 快照必须在创建任何虚拟屏**之前**拍，并作为本会话唯一恢复依据 | `M1RDPDriver.prepareSessionShieldError:` |
+| C-12.4 | 禁屏 keep 集合必须含本会话虚拟屏；禁屏后自检 active 非空，为空即回滚 | `snapshotAndDisablePhysicalExcept:` |
+| C-12.5 | C-09 判定必须拒绝空 active（零显示比泄漏更严重） | `M1IsolationViolation()` |
+| C-12.6 | 恢复必须覆盖信号与卡死两条非正常出口 | 自管道线程 + 看门狗（时长+120s） |
+| C-12.7 | 守护兜底恢复后，额外禁用不属于快照的 P0 虚拟屏（孤儿槽位） | `P0VDisableOrphanVirtualDisplays()` |
+
+### 验证
+
+- `tests/guardian_handshake_test.m`（负向）：宿主不实现 `--guardian` 时 `P0VStartGuardian`
+  必须返回 NO，错误信息明确指向缺失实现 —— 这是把事故成因钉成回归测试。
+- `pipeline_kiosk_probe --preflight`：只跑「快照 → 守护握手 → 撤盾」，不碰显示配置，
+  1 秒内给出「有没有兜底」的确定答案；失败即禁止禁屏。
+- 单测 120 断言全过（新增 `violation-empty-active-rejected` 等 5 项）。
+
+### 影响
+
+- 任何新探针只要调用 `P0VStartGuardian` 就自动受握手约束，忘记实现 `--guardian` 会**禁屏失败**而不是黑屏；
+- 真实禁屏实测的标准前置动作变为「先 `--preflight`，通过再跑」，写入 `M1-Skeleton/README.md`。
 
 ---
 

@@ -2,9 +2,9 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v1.1-draft |
+| 文档版本 | v1.3 |
 | 日期 | 2026-11-18 |
-| 状态 | **草稿，待评审**；A-01 已于 2026-11-17 关闭（单屏 P0 通过），定稿仍须关闭 A-02 |
+| 状态 | **已评审通过，作为 M1 基线**（11:20 冻结，11:40 按 D-10 修订，15:35 按 D-11 补注）。A-01/A-04/A-08/A-09 已关闭（A-09 的 `loginDone=0` 场景延后 M2）；A-02（glass-to-glass 延迟）不在 M1 关键路径上，留 P2 关闭 |
 | 关联工程 | `P0-TahoeProbe/`（可行性探针；Tahoe 26.5.2 建屏/捕获/编码/HiDPI 全通过，见其 README §13–§15）；`P0V-SessionRecon/`（独占会话能力侦察，见其 README）；`P1-ClientProbe/`（协议编解码 + 坐标变换） |
 | 评审记录 | 无（首次起草） |
 | 实测结论 | **按 OS 分离记录于 `docs/RESULTS-BY-OS.md`**；Sequoia 15.5 与 Tahoe 26.5.2 的结论禁止互相外推 |
@@ -61,7 +61,7 @@
 | FR-00 | **会话独占**：控制端认证通过后，Host 进入独占态（物理屏 disable + 本地键鼠输入被吞掉并上报），断开后恢复物理屏并进入**待机壳**（黑屏 + 吞输入，不锁屏；高安全档可配置为真锁屏，见 D-07） | P0 | 会话期间现场屏不可见内容、本地输入不进入会话；断开 5s 内恢复；现场手势可夺回控制权（D-06 §3） |
 | FR-01 | **只建虚拟屏，绝不捕获物理屏**：按控制端规格建 N 块 `CGVirtualDisplay`（块数与分辨率由客户端决定），会话结束全部销毁 | P0 | 每屏 online+active+SCK 可见、mode 落到客户端目标；`capture` 的 displayID 全部为会话内新建的虚拟屏；会话期间 `CGGetActiveDisplayList` **只返回这 N 块**（C-09） |
 | FR-02 | 虚拟屏故障自恢复：stale 检测、identity walk、原子解除自动镜像、SPI 熔断 | P0 | 注入故障后 30s 内恢复或明确报错，绝不拖挂 WindowServer |
-| FR-03 | SCK 逐屏捕获 + VideoToolbox H.264 硬编（IOSurface 零拷贝） | P0 | 1080p60 非黑帧，编码产出连续 |
+| FR-03 | **主路径（D-10）**：SCK `SCStream` → IOSurface → VideoToolbox H.264 硬编；**对照/兜底**：`CGDisplayCreateImage` 抓帧 → CVPixelBuffer（Tahoe 带编码仅 4fps，作降级兜底）。D-09 曾选 CG 为主，M1-Pre 实测后由 D-10 改回 SCK | P0 | 1080p 15–30fps（D-10 修订目标）非黑帧，编码产出连续；参数按 SCK + 20fps 默认，可替换而不改上层 |
 | FR-04 | 局域网会话：发现、配对认证、加密传输 | P0 | 未配对设备无法连接；链路加密 |
 | FR-05 | Client 解码（VT 硬解）+ Metal 渲染，N 个无边框全屏窗口落到 N 块物理屏 | P0 | 坐标变换正确（负坐标/混合缩放），首帧 < 1s |
 | FR-06 | 键鼠采集与注入：`CGEventPost` + display ID 路由、中文输入法、修饰键同步 | P0 | 中文输入可用；Cmd-Tab 等系统快捷键可按策略拦截/放行 |
@@ -79,7 +79,7 @@
 |---|---|---|---|
 | NFR-01 | 采集+编码延迟 | < 30ms（1080p60） | P2 双机 spike，时间戳打点 |
 | NFR-02 | glass-to-glass 总延迟 | < 50ms（局域网有线） | 双机高速摄像/输入时间戳回环 |
-| NFR-03 | 帧率 | 稳定 60fps（动态画面） | 动态测试图案，统计掉帧 |
+| NFR-03 | 帧率 | **15–30fps（D-10 修订）**，默认目标 20fps；60fps 在 Intel + 当前系统 API 下不现实，已从验收项移除 | 动态测试图案，统计掉帧；Tahoe 实测带编码 SCK 禁屏 18fps / CG 4fps |
 | NFR-04 | 分辨率 | 单屏最高 4096×2304@55（H.264 High@L5.2 吞吐安全点，PR #288）；默认 1920×1080 / 2560×1440@60 | verify + 编码吞吐统计 |
 | NFR-05 | Host CPU 占用 | 双屏 1080p60 编码 < 15%（QuickSync 硬编，i5-9500 级） | 长时间运行采样 |
 | NFR-06 | 可用性 | 7×24 运行，WindowServer 零拖挂；任何 SPI 挂起 8s 内熔断 | 故障注入 + 72h  soak |
@@ -105,14 +105,14 @@
 | 编号 | 假设 | 验证方式 | 不成立时的回退 |
 |---|---|---|---|
 | **A-01** | Tahoe **26.5.2 (25F84)** Intel 上私有 SPI 可用，identity walk + 保守 canvas→promote 能恢复 stale/poisoned | ✅ **已关闭**（2026-11-17 11:55）：单屏 `verify` 返回 `pass=1`、`visibility` 一次命中、`capture=HAS_CONTENT`、`identityOffset=0`（本次未触发 walk）。见 README §14 | 逐 selector 重逆向；极端情况 EDID 假插头（C-05） |
-| **A-02** | 双机 1080p60 采集+编码 < 30ms、总链路 < 50ms | P2 双机 spike | 降分辨率/帧率；编码参数调优；传输换 QUIC |
+| **A-02** | 双机 1080p **15–30fps（D-10 修订）** 采集+编码 < 30ms、总链路 < 50ms；首帧 <1s 是风险项（M1-Pre 单机实测 739–1031ms） | P2 双机 spike | 降分辨率/帧率；编码参数调优；传输换 QUIC |
 | A-03 | `CGEventKeyboardSetUnicodeString` 中文注入与修饰键同步在 Tahoe 可用 | P1 控制端探针 + 双机联调 | 改 IOHIDPostEvent / 输入法状态机同步 |
 | A-04 | Intel+Tahoe 扩展虚拟屏上限 ≥ 2（社区经验约 4） | ✅ **已关闭 2026-11-17**：实测 **2 物理 + 4 虚拟 = 6 块 display 同时 online/active 且全部可捕获**（README §16.1）。虚拟屏走 WindowServer 软件合成，不占 Intel DDI 通道，与物理屏数量**解耦** | — |
 | A-05 | HiDPI（2x points/pixels）与混合缩放渲染正确 | P1 渲染探针 | 本期只支持 1x，HiDPI 降级为 P2 |
 | A-06 | 安全更新不破坏私有 SPI | 每次更新后 probe+verify 回归（NFR-08） | 版本锁定回滚 + 社区补丁跟进 |
 | A-07 | Ventura 13 / Sonoma 14 上私有 SPI 与 Sequoia 行为一致（selector 已在 15/26/27 复核一致，13/14 未实测） | 各版本真机 probe+verify（P0-R，M3 前关闭） | OS 策略按版本加分支；个别版本不支持则从适配范围剔除并记录 |
 | **A-08** | 独占态的物理屏可以「只对现场置黑」，且不影响虚拟屏的建屏与捕获：`SLSConfigureDisplayEnabled` 在显示配置事务内可提交 | **P0-V**：V-01 禁用**一块**物理屏后虚拟屏仍 `HAS_CONTENT`，且按键/触控板/触控 ID 等唤醒事件**不会**把物理屏重新 enable；V-03 禁用**全部**物理屏（只剩虚拟屏）后系统仍可建屏/捕获/注入输入（C-09 的极限情形，但**建屏必须在禁用物理屏之前完成**：Sequoia/Intel 实测，零 active 物理屏 + 残留槽位时新建虚拟屏会触发 WindowServer `canonical_mirror_master` 断言）；V-02 锁屏态下 a) 能否捕获到锁屏界面而非黑帧、b) 能否把键鼠注入 loginwindow、c) 能否用注入密码完成解锁。**2026-11-18 Tahoe 26.5.2：V-01 全项 PASS；V-03 的禁屏/指针/注入/20–30s 无重新 enable/恢复全通过，但 SCK 在零 active 物理屏下 4 次运行出现 1 次全黑、2 次多数帧黑、1 次白色窗口对照仍全黑；系统截图证明桌面仍在正常合成 ⇒ SCK 送帧异常，A-08 在 Tahoe 未关闭**；2026-11-18 追加（已更正）：V-02 早前 `active=false` 是探针假阴性，实际锁屏态虚拟屏 `active=1`；替代采集路径 `CGDisplayCreateImage`/`CGWindowListCreateImage` 在零 active 物理屏下稳定 `HAS_CONTENT`（见 `docs/RESULTS-BY-OS.md`） | 退化为公开 API：`CGDisplayCapture` 独占物理屏 + 高窗口层遮罩 + **强制光标接管**（D-05 §3），并把「非绝对安全」写进产品说明 |
-| **A-09** | Host 在锁屏 / 登录窗态下，远程仍能拿到登录界面并完成登录（从而"断开后锁屏"与"可重连"同时成立） | **P0-V V-04a/b/c/d**（SCK 捕获登录窗、定向注入、注入密码解锁、登录窗态建虚拟屏）。见 D-08。**Sequoia 15.5 实测：V-04a/b 在用户会话进程通过（锁屏截图真实、`INJECTION_ACCEPTED_UI_CHANGED`、密码框出现输入）；root daemon 路径被 TCC 路径条目 + 无 GUI 会话挡住。** V-04c 待凭据，V-04d 未实现。**2026-11-18 10:52 最终结论：A-08 / A-09 在 Tahoe 均关闭**。V-02 假阴性已修正（探针硬闸门 + 脚本字段号），锁屏+屏亮态虚拟屏 `active=1`；禁全部物理屏后登录 UI 完整迁移到虚拟屏（截图含日期/时钟/`bemin`/密码框，有/无光标聚焦两轮均成立 ⇒ 触发条件是零物理屏）；V-04a/b/c/d 全过，V-04c 用授权凭据注入解锁 `sessionAfter.screenIsLocked=false`（凭据仅环境变量运行时注入，无明文落盘）。Path A 端到端成立，不必回 Path B。**前置**：必须防显示睡眠（锁屏 2-3s 屏睡会让 SCK displays 变空）；已登录零物理屏场景 SCK 不可靠，优先公开抓屏 API（D-05）。真 loginwindow（`loginDone=0`）未测 | 四项任一失败 → 退回 Path B：Host 常驻登录态、禁闲置锁屏、"断开后锁屏"降级为可选（D-07） |
+| **A-09** | Host 在锁屏 / 登录窗态下，远程仍能拿到登录界面并完成登录（从而"断开后锁屏"与"可重连"同时成立） | **P0-V V-04a/b/c/d**（SCK 捕获登录窗、定向注入、注入密码解锁、登录窗态建虚拟屏）。见 D-08。**Sequoia 15.5 实测：V-04a/b 在用户会话进程通过（锁屏截图真实、`INJECTION_ACCEPTED_UI_CHANGED`、密码框出现输入）；root daemon 路径被 TCC 路径条目 + 无 GUI 会话挡住。** V-04c 待凭据，V-04d 未实现。**2026-11-18 10:52 最终结论：A-08 / A-09 在 Tahoe 均关闭**。V-02 假阴性已修正（探针硬闸门 + 脚本字段号），锁屏+屏亮态虚拟屏 `active=1`；禁全部物理屏后登录 UI 完整迁移到虚拟屏（截图含日期/时钟/`bemin`/密码框，有/无光标聚焦两轮均成立 ⇒ 触发条件是零物理屏）；V-04a/b/c/d 全过，V-04c 用授权凭据注入解锁 `sessionAfter.screenIsLocked=false`（凭据仅环境变量运行时注入，无明文落盘）。Path A 端到端成立，不必回 Path B。**前置**：必须防显示睡眠（锁屏 2-3s 屏睡会让 SCK displays 变空）；已登录零物理屏场景 SCK 不可靠，优先公开抓屏 API（D-05）。真 loginwindow（`loginDone=0`）**延后 M2 借测机（D-11）**，前置只读探针 `gui_session_probe` 与补测脚本 `run_loginwindow_probe.sh` 已就绪 | 四项任一失败 → 退回 Path B：Host 常驻登录态、禁闲置锁屏、"断开后锁屏"降级为可选（D-07） |
 
 ---
 
@@ -126,11 +126,11 @@
 │      │                                                                    │
 │  VirtualDisplayManager ── 建屏/恢复/熔断（P0 VDManager 演进）               │
 │      │ CGVirtualDisplay SPI                                               │
-│  CapturePipeline ── SCK 逐屏捕获 → IOSurface                              │
+│  CapturePipeline ── SCK SCStream → IOSurface (CGDisplayCreateImage 兜底)   │
 │      │                                                                    │
 │  VideoEncoder ── VTCompressionSession H.264 硬编 → Annex-B/AVCC           │
 │      │                                                                    │
-│  FrameTransport ── 帧通道(UDP/QUIC，待定 D-01)：分片/序号/关键帧请求         │
+│  FrameTransport ── 帧通道(QUIC datagram, D-01)：分片/序号/关键帧请求         │
 │      ▲                                                                    │
 │  InputInjector ── CGEventPost + displayID 路由 ◄── 控制通道                │
 └───────────────────────────────────┬──────────────────────────────────────┘
@@ -195,7 +195,7 @@
 | 模块 | 职责 | 关键接口（概要） | 来源/演进 |
 |---|---|---|---|
 | VirtualDisplayManager | 串行建屏、mode 提交等待、原子 unmirror、liveness、identity walk、8s 死线熔断 | `establish(specs) -> [DisplayHandle]` / `teardown()` / `healthEvents` | P0 `VDManager` 直接演进 |
-| CapturePipeline | 逐屏 SCStream，IOSurface 输出，退化 mode 拒捕，start/stop 死线 | `start(displayID, config) -> FrameStream` | P0 `PipelineProbe` 演进 |
+| CapturePipeline | 逐屏 SCK `SCStream` → IOSurface（主路径 D-10）；`CGDisplayCreateImage` 抓帧 → CVPixelBuffer 为对照/兜底；退化 mode 拒捕，start/stop 死线 | `start(displayID, config) -> FrameStream` | P0 `PipelineProbe` 演进；M1-Pre 采编探针已验证两路径 |
 | VideoEncoder | VTCompressionSession，实时模式，码率/关键帧间隔策略，吞吐看门狗（PR #288 黑屏陷阱） | `encode(sampleBuffer) -> EncodedFrame` | P0 编码环回演进 |
 | FrameTransport | 分片、序号、发送 pacing、关键帧请求响应 | `send(frame)` / `onKeyframeRequest` | 新建 |
 | InputInjector | CGEvent 注入、displayID 路由、IME unicode、修饰键状态机 | `inject(event, targetDisplay)` | 新建（A-03 验证） |
@@ -234,7 +234,9 @@ JSON 信令 + 二进制帧头（细则以 `docs/PROTOCOL.md` 为准）。信令�
 
 ### 5.3 帧管线
 
-SCK（IOSurface）→ VT 硬编（实时、无 B 帧、关键帧间隔 2s + 按需）→ 分片发送 → 重组 → VT 硬解 → Metal 呈现。全程零拷贝；编码吞吐看门狗发现「会话成功但无 buffer」（PR #288 陷阱）时自动降分辨率重建编码器。
+主路径（D-10）：SCK `SCStream` → IOSurface → VT 硬编（实时、无 B 帧、关键帧间隔 2s + 按需）→ 分片发送 → 重组 → VT 硬解 → Metal 呈现，全程零拷贝。`CGDisplayCreateImage` → CVPixelBuffer 为对照/兜底（涉及位图拷贝）。编码吞吐看门狗发现「会话成功但无 buffer」（PR #288 陷阱）时自动降分辨率重建编码器。
+
+> **M1-Pre 实测与 D-10（2026-11-18）**：两条链路端到端都成立（0 黑帧、编解码一致），但带编码真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均达不到 60fps；无编码时 SCK 的「55fps」是按内容送帧假象。**D-10 已定：SCK 回主路径 + 目标帧率下调 15–30fps，流水线并行留作 M1 后优化**。帧管线接口预留、参数按 SCK + 20fps 默认，上层不随之改动。详见 `DECISIONS.md` D-10 与 `RESULTS-BY-OS.md` §5.1/§5.2。
 
 ### 5.4 输入路由
 
@@ -281,12 +283,12 @@ Client 窗口坐标 → 归一化到对应虚拟屏坐标 → 控制通道 → H
 | P0-R | Ventura/Sonoma 真机回归（probe+verify，可借测机器，与 P1 并行） | 13/14 各出基线报告（A-07 关闭） | M3 前完成 |
 | P1 | 控制端探针 `P1-ClientProbe/`：硬解+Metal 渲染、N 窗口坐标、IME 注入 | §7 四项各出实证报告 | 协议层（输入编解码/状态机/1150B 分片）2026-11-18 完成，140 断言全过；**硬解+Metal 渲染、A-03 IME 双机实证未做** |
 | P2 | 双机联调 spike：glass-to-glass 延迟 | NFR-01/02 达标或降级结论（A-02 关闭） | 依赖 P0-T、P1 |
-| **M1** | 产品骨架：MIT 基座集成 + 本文档模块划分落地 + 控制协议 v1 | 单屏会话端到端跑通（发现/配对/推流/输入） | A-01 已关闭；**仍待 A-02**（glass-to-glass 延迟），M1 可先做不依赖延迟数据的骨架工作 |
+| **M1** | 产品骨架：MIT 基座集成 + 本文档模块划分落地 + 控制协议 v1 | 单屏会话端到端跑通（发现/配对/推流/输入） | **已评审通过、可开工（2026-11-18 11:20）**。A-01/A-04/A-08/A-09 已关闭，D-01/D-02/D-09 已定；A-02 不在 M1 关键路径上。先做 M1-Pre 采编链路验证，再落骨架 |
 | M2 | 多屏 + 完整输入（IME/修饰键/沉浸模式）+ 动态协商 | FR-05/06/07 验收 | |
 | M3 | 断线重连 + 无人值守 + 安全加固 + soak | FR-08/09、NFR-06/07、72h soak | |
 | M4（后续） | 光标独立通道、音频、剪贴板 | 单独设计评审 | |
 
-**方案定稿条件**：A-02 关闭 + D-01 传输选型决策 + 本文档评审通过（A-01 已于 2026-11-17 关闭）。在此之前 M1 只做不依赖待验证假设的准备工作（基座源码审计、协议骨架、坐标变换单测）。
+**方案定稿条件（已满足，11:40 按 D-10 更新）**：D-01 传输选型（QUIC datagram）、D-02 工程形态（Swift + ObjC 桥）、采集主路径（D-09 → **D-10 修订为 SCK 主 + CG 兜底**）均已决策，本文档评审通过；A-01/A-04/A-08/A-09 已关闭。**A-02 从定稿前置移出**，改为 P2 双机联调验收项——M1 骨架与单屏端到端不依赖延迟数据，可立即开工；帧率目标已按 D-10 下调至 15–30fps，与实测能力对齐。
 
 ---
 
@@ -299,15 +301,16 @@ Client 窗口坐标 → 归一化到对应虚拟屏坐标 → 控制通道 → H
 
 ---
 
-## 10. 待决问题（评审时决策）
+## 10. 决策索引与未决问题
+
+决策编号以 `docs/DECISIONS.md` 为准：D-01 帧通道（QUIC datagram）、D-02 工程形态（Swift + ObjC 桥）、D-03 已作废、D-04 独占式会话、D-05 显示空间隔离、D-06 锁屏语义、D-07 Path B 兜底、D-08 远程登录 Path A、D-09 采集主路径（部分被 D-10 修订）、D-10 帧管线（SCK 主路径 + 15–30fps）。下表只列**尚未决策**的问题，用 Q-xx 编号以免与 D-xx 冲突。
 
 | 编号 | 问题 | 候选与建议 | 决策期限 |
 |---|---|---|---|
-| D-01 | 帧通道传输 | ✅ **已定（2026-11-17）：QUIC + unreliable datagram，Network.framework 原生实现**；API 已在 26.5 SDK 实测可构造。详见 `docs/DECISIONS.md` | M1 启动前 |
-| D-02 | 产品形态 | ✅ **已定（2026-11-17）：Swift 主工程 + ObjC 桥（RDPKit ObjC / RDPApp Swift）**，P0 的 VDManager/PipelineProbe 直接搬入。详见 `docs/DECISIONS.md` | M1 启动前 |
-| D-03 | 互联网远程 | 本期仅 LAN；后续 Tailscale/WireGuard 组网 vs 自建中继 | M3 评审 |
-| D-04 | 光标通道相位 | P2（FR-10），若 NFR-02 实测光标拖影明显则提前 | P2 后 |
-| D-05 | 音频/剪贴板 | M4 单独设计 | M3 后 |
+| Q-01 | 互联网远程 | 本期仅 LAN；后续 Tailscale/WireGuard 组网 vs 自建中继 | M3 评审 |
+| Q-02 | 光标通道相位 | P2（FR-10），若 NFR-02 实测光标拖影明显则提前 | P2 后 |
+| Q-03 | 音频/剪贴板 | M4 单独设计 | M3 后 |
+| Q-04 | 采编参数锁定 | D-10 已定：SCK 主路径 + 15–30fps；码率/关键帧间隔按 SCK + 20fps 默认，P2 双机实测后微调 | D-10 已定，参数留 P2 微调 |
 
 ---
 
@@ -326,3 +329,6 @@ Client 窗口坐标 → 归一化到对应虚拟屏坐标 → 控制通道 → H
 | v0.9-draft | 2026-11-18 | Tahoe V-01 全项 PASS；V-03 显示隔离机制通过但 SCK 在零 active 物理屏下送不稳定（系统截图有内容、SCK 帧多黑/全黑，白色窗口对照仍全黑），A-08 在 Tahoe 未关闭，新增替代采集路径验证或 D-05 降级的前置工作 | WorkBuddy 协助核对 |
 | v1.0-draft | 2026-11-18 | 建立 `docs/RESULTS-BY-OS.md` 按 OS 分离结论；Tahoe V-02 不成立（锁屏态虚拟屏 `active=false`）、V-04a 通过、V-04b 未确认、V-04c 未测、V-04d 不成立；`CGDisplayCreateImage`/`CGWindowListCreateImage` 在零 active 物理屏下稳定可用，SCK 不稳定。Path A 在 Tahoe 不成立，M1 采集层改以公开抓屏 API 为候选 | WorkBuddy 协助核对 |
 | v1.1-draft | 2026-11-18 10:52 | **Path A 在 Tahoe 端到端成立，A-08/A-09 关闭**：两轮（聚焦/不聚焦）禁全部物理屏后登录 UI 完整迁移到虚拟屏 → 触发条件是零物理屏；V-04b/c 用授权凭据干净重测通过（解锁成功，凭据仅运行时环境变量注入、无明文落盘）。FR-13 达到 P0；M1 前置：常驻防显示睡眠断言，采集优先公开 API（D-05），真 loginwindow 态待 M1 补测 | WorkBuddy 协助核对 |
+| v1.1 | 2026-11-18 11:20 | **评审通过、冻结为 M1 基线**：D-01/D-02 由提议转确认，新增 D-09 采集主路径（`CGDisplayCreateImage`）；FR-03/架构图/模块表/§5.3 同步；A-02 从定稿前置移出、改 P2 验收；M1 可开工，先做 M1-Pre 采编链路验证 | 用户确认 + WorkBuddy 落文档 |
+| v1.2 | 2026-11-18 11:40 | **D-10 修订**：M1-Pre 实测两路径带编码仅 4–18fps，D-09 主路径改回 SCK、`CGDisplayCreateImage` 降兜底；NFR-03 帧率 60fps → 15–30fps（默认 20fps）；A-02 首帧延迟风险记入；FR-03/架构图/§4.1/§5.3/方案定稿条件同步 | 用户确认 + WorkBuddy 落文档 |
+| v1.3 | 2026-11-18 15:35 | **D-11 补注**：A-09 遗留的 `loginDone=0` 真登录窗场景延后到 M2 借测机，主力机不承担需登出中断会话的测试；新增只读前置探针 `P0V-SessionRecon/gui_session_probe.m`（GUI 会话判定 + 抓屏 luma）与改造后的 `run_loginwindow_probe.sh`（preflight + 自动 bsexec 重入）。仅补注，M1 基线内容不变 | 用户选 B + WorkBuddy 落文档 |

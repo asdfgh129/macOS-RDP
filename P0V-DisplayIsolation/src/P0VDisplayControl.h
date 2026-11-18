@@ -120,10 +120,16 @@ void P0VResetWindowServerHung(void);
 #pragma mark - 守护进程
 
 // 以独立进程组 spawn 自身 --guardian 模式。父进程退出后若未写 <snapshot>.done，
-// 守护进程读快照并恢复显示。返回 YES 表示 spawn 成功（不保证后续恢复成功）。
+// 守护进程读快照并恢复显示。
+//
+// ★ 返回 YES 只代表「守护进程已就绪」（子进程写了 <snapshot>.guardian-ready）。
+//   返回 NO 时调用方绝对不允许继续禁屏 —— 没有兜底的显示配置变更只能靠强制重启收场。
+//   宿主二进制必须自己实现 --guardian <snapshot> --parent-pid <pid> 并转调 P0VRunGuardian，
+//   否则本函数会因为握手超时而失败（这是有意的硬性约束）。
 BOOL P0VStartGuardian(NSString *snapshotPath, pid_t parentPID, NSError * _Nullable * _Nullable error);
 
-// 守护进程主循环；返回进程退出码。
+// 守护进程主循环；返回进程退出码。函数一进来就写 <snapshot>.guardian-ready，
+// 父进程据此确认兜底已就位。恢复成功后会额外禁用不属于快照的 P0 虚拟屏（孤儿槽位）。
 int P0VRunGuardian(NSString *snapshotPath, pid_t parentPID);
 
 NS_ASSUME_NONNULL_END

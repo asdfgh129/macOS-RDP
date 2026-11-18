@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.4-draft |
+| 版本 | v0.6-draft |
 | 日期 | 2026-11-18 |
 | 原则 | **结论绑定具体 OS build 与机器，禁止跨版本外推**。同一判据在 Sequoia 与 Tahoe 分别记录，未测就写未测。 |
 | 上位文档 | `docs/DESIGN.md` §8、`docs/DECISIONS.md` |
@@ -69,7 +69,7 @@
 |---|---|---|---|---|
 | 锁屏 + 屏亮（caffeinate 先于 lock） | `screenIsLocked=1`、无 display sleep 断言 | 2 块物理屏 | 2 块物理屏 | ✅ 1 |
 | 锁屏 + 屏睡（2-3s 后自动） | `screenIsLocked=1`、display sleep | 0 | 0（**SCK 也看不到**） | ✅ 1（建屏后） |
-| 真登录窗（loginwindow / 未登录） | `loginDone=0` 或不同 auditID | 未测 | 未测 | 未测 |
+| 真登录窗（loginwindow / 未登录） | `loginDone=0` 或不同 auditID | 未测 | 未测 | ⏸ **延后到 M2 借测机（D-11，2026-11-18 15:30 用户定）**，不占用主力机。资产已备齐：`P0V-SessionRecon/gui_session_probe.m`（只读判定 GUI 会话 + 抓屏 luma）与 `run_loginwindow_probe.sh`（守卫 `loginDone=0` → preflight → 自动 `bsexec` 重入 → 建屏/禁屏/采集）。已知障碍：SSH root 不在 Aqua session，需 bsexec 绕过；preflight 区分「不在会话」(10) 与「TCC 拒绝抓屏」(11)。已关闭的 A-08/A-09 是 `loginDone=1` 锁屏态，二者不等价 |
 
 | 项 | Sequoia 15.5 | Tahoe 26.5.2 |
 |---|---|---|
@@ -105,7 +105,89 @@
 | 执行入口 | `P0V-AltCapture/altprobe` | 同左 |
 | 证据 | — | `/tmp/p0v-alt-tahoe3.json`、`/tmp/p0v-alt-tahoe-1080.json` |
 
-**结论**：Tahoe 零 active 物理屏下，公开抓屏 API 能稳定拿到内容，可作为 M1 的采集候选路径；但帧率/编码链路尚未接 VideoToolbox，需在 P2 双机联调验证。SCK 仍应保留为对照，不应作为该场景的唯一路径。
+**结论（v0.6 更正）**：公开抓屏 API 能稳定拿到内容，但**端到端帧率不成立**，见 §5.1。SCK 帧率读数必须区分「是否带编码环回」——不带编码的 55fps 是按内容变化送帧的假象，见 §5.2。
+
+### 5.1 M1-Pre 采编链路实测（`M1-Pre-CaptureCodec`，2026-11-18 11:27–11:30）
+
+把 `CGDisplayCreateImage → CVPixelBuffer → VT H.264 → VT 解码` 整条链路接起来实测（`capturecodec`）：
+
+| 场景 | 分辨率 | verdict | 实际 fps | 抓帧 avg/p95 ms | 转换 avg/p95 ms | 编码入队 p50 ms | 整机 busy | 本进程核数 |
+|---|---|---|---|---|---|---|---|---|
+| `--no-disable` | 1920×1080 | PASS | 1 | 282 / 356 | 60 / 96 | 1.2 | 99% | 0.14 |
+| 禁全部物理屏 | 1920×1080 | PASS | 4 | 125 / 168 | 47 / 94 | 0.1 | 99% | 0.21 |
+| 禁全部物理屏 | 1280×720 | PASS | 7 | 95 / 124 | 17 / 23 | 0.1 | 77% | — |
+
+三组均：抓帧/编码/解码计数一致（20/20/20）、0 黑帧、0 编码错误、恢复 OK；`minLumaMean=29/maxVar=1278`。证据：`/tmp/m1-pre-nodisable.json`、`/tmp/m1-pre-disable.json`、`/tmp/m1-pre-disable-720.json`，截图 `/tmp/m1-pre-nodisable.png`（真实桌面壁纸+菜单栏，非黑）。
+
+**关键结论**：
+
+1. **链路成立**：D-09 的路径选择正确，零物理屏下端到端可用、无黑帧、无编码错误。
+2. **帧率不成立**：`CGDisplayCreateImage` 单次抓帧固定成本 95–282ms 是绝对瓶颈；降到 720p 只从 125ms 降到 95ms，说明不是像素拷贝开销而是 API 的系统级同步成本。**1080p60 / <30ms（NFR-01/03）达不到，差 4–8 倍。**
+3. **CPU 记账**：整机 busy 77–99%，本进程仅 0.14–0.21 核 —— 开销在 WindowServer/系统合成侧，不在编码进程。NFR-05 若按整机口径不达标。
+4. ~~**SCK 对照反转**：55fps~~ —— **v0.6 撤销此判断**：该 55fps 读数来自 `withEncoder:NO`，`encodedFrames=0`、首帧延迟 847ms，是 SCK 按内容变化推送的帧计数，不是可用编码帧率。带编码环回的真实数据见 §5.2。
+5. **对 M1 的影响**：60fps 不能建立在这条同步抓屏路径上。**M1 帧管线参数暂不冻结**，需先评估：① 抓帧与编码流水线并行掩盖 100ms 延迟；② 对比 SCK 编码环回真实帧率（§5.2）；③ 按 NFR-04 降规格。
+
+### 5.2 SCK 编码环回真实帧率（`--sck-only`，2026-11-18 11:32–11:35）
+
+为排除「两条采集链路在同一进程串行、争抢 WindowServer」的污染，加 `--sck-only` 开关让 SCK 编码环回独占系统：`SCStream → VT H.264 → VT 解码`（复用 `PipelineProbe captureDisplayID:withEncoder:YES`）。
+
+| 场景 | 编码 | verdict | 实际 fps | 帧数 | 编码/解码帧 | 首帧延迟 | 黑帧 | 编码入队 p50/p95 |
+|---|---|---|---|---|---|---|---|---|
+| 禁屏 1080p，`withEncoder:NO`（对照） | 否 | HAS_CONTENT | ~~55~~ 假象 | 55 | **0 / 0** | 847ms | 0 | — / — |
+| 不禁屏 1080p，`withEncoder:YES` | 是 | HAS_CONTENT | 2 | 11 | 11 / 11 | 1031ms | 0 | 9.5 / 437ms |
+| 禁屏 1080p，`withEncoder:YES` | 是 | HAS_CONTENT | **18** | 73 | 73 / 73 | 739ms | 0 | — / — |
+
+证据：`/tmp/m1-pre-disable.json`（无编码对照）、`/tmp/m1-pre-sck-only-nodisable.json`、`/tmp/m1-pre-sck-only-disable.json`。
+
+**关键结论（更正 §5.1 第 4 条）**：
+
+1. **55fps 是假象**：不带编码时 SCK 按内容变化送帧，静态桌面下 1 秒内推 55 帧，但 `encodedFrames=0`、首帧要 847ms。它不代表可用帧率，不能作为路径选型依据。本项目历史上已两次栽在「静态 SCK fps 不可当结论」（README §15 性能警告、A-05），本次是第三次同类陷阱，已拦下。
+2. **带编码的真实上限**：SCK 在禁屏独占下达 **18fps**（vs `CGDisplayCreateImage` 的 4fps），是更好的采集路径，但**同样远达不到 60fps**；不禁屏时降到 2fps，说明物理屏在线的合成负载会严重拖慢两条路径。
+3. **首帧延迟 739–1031ms**：远超 NFR-FR-05「首帧 <1s」且贴近上限，双机场景会更差。
+4. **D-09 决策修正**：SCK 不是「不可用」而是「绝对性能也不达标但相对更优」。M1 主路径应优先 SCK（原生 IOSurface、禁屏下 18fps、0 黑帧），`CGDisplayCreateImage` 降为兜底；**但两者都撑不起 60fps，必须同时决策降规格或流水线优化**，见 D-10。
+
+---
+
+### 5.3 负结果：首次禁屏独占实测导致整机黑屏（2026-11-18 16:05，Tahoe）
+
+**现象**：`pipeline_kiosk_probe` 首次运行后屏幕全黑，键盘鼠标无响应，无法唤醒、无法重新进入系统，最终强制重启。重启后显示拓扑自动恢复（`P0VCommitScopeSession` 生效），无持久化损坏。
+
+**结论**：不是 SPI 失效，也不是 WindowServer 崩溃，而是**探针自身的兜底链路四处断裂**，把一次可恢复的实测变成了整机不可用。详细根因与强制约束见 `DECISIONS.md` D-12，撤回/纠正如下：
+
+| # | 断裂点 | 证据 | 修复 |
+|---|---|---|---|
+| 1 | 守护进程从未运行 | `./pipeline_kiosk_probe --guardian … --parent-pid 1` → `exit=2` + 打印 usage（探针 `main` 没有该分支）；同期守护日志缺失 | `--guardian` 分支 + `<snapshot>.guardian-ready` 就绪握手，握手失败即禁止禁屏 |
+| 2 | 快照在虚拟屏创建后拍 | 快照文件里含 1920×1080 虚拟屏记录，`main` 为虚拟屏 | 快照前移到 `prepareSessionShieldError:`（建屏前） |
+| 3 | 禁屏把虚拟屏一起禁掉 | 探针传 `keepIDs:@[]`，驱动按「active − keep」全禁 | keep 自动并入会话虚拟屏；禁屏后自检 active 非空 |
+| 4 | 零显示通过了安全检查 | C-09 判据 `active ⊆ 虚拟屏` 对空集恒真 | 新增 `M1IsolationViolation()`，空 active 判违规 |
+
+**恢复过程**（供以后再遇到时照抄）：`recover_displays` → `recover_v2`（清掉 1920×1080 ghost 1104977159）→ `recover_v4`（origin jitter 强制 commit）→ `recover_v5`（消除布局缺口）；最终仍需重启。教训是**这些工具都只能救「拓扑错位」，救不了「零显示 + 无兜底」**，所以正确做法是让这种状态无法发生。
+
+**对 M1 的影响**：帧管线在禁屏条件下的性能数据仍为空（本次未取得有效数据）。重新开测前的强制前置：`./pipeline_kiosk_probe --preflight` 必须通过。D-10 的 20fps 目标档继续待实测。
+
+### 5.4 禁屏独占下的帧管线真实性能（修复后首次有效数据，2026-11-18 16:34，Tahoe）
+
+`pipeline_kiosk_probe --spec 1920x1080 --duration-ms 10000`，SCK `SCStream` → VT H.264 → 协议分片 → 环回重组/解码，全部物理屏禁用、只留虚拟屏（C-09 校验通过）。
+
+| 指标 | 数值 |
+|---|---|
+| 采编发 | captured 182 / encoded 181 / sent 181（dropPreEnc 0、encFail 0、sendFail 0） |
+| 环回解码 | decoded 181 / dropped 0 / decodeFail 0 / malformed 0（解码 1920×1080） |
+| 关键帧 | 5（2s 间隔 + `ForceKeyFrame` 生效） |
+| 分片 / 负载 | 908 片、973 289 B（平均 1072 B/片，未触发 255 片上限） |
+| 码率 | 610 kbps（0.12 bpp @ 1080p20） |
+| 报告帧率 | 14.2 fps（**含首帧 3924ms 启动开销**） |
+| 稳态帧率 | ≈20.6 fps（首帧后 181 帧 / 8.8s），与目标 20fps 吻合 |
+| 首帧延迟 | 3924ms（明显劣于 M1-Pre 的 739–1031ms，疑与禁屏后首次合成有关，待复测） |
+
+**判读**：
+
+1. **D-10 的 20fps 目标档在禁屏独占条件下可达**：稳态 ≈20.6fps、零丢帧、零解码失败，说明「禁物理屏 → SCK 满速」这条假设成立；14.2fps 的全窗口读数是被 3.9s 首帧拖低的算术结果，不能当作稳态能力。
+2. **首帧 3.9s 是新的待查项**：M1-Pre 同链路首帧 739–1031ms，本次退到 3924ms。候选原因：禁屏后登录 UI 迁移引起的合成重建、或虚拟屏首次被 SCK 绑定。NFR-FR-05「首帧 <1s」仍不达标，需要单独复测（至少 3 轮取样）。
+3. **60fps 仍无证据**：本次未测高帧率档，20fps 是当前唯一被证实可达的档位。
+4. **A-02 保持开放**：本次是主机内环回，不含网络与客户端渲染，glass-to-glass 仍待 P2 双机打点。
+
+数据：`/tmp/m1-kiosk-full.json`（环回）/ `/tmp/m1-kiosk-halfdisable.json`（半禁屏对照 1.8fps）。
 
 ---
 
@@ -117,7 +199,7 @@
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 |
 | A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
 | A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） |
-| A-02 glass-to-glass 延迟 | 未测 | 未测 |
+| A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。双机端到端延迟仍未测，A-02 保持开放且帧管线参数暂不冻结，见 D-10 |
 
 ---
 
@@ -127,3 +209,9 @@
 - v0.2-draft 2026-11-18：补入 Tahoe V-02（锁屏态虚拟屏 `active=false`，不成立）、V-04a（通过）、V-04b（判据污染，未确认）、V-04d（不成立）；补入替代采集路径对照结果（`CGDisplayCreateImage`/`CGWindowListCreateImage` 稳定可用）。
 - v0.3-draft 2026-11-18 10:40：**重要更正**。发现 v0.2 的 V-02 结论是假阴性——探针 `waitUntilUsable` 提前退出 + 脚本 `awk $3` 取错 ID，捕获从未执行。用户补充「锁屏 2-3 秒后屏睡」后重测：① 屏睡导致 SCK 无帧，caffeinate 先于 lock 可保持屏亮、SCK 恢复 50 帧；② 锁屏态虚拟屏实际 `active=1`（两种状态均是）；③ 截图显示虚拟屏上只有锁屏壁纸、无登录框。撤回「Path A 在 Tahoe 不成立」，改记「Path A 未验证」；V-04d 不成立理由从「不能建 active 屏」更正为「登录 UI 未迁移到虚拟屏」。
 - v0.4-draft 2026-11-18 10:52：**Path A 端到端成立，结论翻转为通过**。v0.3 的「登录框未迁移」是假阴性——此前探针只建虚拟屏、未禁物理屏，登录 UI 自然留在物理屏。本次 r5/r6 两轮在锁屏+屏亮态禁掉全部物理屏后，虚拟屏截图出现完整登录 UI（日期/时钟/`bemin`/密码框），且无 focus 对照同样成立 → 迁移触发条件是「零 active 物理屏」，与光标无关。用户授权的真实凭据经 `P0V_PW` 环境变量在运行时注入，V-04b/c 干净通过（`INJECTION_ACCEPTED_AND_UNLOCKED`、256/256、会话 locked→unlocked），脚本/日志/文档均无明文密码。A-08/A-09 在 Tahoe 关闭，D-08 四项全过，不再回退 Path B。
+- v0.5-draft 2026-11-18 11:30：新增 §5.1 M1-Pre 采编链路实测。D-09 路径端到端成立（0 黑帧、编解码一致），但 `CGDisplayCreateImage` 抓帧固定成本 95–282ms、实际 1–7fps，达不到 1080p60；一度记「SCK 55fps」。
+- v0.6-draft 2026-11-18 11:35：**撤销 v0.5 的「SCK 55fps」判断**——经 `--sck-only` 带编码环回复测，55fps 来自 `withEncoder:NO` 的按内容送帧假象（`encodedFrames=0`、首帧 847ms）。真实带编码帧率：SCK 禁屏 18fps、不禁屏 2fps，`CGDisplayCreateImage` 禁屏 4fps，均不达 60fps。新增 §5.2。D-09 修正为「SCK 相对更优但绝对值也不达标，应回主路径 + 同时降规格/流水线优化」，见 D-10。
+- v0.7-draft 2026-11-18 14:45：M1 骨架层完成（不依赖帧率部分）。新增 `M1-Skeleton/` 生产驱动 `M1RDPDriver`（IOKit 双断言+VDManager+P0VDisplayControl+C-09 隔离+CGEvent 凭据注入）、`M1InputInjector`（CGEvent seam+手势 tap）、驱动/输入纯逻辑（69 断言单测）；`RDPApp/` Swift 主+ObjC 静态库桥接端到端跑通（Swift 实现 ObjC protocol）。`driver_probe` 只读侦察确认现场 API 可用。真 loginwindow（`loginDone=0`）补测脚本 `P0V-SessionRecon/run_loginwindow_probe.sh` 已备好但未执行（需登出，交用户决策）。帧管线/Metal/双机延迟仍未开始。
+- v0.8-draft 2026-11-18 15:35：**真 loginwindow 补测正式延后 M2 借测机（D-11）**，主力机不再承担需登出中断会话的测试。新增只读前置探针 `P0V-SessionRecon/gui_session_probe.m`——用 `CGSessionCopyCurrentDictionary` 判定是否在 GUI 会话、逐屏 `CGDisplayCreateImage` 采样算 luma，输出三态结论（`READY_FOR_LOGINWINDOW_PROBE` / `NOT_IN_GUI_SESSION` / `GUI_BUT_NO_CONTENT`），严格不动显示配置；实测当前主力机 2 屏 `HAS_CONTENT`、判定 READY，逻辑自洽。`run_loginwindow_probe.sh` 改造为借测机可一次跑通：前置检查移到日志重定向之前（失败原因可见）、preflight 自动区分「不在 GUI 会话」(exit 10) 与「在会话但 TCC 拒绝抓屏」(exit 11)、不在会话时遍历 `loginwindow` pid 逐个 `bsexec` 并自动重入自身。**A-09 在 `loginDone=1` 锁屏态的结论不变，仅 `loginDone=0` 场景待验。**
+- v0.9-draft 2026-11-18 16:20：**新增 §5.3 负结果（首次禁屏独占实测致整机黑屏）**。不是 SPI/WindowServer 故障，而是探针兜底链路四处断裂：① 宿主未实现 `--guardian`，守护进程 exit(2) 后父进程仍禁屏；② 快照在建虚拟屏之后才拍，虚拟屏被当成 main；③ `keepIDs:@[]` 把虚拟屏一起禁掉 → 零显示；④ C-09 判据对空集恒真，零显示被放行。另 `@finally` 是唯一恢复出口，信号直接终止进程时不执行。已按 D-12 修完：守护就绪握手（`<snapshot>.guardian-ready`，失败即禁止禁屏）、快照前移建屏前、keep 并入会话虚拟屏并自检 active 非空、`M1IsolationViolation()` 拒绝空 active、信号自管道 + 看门狗、守护兜底额外清孤儿虚拟屏。新增负向测试 `tests/guardian_handshake_test.m` 与 `--preflight` 预检；单测 120 断言全过。禁屏条件下的帧管线数据仍为空。
+- v0.10-draft 2026-11-18 16:40：**修复后首次取得禁屏独占有效数据（§5.4）**：1080p20 环回 181/181 帧、零丢零错、稳态 ≈20.6fps（全窗口 14.2fps 被 3.9s 首帧拖低），码率 610kbps、平均分片 1072B。D-10 的 20fps 档在禁屏条件下可达；首帧 3924ms 明显劣于 M1-Pre 的 739–1031ms，新增待查项；60fps 仍无证据，A-02 保持开放。同时修掉 `M1FramePipeline` 在 `stop` 后把采集尺寸报成 0×0 的问题（尺寸随统计一起固化）。

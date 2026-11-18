@@ -17,6 +17,7 @@
 #import <limits.h>
 #import <stdlib.h>
 #import <string.h>
+#import <sys/wait.h>
 
 extern char **environ;
 
@@ -575,11 +576,47 @@ static void P0VWriteGuardianResult(NSString *snapshotPath, NSDictionary *result)
     }
 }
 
+// 守护兜底恢复之后，把「不属于快照的 P0 虚拟屏」一并禁用。
+// 场景：快照在创建虚拟屏之前拍下（M1 新顺序），进程若在建屏后被杀，虚拟屏会成为
+// 无主孤儿槽位，甚至被 WindowServer 当成 main；只恢复快照不足以清掉它，
+// 物理屏拓扑仍被孤儿占位（表现为恢复后画面错位 / 黑屏）。
+static NSInteger P0VDisableOrphanVirtualDisplays(P0VDisplaySnapshot *snapshot) {
+    NSSet *known = [NSSet setWithArray:[snapshot displayIDs]];
+    NSMutableArray<NSNumber *> *orphans = [NSMutableArray array];
+    for (NSDictionary *d in P0VDisplayDictionaries(P0VActiveDisplayIDs())) {
+        if ([d[@"vendorID"] unsignedIntValue] != kP0VVirtualVendorID) continue;
+        NSNumber *did = d[@"displayID"];
+        if (did && ![known containsObject:did]) [orphans addObject:did];
+    }
+    if (orphans.count == 0) return 0;
+
+    NSDictionary *detail = nil;
+    NSError *err = nil;
+    if (!P0VApplyDisplayEnabledChanges(orphans, @[], P0VCommitScopeSession, 20, &detail, &err)) {
+        P0Error(@"清理无主虚拟屏失败: %@", err.localizedDescription);
+        return -1;
+    }
+    P0Log(@"已禁用 %lu 块无主虚拟屏 %@", (unsigned long)orphans.count, orphans);
+    return (NSInteger)orphans.count;
+}
+
 int P0VRunGuardian(NSString *snapshotPath, pid_t parentPID) {
     // 守护进程在独立进程组里，但仍显式忽略终端信号，避免被同组操作误杀。
     signal(SIGHUP, SIG_IGN);
     signal(SIGINT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
+
+    // 就绪握手：必须在做任何事之前写 ready 文件。
+    // 父进程（P0VStartGuardian）等到这个文件才会允许禁屏；写不出来就说明本进程
+    // 根本没接管守护职责，此时父进程必须放弃禁屏，而不是在没有兜底的情况下黑屏。
+    NSString *readyPath = [snapshotPath stringByAppendingString:@".guardian-ready"];
+    NSError *readyErr = nil;
+    if (![@"ready" writeToFile:readyPath atomically:YES
+                      encoding:NSUTF8StringEncoding error:&readyErr]) {
+        P0Error(@"守护进程写就绪文件失败（%@）: %@", readyPath,
+                readyErr.localizedDescription);
+        return 4;
+    }
 
     char rawPath[PATH_MAX] = {0};
     uint32_t size = sizeof(rawPath);
@@ -628,11 +665,16 @@ int P0VRunGuardian(NSString *snapshotPath, pid_t parentPID) {
         ok = P0VRestoreSnapshot(snap, P0VCommitScopeSession, 20, &detail, NULL);
     }
 
+    // 恢复物理屏之后清掉本会话遗留的虚拟屏，避免孤儿占位（见函数注释）。
+    NSInteger orphansDisabled = 0;
+    if (ok) orphansDisabled = P0VDisableOrphanVirtualDisplays(snap);
+
     NSDictionary *result = @{
         @"acted": @YES,
         @"ok": @(ok),
         @"error": err.localizedDescription ?: @"",
         @"detail": detail ?: @{},
+        @"orphansDisabled": @(orphansDisabled),
         @"activeIDs": P0VActiveDisplayIDs(),
         @"snapshotIDs": [snap displayIDs],
     };
@@ -677,6 +719,10 @@ BOOL P0VStartGuardian(NSString *snapshotPath, pid_t parentPID, NSError **error) 
         NULL,
     };
 
+    // 清掉可能残留的就绪标记，握手必须由本次 spawn 的子进程自己写。
+    NSString *readyPath = [snapshotPath stringByAppendingString:@".guardian-ready"];
+    [[NSFileManager defaultManager] removeItemAtPath:readyPath error:NULL];
+
     pid_t child = 0;
     int rc = posix_spawn(&child, resolved, &actions, &attr, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
@@ -688,6 +734,33 @@ BOOL P0VStartGuardian(NSString *snapshotPath, pid_t parentPID, NSError **error) 
                 [NSString stringWithFormat:@"posix_spawn 守护进程失败: %s", strerror(rc)]}];
         return NO;
     }
-    P0Log(@"已启动守护进程 pid=%d（日志 %@）", (int)child, P0VGuardianLogPath());
+
+    // 就绪握手（必须）：spawn 成功 ≠ 守护在跑。
+    // 2026-11-18 事故：pipeline_kiosk_probe 没实现 --guardian，子进程打印用法后立刻退出，
+    // 父进程却以为「有兜底」继续禁屏，最终全屏黑死、只能强制重启。
+    // 因此这里必须等到 ready 文件，否则视为「无兜底」，直接失败。
+    BOOL ready = NO;
+    BOOL childExited = NO;
+    int childStatus = 0;
+    for (int i = 0; i < 60; i++) {          // 最多 3s
+        if ([[NSFileManager defaultManager] fileExistsAtPath:readyPath]) { ready = YES; break; }
+        pid_t w = waitpid(child, &childStatus, WNOHANG);
+        if (w == child) { childExited = YES; break; }
+        usleep(50 * 1000);
+    }
+    if (!ready) {
+        if (!childExited) {
+            kill(child, SIGKILL);
+            waitpid(child, &childStatus, 0);
+        }
+        if (error) *error = [NSError errorWithDomain:@"P0V" code:22
+            userInfo:@{NSLocalizedDescriptionKey: childExited
+                ? [NSString stringWithFormat:
+                    @"守护进程启动即退出（exit=%d）：宿主二进制很可能没有实现 --guardian，"
+                    @"禁止在无兜底的情况下禁屏", WIFEXITED(childStatus) ? WEXITSTATUS(childStatus) : -1]
+                : @"守护进程 3s 内未就绪，禁止在无兜底的情况下禁屏"}];
+        return NO;
+    }
+    P0Log(@"已启动守护进程 pid=%d（就绪握手通过，日志 %@）", (int)child, P0VGuardianLogPath());
     return YES;
 }
