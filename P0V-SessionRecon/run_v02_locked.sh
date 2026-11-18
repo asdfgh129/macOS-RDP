@@ -28,7 +28,7 @@ ALTLOG=/tmp/${TAG}-alt.log
 altpid=$!
 vid=""
 for i in $(seq 1 150); do
-    vid=$(grep -o '虚拟屏就绪: [0-9]*' "$ALTLOG" 2>/dev/null | tail -1 | awk '{print $3}')
+    vid=$(grep -o '虚拟屏就绪: [0-9]*' "$ALTLOG" 2>/dev/null | tail -1 | awk '{print $2}')
     [ -n "$vid" ] && break
     sleep 0.2
 done

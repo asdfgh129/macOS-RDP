@@ -396,9 +396,23 @@ daemon 实测：`session.available=0`、`axTrusted=0`、SCK `6s 超时`、注入
 
 **2026-11-18 Tahoe 26.5.2 追加（见 `docs/RESULTS-BY-OS.md`）**：V-04a 在用户会话路径
 通过（锁屏态 `HAS_CONTENT`，17 帧、0 黑帧）；V-04b 两次判据均被污染（r1 用户手动解锁，
-r2 抓屏时已解锁且 256/256 格无变化），未确认；V-04c 仍未测；V-04d 因锁屏态虚拟屏
-只能 `online` 不能 `active` 而不成立。**结论：Path A 在 Tahoe 不成立，不能沿用
-Sequoia 的用户态锁屏结论；M1 必须按 Path B（D-07）或重新设计登录态流程。**
+r2 抓屏时已解锁且 256/256 格无变化），未确认；V-04c 仍未测。
+
+**2026-11-18 10:40 更正（撤回此前过度推论）**：此前根据 `active=false` 判定「V-02 不成立、
+Path A 在 Tahoe 不成立」，已查明是**探针假阴性**：`altprobe --no-disable` 在
+`waitUntilUsable`（要求 `active=true`）处提前退出，且 `run_v02_locked.sh` 用 `awk $3`
+取虚拟屏 ID（实际在 `$2`），导致三路径捕获从未执行。修正探针后重测：
+
+- 锁屏态下虚拟屏实际 `online=1 / active=1`（屏睡态与屏亮态均是）；
+- 用户补充的「锁屏 2-3 秒后屏睡」是关键：屏睡时 SCK displays 变空；**先启动 `caffeinate -d`
+  再锁屏**可保持屏亮，SCK 恢复 `HAS_CONTENT` 50 帧；
+- 但两次截图（`/tmp/tahoe-r3-lockscreen.png`、`/tmp/tahoe-20261118-r4-lockscreen.png`）
+  显示虚拟屏上只有锁屏壁纸、**没有登录框/密码框**，`CGWindowListCreateImage` 在屏亮态
+  的 `HAS_CONTENT` 也是壁纸内容。
+
+**结论修正**：Path A 在 Tahoe 应记为**未验证**，不是失败；V-04d 不成立理由从「无法建
+active 虚拟屏」更正为「登录 UI 未迁移到虚拟屏」。解锁前的下一步是验证登录 UI 能否被
+引导到虚拟屏（或接受在物理屏呈现登录界面、解锁后再转独占会话），而非直接回 Path B。
 
 ---
 

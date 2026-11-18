@@ -63,11 +63,21 @@
 
 ### 3.3 V-02（锁屏态建虚拟屏 + 采集）与 V-04d（登录窗态禁物理屏）
 
+**状态区分（2026-11-18 10:40 更正）**：此前把三种状态混为一谈，导致 V-02 被误判为失败：
+
+| 状态 | 判据 | CG active | SCK displays | 虚拟屏 active |
+|---|---|---|---|---|
+| 锁屏 + 屏亮（caffeinate 先于 lock） | `screenIsLocked=1`、无 display sleep 断言 | 2 块物理屏 | 2 块物理屏 | ✅ 1 |
+| 锁屏 + 屏睡（2-3s 后自动） | `screenIsLocked=1`、display sleep | 0 | 0（**SCK 也看不到**） | ✅ 1（建屏后） |
+| 真登录窗（loginwindow / 未登录） | `loginDone=0` 或不同 auditID | 未测 | 未测 | 未测 |
+
 | 项 | Sequoia 15.5 | Tahoe 26.5.2 |
 |---|---|---|
-| V-02 | 未测 | ❌ **不成立**（2026-11-18 09:58）：程序化锁屏后 `screenIsLocked=true`，`CGVirtualDisplay` 能创建（4128835，mode 1280×720 提交成功），但 8s liveness 内一直是 `online=true / active=false / usable=0`，`altprobe --no-disable` 退出码 2。锁屏后 active 集合里已无物理屏，所以 `v01probe` 也会因「没有可禁用的物理屏」中止（ABORTED），这不是建屏失败而是前置条件不匹配 |
-| V-04d | 未实现 | ❌ **不成立**：锁屏态下虚拟屏无法进入 active，故「登录界面渲染到虚拟屏」无法达成。r2 中一次 V-04d 抓屏发生在会话已被解锁后（`session.screenIsLocked=false`），该次数据无效，不能当作通过 |
-| 证据 | — | `/tmp/tahoe-20261118-v02lock-alt.log`、`/tmp/tahoe-20261118-r2-v02-dryrun.log`、`/tmp/tahoe-20261118-r2-v04d*.json` |
+| V-02 | 未测 | ⚠️ **更正为「建屏成立、登录 UI 未验证」**：此前 `active=false` 是探针在 `waitUntilUsable` 提前退出 + 脚本 `awk $3` 取错 ID 造成的**假阴性**（捕获从未执行）。修正探针后：锁屏+屏睡态与锁屏+屏亮态，虚拟屏均为 `online=1 / active=1`；`/tmp/tahoe-20261118-r3-sleep-direct.json`、`/tmp/tahoe-20261118-r4-capture.json` |
+| V-02 采集（屏睡态） | 未测 | SCK `NO_FRAMES_TCC_OR_STALE`；`CGDisplayCreateImage` `HAS_CONTENT` mean=163；但截图仅为**锁屏壁纸、无登录框**（`/tmp/tahoe-r3-lockscreen.png`） |
+| V-02 采集（屏亮态） | 未测 | SCK `HAS_CONTENT` 50 帧；`CGDisplayCreateImage` / `CGWindowListCreateImage` 均 `HAS_CONTENT`（mean 148/149 var 1639/1514）；截图仍**仅壁纸、无登录框**（`/tmp/tahoe-20261118-r4-lockscreen.png`） |
+| V-04d | 未实现 | ⚠️ **不成立但理由更正**：虚拟屏能 active，但登录 UI 没有迁移到虚拟屏（两态截图均只有壁纸）。`CGWindowListCreateImage` 在屏亮态 `HAS_CONTENT` 是壁纸内容，不是登录框 |
+| 证据 | — | `/tmp/tahoe-20261118-r4-t{0,1,2,3,5}.json`、`/tmp/tahoe-20261118-r4-capture.json`、`/tmp/tahoe-r3-lockscreen.png`、`/tmp/tahoe-20261118-r4-lockscreen.png` |
 
 ---
 
@@ -79,8 +89,8 @@
 | V-04a 用户态锁屏捕获 | ✅ 真实登录界面，`HAS_CONTENT` | ✅ 通过：`session.screenIsLocked=true`、`HAS_CONTENT`、17 帧、`minMean=134`、0 黑帧（`/tmp/tahoe-20261118-r2-v04a.json`） |
 | V-04b 用户态定向注入 | ✅ `INJECTION_ACCEPTED_UI_CHANGED`，152/256 格变化 | ⚠️ **未确认**：r1 的 `aa`+Return 后用户手动解锁，判据被污染；r2 改用长错误密码但抓屏时会话已解锁、256/256 格无变化。需在全程锁屏下重测 |
 | V-04c 正确密码解锁 | ⏸ 主动跳过、记为未测（需真实凭据） | 同样跳过，不向助手提供密码 |
-| V-04d 登录窗建屏+禁屏 | 未实现 | ❌ 不成立（见 §3.3） |
-| 结论 | loginwindow 不阻止用户会话进程捕获/定向注入；推荐形态改为正确签名的用户态 App | Tahoe 上**锁屏画面可捕获**，但锁屏态无法建出 active 虚拟屏；V-04b 待干净重测，V-04c 未测，V-04d 不成立。**不得沿用 Sequoia 的 Path A 结论** |
+| V-04d 登录窗建屏+禁屏 | 未实现 | ⚠️ 不成立：虚拟屏可 active，但登录 UI 未迁移到虚拟屏（见 §3.3） |
+| 结论 | loginwindow 不阻止用户会话进程捕获/定向注入；推荐形态改为正确签名的用户态 App | **2026-11-18 10:40 更正**：撤回「Path A 在 Tahoe 不成立」的过度推论。已证：① 锁屏态虚拟屏可 active；② 锁屏+屏亮时 SCK 可捕获 50 帧；③ 屏睡是 SCK 无帧的原因，caffeinate 先于 lock 可避免。未证：登录框是否渲染到虚拟屏（截图仅壁纸）、V-04b 干净重测、V-04c。**Path A 应记为「未验证」，不是「失败」** |
 
 ---
 
@@ -104,8 +114,8 @@
 |---|---|---|
 | A-01 Tahoe SPI 可用 | — | ✅ 关闭 |
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 |
-| A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ⚠️ 部分：V-01 关闭；V-03 机制通过但 SCK 采集不可靠；V-02 锁屏态建屏不成立；替代采集路径可行但未接入 |
-| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | V-04a ✅、V-04b 未确认、V-04c 未测、V-04d ❌；Path A 在 Tahoe 不成立 |
+| A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ⚠️ 部分：V-01 关闭；V-03 机制通过但 SCK 采集不可靠；V-02 建屏成立、登录 UI 未证；替代采集路径可行但未接入 |
+| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | V-04a ✅、V-04b 未确认、V-04c 未测、V-04d ⚠️ 登录 UI 未迁移到虚拟屏；**Path A 未验证（非失败）**；关键新发现：锁屏后 2-3s 显示睡眠导致 SCK 无帧，caffeinate 可避免 |
 | A-02 glass-to-glass 延迟 | 未测 | 未测 |
 
 ---
@@ -114,3 +124,4 @@
 
 - v0.1-draft 2026-11-18：首次建立按 OS 分离的结论表；把 Sequoia 与 Tahoe 的 V-01/V-03/V-04 结论拆开，明确禁止跨版本外推。
 - v0.2-draft 2026-11-18：补入 Tahoe V-02（锁屏态虚拟屏 `active=false`，不成立）、V-04a（通过）、V-04b（判据污染，未确认）、V-04d（不成立）；补入替代采集路径对照结果（`CGDisplayCreateImage`/`CGWindowListCreateImage` 稳定可用）。
+- v0.3-draft 2026-11-18 10:40：**重要更正**。发现 v0.2 的 V-02 结论是假阴性——探针 `waitUntilUsable` 提前退出 + 脚本 `awk $3` 取错 ID，捕获从未执行。用户补充「锁屏 2-3 秒后屏睡」后重测：① 屏睡导致 SCK 无帧，caffeinate 先于 lock 可保持屏亮、SCK 恢复 50 帧；② 锁屏态虚拟屏实际 `active=1`（两种状态均是）；③ 截图显示虚拟屏上只有锁屏壁纸、无登录框。撤回「Path A 在 Tahoe 不成立」，改记「Path A 未验证」；V-04d 不成立理由从「不能建 active 屏」更正为「登录 UI 未迁移到虚拟屏」。

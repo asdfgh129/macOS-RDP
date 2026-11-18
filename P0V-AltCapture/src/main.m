@@ -13,6 +13,7 @@
 #import <Foundation/Foundation.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <ImageIO/ImageIO.h>
 #import <unistd.h>
 #import <math.h>
 
@@ -94,11 +95,25 @@ static NSDictionary *AltAnalyzeImage(CGImageRef image) {
     };
 }
 
+static NSString *optShotPath = nil;
+
 static NSDictionary *AltSampleCGDisplay(CGDirectDisplayID displayID, int samples) {
     NSMutableArray *rows = [NSMutableArray array];
+    BOOL savedShot = NO;
     int blackCount = 0, maxVar = 0, minMean = 999;
     for (int i = 0; i < samples; i++) {
         CGImageRef img = CGDisplayCreateImage(displayID);
+        if (img && optShotPath && !savedShot) {
+            NSURL *url = [NSURL fileURLWithPath:optShotPath];
+            CFStringRef pngType = CFSTR("public.png");
+            CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)url,
+                                                        pngType, 1, NULL);
+            if (dest) {
+                CGImageDestinationAddImage(dest, img, NULL);
+                savedShot = CGImageDestinationFinalize(dest);
+                CFRelease(dest);
+            }
+        }
         NSDictionary *row = AltAnalyzeImage(img);
         if (img) CGImageRelease(img);
         [rows addObject:row];
@@ -190,7 +205,13 @@ static int AltRun(void) {
         @{ @"width": @(optWidth), @"height": @(optHeight), @"hiDPI": @NO,
            @"refreshRate": @60, @"name": @"P0V-Alt" }
     ] identityOffset:[VDManager savedIdentityOffset] conservativeFirst:YES];
-    if (![vd createAll] || ![vd waitUntilUsableTimeoutMs:8000]) {
+    // 锁屏态下 CG active 集合为空（显示睡眠），usable=online&&active 必然为假。
+    // 此时不能用 allUsable 当硬闸门，否则会在采集前就退出，得出「无法捕获」的错误结论。
+    // --no-disable 模式：只等屏注册（ID 非空），liveness 如实记录但不否决。
+    BOOL registered = [vd createAll];
+    if (optNoDisable) {
+        [NSThread sleepForTimeInterval:1.5];
+    } else if (!registered || ![vd waitUntilUsableTimeoutMs:8000]) {
         out[@"error"] = @"create virtual display failed";
         [out writeToFile:optOut atomically:YES];
         return 2;
@@ -201,12 +222,15 @@ static int AltRun(void) {
     uint32_t displayID = [vd.displayIDs.firstObject unsignedIntValue];
     out[@"virtualDisplayID"] = @(displayID);
     out[@"virtualLiveness"] = vd.liveness;
+    out[@"virtualOnline"] = @(CGDisplayIsOnline(displayID) != 0);
+    out[@"virtualActive"] = @(CGDisplayIsActive(displayID) != 0);
+    out[@"physicalActiveIDs"] = P0VActiveDisplayIDs();
     printf("虚拟屏就绪: %u\n", displayID);
     fflush(stdout);
 
     NSError *sckErr = nil;
-    [PipelineProbe waitForDisplayIDs:@[@(displayID)] timeoutMs:8000 lastSeen:NULL];
-    out[@"sckVisible"] = @([[PipelineProbe shareableDisplayIDsWithError:&sckErr] containsObject:@(displayID)]);
+    NSArray *sckIDs = [PipelineProbe shareableDisplayIDsWithError:&sckErr];
+    out[@"sckVisible"] = @([sckIDs containsObject:@(displayID)]);
     out[@"sckError"] = sckErr.localizedDescription ?: [NSNull null];
 
     CGRect bounds = CGDisplayBounds(displayID);
@@ -338,6 +362,8 @@ int main(int argc, const char *argv[]) {
                 // 兼容 v01probe 习惯；本探针默认无需交互
             } else if (strcmp(argv[i], "--no-disable") == 0) {
                 optNoDisable = YES;
+            } else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
+                optShotPath = [NSString stringWithUTF8String:argv[++i]];
             } else {
                 AltUsage(); return 3;
             }
