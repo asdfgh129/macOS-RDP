@@ -5,6 +5,8 @@
 
 #import "M1ControlSession.h"
 #import "ProtocolCodec.h"
+#import "P1InputCodec.h"
+#include <stdatomic.h>
 
 NSString * const M1ControlSessionErrorDomain = @"M1ControlSession";
 
@@ -38,7 +40,13 @@ static NSString *M1ArchName(void) {
 
 @end
 
-@interface M1ControlSession ()
+@interface M1ControlSession () {
+    // 统计在两条线程上写（发送=调用方线程，接收=控制收包队列），读出可能在第三条线程。
+    atomic_uint_fast64_t _inputSent;
+    atomic_uint_fast64_t _inputReceived;
+    atomic_uint_fast64_t _inputDropped;
+    atomic_uint_fast64_t _inputRejected;
+}
 @property (nonatomic, strong) M1ControlChannel *channel;
 @property (nonatomic, strong) M1ControlSessionConfig *config;
 @property (nonatomic, readwrite) P1SessionStateMachine *stateMachine;
@@ -54,6 +62,8 @@ static NSString *M1ArchName(void) {
 @property (nonatomic, strong) dispatch_source_t hbTimer;
 @property (nonatomic, assign) BOOL began;
 @property (nonatomic, assign) BOOL closed;
+// 注入速率限制（PROTOCOL §3.1：单会话 ≤1000 event/s，超限丢 move/scroll）
+@property (nonatomic, strong) P1InputRateLimiter *inputLimiter;
 @end
 
 @implementation M1ControlSession
@@ -68,6 +78,11 @@ static NSString *M1ArchName(void) {
         _log = [NSMutableArray arrayWithObject:P1SessionStateName(P1SessionStateDiscovered)];
         _remoteDisplays = @[];
         _hbQueue = dispatch_queue_create("m1.control.heartbeat", DISPATCH_QUEUE_SERIAL);
+        atomic_init(&_inputSent, 0);
+        atomic_init(&_inputReceived, 0);
+        atomic_init(&_inputDropped, 0);
+        atomic_init(&_inputRejected, 0);
+        _inputLimiter = [[P1InputRateLimiter alloc] initWithEventsPerSecond:P1InputMaxEventsPerSecond];
         channel.delegate = self;
     }
     return self;
@@ -169,12 +184,13 @@ static NSString *M1ArchName(void) {
     else if ([type isEqualToString:@"session-start"]) [self handleSessionStart:message];
     else if ([type isEqualToString:@"session-ready"]) [self handleSessionReady:message];
     else if ([type isEqualToString:@"heartbeat"])     [self handleHeartbeat:message];
+    else if ([type isEqualToString:@"input"])         [self handleInput:message];
     else if ([type isEqualToString:@"bye"] || [type isEqualToString:@"session-error"]) {
         self.closed = YES;
         [self stopHeartbeat];
         [self advance:type];
     }
-    // 其余类型（input / keyframe-*）属帧通道阶段，这里静默忽略。
+    // 其余类型（keyframe-*）属帧通道阶段，这里静默忽略。
 }
 
 - (void)controlChannel:(M1ControlChannel *)channel didFailWithError:(NSError *)error {
@@ -335,6 +351,83 @@ static NSString *M1ArchName(void) {
 
 - (void)handleHeartbeat:(NSDictionary *)msg {
     if (self.stateMachine.state == P1SessionStateStreaming) [self advance:@"heartbeat"];
+}
+
+#pragma mark - 输入（PROTOCOL §3.1）
+
+- (NSUInteger)inputEventsSent     { return (NSUInteger)atomic_load(&_inputSent); }
+- (NSUInteger)inputEventsReceived { return (NSUInteger)atomic_load(&_inputReceived); }
+- (NSUInteger)inputEventsDropped  { return (NSUInteger)atomic_load(&_inputDropped); }
+- (NSUInteger)inputEventsRejected { return (NSUInteger)atomic_load(&_inputRejected); }
+
+- (BOOL)sendInputEvent:(NSDictionary *)event error:(NSError **)error {
+    if (self.role != M1ControlRoleClient) {
+        atomic_fetch_add(&_inputRejected, 1);
+        if (error) *error = M1SessErr(M1ControlSessionErrorProtocol,
+            @"Host 侧不应发送 input 事件");
+        return NO;
+    }
+    // 只有 STREAMING 态才有目标屏可注入。这里刻意不 failWith：
+    // 输入是高频路径，握手/重连窗口里丢几条不该把会话判死。
+    if (self.closed || self.stateMachine.state != P1SessionStateStreaming) {
+        atomic_fetch_add(&_inputDropped, 1);
+        if (error) *error = M1SessErr(M1ControlSessionErrorInvalidState,
+            @"会话未处于 STREAMING，输入事件未发送");
+        return NO;
+    }
+
+    NSError *normErr = nil;
+    NSDictionary *normalized = P1NormalizeInputEvent(event, &normErr);
+    if (!normalized) {
+        // 畸形事件属于客户端 bug，计数但不掀会话（否则一次坐标 NaN 就断线）。
+        atomic_fetch_add(&_inputRejected, 1);
+        if (error) *error = normErr;
+        return NO;
+    }
+    // displayID 与 seq 由这里补齐：seq 由 M1ControlChannel 统一分配（与控制消息同一序列），
+    // 保证对端按同一套单调序号做丢包观察。
+    // displayID 两处都带：PROTOCOL §3.1 写在消息层，P1InputCodec 放在 event 内。
+    // 对端两种读法都能取到值，省掉一次「文档与实现不一致」的踩坑（见 D-17）。
+    NSMutableDictionary *payload = [@{ @"type": @"input", @"event": normalized } mutableCopy];
+    if (normalized[@"displayID"]) payload[@"displayID"] = normalized[@"displayID"];
+    if (![self sendPayload:payload]) return NO;
+    atomic_fetch_add(&_inputSent, 1);
+    return YES;
+}
+
+- (void)handleInput:(NSDictionary *)msg {
+    if (self.role != M1ControlRoleHost) {
+        [self failWith:M1SessErr(M1ControlSessionErrorProtocol, @"Client 不应收到 input")];
+        return;
+    }
+    // 未进入 STREAMING 就没有目标屏，事件无处可去。不计 rejected（不是畸形），
+    // 计 dropped 以便观察对端是不是抢跑。
+    if (self.closed || self.stateMachine.state != P1SessionStateStreaming) {
+        atomic_fetch_add(&_inputDropped, 1);
+        return;
+    }
+    // displayID 兼容两种位置：event 内（P1InputCodec 实际实现）与消息层（PROTOCOL §3.1 文档）。
+    NSDictionary *rawEvent = msg[@"event"];
+    NSMutableDictionary *eventIn = [rawEvent isKindOfClass:[NSDictionary class]]
+                                 ? [rawEvent mutableCopy] : nil;
+    if (eventIn && !eventIn[@"displayID"] && msg[@"displayID"]) {
+        eventIn[@"displayID"] = msg[@"displayID"];
+    }
+    NSError *normErr = nil;
+    NSDictionary *event = P1NormalizeInputEvent(eventIn, &normErr);
+    if (!event) {
+        atomic_fetch_add(&_inputRejected, 1);
+        return;
+    }
+    double now = [[NSDate date] timeIntervalSince1970];
+    if (![self.inputLimiter shouldAcceptEvent:event atTime:now]) {
+        atomic_fetch_add(&_inputDropped, 1);
+        return;
+    }
+    atomic_fetch_add(&_inputReceived, 1);
+    if ([self.delegate respondsToSelector:@selector(controlSession:didReceiveInputEvent:)]) {
+        [self.delegate controlSession:self didReceiveInputEvent:event];
+    }
 }
 
 #pragma mark - 心跳

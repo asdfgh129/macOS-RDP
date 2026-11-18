@@ -2,10 +2,12 @@
 //  stream_probe.m
 //  M1-Skeleton
 //
-//  M1-A 第 4 步验收：跨进程推流落盘。
+//  M1-A 第 4 步验收 + M1-B 第 1 步：跨进程推流落盘 / 上屏 + 输入回传。
 //
 //    host   : SCK 采集 → VT 编码 → M1FrameSender → QUIC datagram
-//    client : QUIC datagram → M1FrameReceiver 重组 → VT 解码 → PNG
+//             ← input 事件 → M1InjectionPlan → M1InputInjector（record/real）
+//    client : QUIC datagram → M1FrameReceiver 重组 → VT 解码 → PNG / 窗口上屏
+//             窗口鼠标键盘 → 归一化 → input 事件 → 控制通道
 //
 //  关键点（D-14 C-14.2）：控制帧与视频帧**共用同一条 datagram 连接**，靠首字节魔数分流：
 //    0x43 'C'  → M1ControlLink（seq/ACK 自建可靠性）→ M1ControlChannel → M1ControlSession
@@ -14,9 +16,14 @@
 //
 //  用法：
 //    ./stream_probe --host [--port N] [--port-file PATH] [--duration-ms N]
-//                     [--display ID] [--fps N] [--out JSON]
+//                     [--display ID] [--fps N] [--inject record|real] [--out JSON]
 //    ./stream_probe --client --port N --fingerprint HEX [--duration-ms N]
-//                     [--outdir DIR] [--save-frames N] [--out JSON]
+//                     [--outdir DIR] [--save-frames N] [--window [WxH]]
+//                     [--port-file PATH] [--out JSON]
+//
+//    --window  : 起 NSWindow 把解码帧直接画到屏幕上，并采集鼠标/键盘回传 Host。
+//    --inject  : record（默认，只记录注入计划，单机环回不干扰真实桌面）
+//                real  （真 CGEventPost，双机验收用）
 //
 //  验收判据：
 //    1. 双端到达 STREAMING，且状态序列逐条一致
@@ -26,6 +33,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
@@ -36,6 +44,8 @@
 #import "M1FramePipeline.h"
 #import "M1FrameReceiver.h"
 #import "M1VideoEncoder.h"
+#import "M1FrameView.h"
+#import "M1InputInjector.h"
 
 static NSString *gIdentity = @".state/rdp-identity.p12";
 static NSString *gPass = @"rdpdev";
@@ -91,6 +101,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 @property (nonatomic, assign) double handshakeMs;
 @property (nonatomic, assign) double streamStartMs;   // 进入 STREAMING 的时刻
 @property (nonatomic, copy, nullable) void (^onSessionClosed)(void);
+// Host 侧：收到客户端输入事件（已在 M1ControlSession 过校验与限速）。
+@property (nonatomic, copy, nullable) void (^onInputEvent)(NSDictionary *event);
 
 // 分流统计
 @property (nonatomic, assign) uint64_t controlDatagrams;
@@ -290,6 +302,10 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     dispatch_semaphore_signal(self.streamingSem);
 }
 
+- (void)controlSession:(M1ControlSession *)session didReceiveInputEvent:(NSDictionary *)event {
+    if (self.onInputEvent) self.onInputEvent(event);
+}
+
 - (NSArray<NSString *> *)stateLog { return self.session ? self.session.stateLog : @[]; }
 
 - (void)shutdown {
@@ -322,7 +338,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 @property (nonatomic, assign) int32_t decodedWidth;
 @property (nonatomic, assign) int32_t decodedHeight;
 @property (nonatomic, copy) NSMutableArray<NSString *> *savedPaths;
-
+// 每一帧解码结果的直通出口（窗口上屏用）。在帧队列上回调，实现方需自行切线程。
+@property (nonatomic, copy, nullable) void (^onPixelBuffer)(CVPixelBufferRef pb, uint32_t frameSeq);
 @end
 
 @implementation StreamClientNode
@@ -348,6 +365,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
             self.lastFrameMs = now;
             self.decodedWidth = (int32_t)CVPixelBufferGetWidth(pb);
             self.decodedHeight = (int32_t)CVPixelBufferGetHeight(pb);
+            // 上屏：M1FrameView 内部自己 Retain + 转线程，这里直接递过去
+            if (self.onPixelBuffer) self.onPixelBuffer(pb, frameSeq);
 
             // PNG 编码必须离开接收/解码线程。
             //
@@ -458,6 +477,9 @@ int main(int argc, char **argv) {
         NSUInteger saveFrames = 5;
         double bpp = 0.12;
         int32_t outW = 0, outH = 0;
+        BOOL windowMode = NO;
+        double windowW = 1280, windowH = 720;
+        NSString *injectMode = nil;   // nil / record / real
 
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--host")) hostMode = YES;
@@ -484,6 +506,18 @@ int main(int argc, char **argv) {
             else if (!strcmp(argv[i], "--bpp") && i + 1 < argc) bpp = atof(argv[++i]);
             else if (!strcmp(argv[i], "--width") && i + 1 < argc) outW = atoi(argv[++i]);
             else if (!strcmp(argv[i], "--height") && i + 1 < argc) outH = atoi(argv[++i]);
+            else if (!strcmp(argv[i], "--inject") && i + 1 < argc)
+                injectMode = [NSString stringWithUTF8String:argv[++i]];
+            else if (!strcmp(argv[i], "--window")) {
+                windowMode = YES;
+                // 可选 --window 1600x900；不给就 1280x720。
+                if (i + 1 < argc && strchr(argv[i + 1], 'x') && isdigit(argv[i + 1][0])) {
+                    int w = 0, h = 0;
+                    if (sscanf(argv[++i], "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                        windowW = w; windowH = h;
+                    }
+                }
+            }
             else { PrintUsage(); return 1; }
         }
         if (!hostMode && !clientMode) { PrintUsage(); return 1; }
@@ -553,6 +587,42 @@ int main(int argc, char **argv) {
             }
             printf("  采集尺寸 %dx%d\n", pipe.pixelWidth, pipe.pixelHeight);
 
+            // ---- 输入回传（M1-B）----
+            // record 是默认档：单机环回时 Host 和 Client 是同一个桌面，
+            // 真注入会把光标从这个窗口移走、甚至点中别的 app，验证反而失真。
+            M1RecordingEventSink *recorder = nil;
+            M1InputInjector *injector = nil;
+            __block NSUInteger injectFails = 0;
+            if (injectMode.length > 0) {
+                id<M1EventSink> sink = nil;
+                if ([injectMode isEqualToString:@"real"]) {
+                    sink = [M1CGEventSink new];
+                } else if ([injectMode isEqualToString:@"record"]) {
+                    recorder = [M1RecordingEventSink new];
+                    sink = recorder;
+                } else {
+                    printf("✗ 未知 --inject 模式：%s（只支持 record / real）\n",
+                           injectMode.UTF8String);
+                    [pipe stop];
+                    [host shutdown];
+                    return 1;
+                }
+                // 目标 rect 用被采集那块屏的 Quartz bounds：
+                // CGDisplayBounds 的原点在主屏左上、y 向下，与协议 y=0 在上一致。
+                CGRect targetRect = CGDisplayBounds(displayID);
+                injector = [[M1InputInjector alloc] initWithSink:sink];
+                injector.targetDisplayRect = targetRect;
+                host.onInputEvent = ^(NSDictionary *event) {
+                    NSError *injErr = nil;
+                    if (![injector injectEvent:event error:&injErr]) injectFails += 1;
+                };
+                printf("  输入注入 %s，目标 rect=(%.0f,%.0f %.0fx%.0f)\n",
+                       injectMode.UTF8String, targetRect.origin.x, targetRect.origin.y,
+                       targetRect.size.width, targetRect.size.height);
+            } else {
+                printf("  输入注入未启用（--inject record|real 可开启）\n");
+            }
+
             // 对端 bye 之后立即停管线：否则继续往死连接投递，只会把 sendFailures 刷大。
             __block BOOL stopped = NO;
             host.onSessionClosed = ^{
@@ -584,6 +654,39 @@ int main(int argc, char **argv) {
                    host.controlDatagrams, host.frameDatagrams, host.unroutedDatagrams);
             printf("  控制通道最大到达间隔 %.0f ms（出现在推流 %.0f ms 处）\n",
                    host.maxControlGapMs, host.maxGapAtOffsetMs);
+            if (injectMode.length > 0) {
+                M1ControlSession *hs = host.session;
+                printf("  输入：收到 %lu / 丢弃 %lu / 拒绝 %lu / 注入失败 %lu"
+                       "（注入计划 %lu 条）\n",
+                       (unsigned long)hs.inputEventsReceived,
+                       (unsigned long)hs.inputEventsDropped,
+                       (unsigned long)hs.inputEventsRejected,
+                       (unsigned long)injectFails,
+                       (unsigned long)recorder.postCount);
+                NSArray<NSDictionary *> *plans = recorder.plans;
+                NSUInteger show = MIN(plans.count, (NSUInteger)6);
+                for (NSUInteger i = 0; i < show; i++) {
+                    NSDictionary *pl = plans[i];
+                    if ([pl[@"kind"] isEqualToString:@"mouse"]) {
+                        printf("    #%lu mouse %s %s @ (%.0f, %.0f)\n",
+                               (unsigned long)i + 1,
+                               [pl[@"button"] UTF8String], [pl[@"action"] UTF8String],
+                               [pl[@"x"] doubleValue], [pl[@"y"] doubleValue]);
+                    } else if ([pl[@"kind"] isEqualToString:@"key"]) {
+                        printf("    #%lu key keyCode=%d unicode=%s\n",
+                               (unsigned long)i + 1,
+                               [pl[@"keyCode"] intValue],
+                               [pl[@"unicode"] UTF8String] ?: "");
+                    } else if ([pl[@"kind"] isEqualToString:@"scroll"]) {
+                        printf("    #%lu scroll dx=%.1f dy=%.1f\n",
+                               (unsigned long)i + 1,
+                               [pl[@"dx"] doubleValue], [pl[@"dy"] doubleValue]);
+                    } else {
+                        printf("    #%lu flags=0x%llx\n", (unsigned long)i + 1,
+                               [pl[@"flags"] unsignedLongLongValue]);
+                    }
+                }
+            }
             PrintFlowStats(host, "host");
             printf("  状态序列: %s\n", [host.stateLog componentsJoinedByString:@" → "].UTF8String);
 
@@ -604,6 +707,14 @@ int main(int argc, char **argv) {
             json[@"controlDatagrams"] = @(host.controlDatagrams);
             json[@"frameDatagrams"] = @(host.frameDatagrams);
             json[@"maxControlGapMs"] = @(round(host.maxControlGapMs));
+            if (injectMode.length > 0) {
+                json[@"injectMode"] = injectMode;
+                json[@"inputReceived"] = @(host.session.inputEventsReceived);
+                json[@"inputDropped"] = @(host.session.inputEventsDropped);
+                json[@"inputRejected"] = @(host.session.inputEventsRejected);
+                json[@"inputInjectFails"] = @(injectFails);
+                json[@"inputPlans"] = recorder.plans ?: @[];
+            }
             if (outPath.length > 0) {
                 NSData *d = JSONData(json);
                 if (d) [d writeToFile:outPath atomically:YES];
@@ -625,12 +736,52 @@ int main(int argc, char **argv) {
                                   withIntermediateDirectories:YES
                                                    attributes:nil error:NULL];
 
+        // 窗口模式：先建 NSWindow，保证首帧一到就能上屏（渲染本身在独立队列，
+        // 帧到了先排队，run loop 起来后立即贴图）。
+        M1FrameView *frameView = nil;
+        __block BOOL closedByUser = NO;
+        NSWindow *frameWindow = nil;
+        if (windowMode) {
+            [NSApplication sharedApplication];
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+            NSRect content = NSMakeRect(0, 0, windowW, windowH);
+            frameWindow = [[NSWindow alloc]
+                initWithContentRect:content
+                          styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                     NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+                            backing:NSBackingStoreBuffered
+                              defer:NO];
+            frameWindow.title = [NSString stringWithFormat:
+                @"macOS-RDP 客户端 %d×%d（Esc 退出）", (int)windowW, (int)windowH];
+            frameWindow.releasedWhenClosed = NO;
+            frameView = [[M1FrameView alloc] initWithFrame:content];
+            frameWindow.contentView = frameView;
+            [frameWindow center];
+            [frameWindow makeKeyAndOrderFront:nil];
+            [NSApp activateIgnoringOtherApps:YES];
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:NSWindowWillCloseNotification
+                            object:frameWindow
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                closedByUser = YES;
+                [NSApp stop:nil];
+            }];
+            printf("窗口已打开 %dx%d（Esc 或关窗退出）\n", (int)windowW, (int)windowH);
+        }
+
         StreamClientNode *client = [StreamClientNode new];
         client.expectedFingerprint = fingerprint;
         client.fps = fps;
         client.outdir = outdir;
         client.saveFrames = saveFrames;
         [client prepareReceiver];
+        if (frameView) {
+            __weak M1FrameView *weakView = frameView;
+            client.onPixelBuffer = ^(CVPixelBufferRef pb, uint32_t seq) {
+                [weakView presentPixelBuffer:pb];
+            };
+        }
 
         NSError *err = nil;
         if (![client startAsClientTo:@"127.0.0.1" port:port timeout:12000 error:&err]) {
@@ -644,7 +795,47 @@ int main(int argc, char **argv) {
             return 4;
         }
         printf("已 STREAMING，接收 %d ms\n", durationMs);
-        [NSThread sleepForTimeInterval:durationMs / 1000.0];
+        if (frameView) {
+            NSDictionary *remoteDisplay = client.session.remoteDisplays.firstObject;
+            frameView.displayID = [remoteDisplay[@"displayID"] unsignedIntValue];
+            printf("  目标屏 displayID=%u（w=%d h=%d），开始捕获窗口输入\n",
+                   frameView.displayID,
+                   [remoteDisplay[@"w"] intValue], [remoteDisplay[@"h"] intValue]);
+
+            __block NSUInteger winSent = 0, winSendFail = 0;
+            frameView.onInputEvent = ^(NSDictionary *event) {
+                NSError *sendErr = nil;
+                if ([client.session sendInputEvent:event error:&sendErr]) winSent += 1;
+                else winSendFail += 1;
+            };
+            frameView.onCloseRequest = ^{ closedByUser = YES; [NSApp stop:nil]; };
+
+            // 到点自动收尾。stop: 之后必须再投一个事件，否则 run loop 可能还挂在等事件上。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)durationMs * (int64_t)NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                if (!closedByUser) [NSApp stop:nil];
+                [NSApp postEvent:[NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                                    location:NSZeroPoint
+                                               modifierFlags:0
+                                                   timestamp:0
+                                                windowNumber:0
+                                                     context:nil
+                                                     subtype:0
+                                                       data1:0
+                                                       data2:0]
+                         atStart:NO];
+            });
+
+            [NSApp run];
+            printf("窗口收尾（%s）——上屏 %lu 帧，丢 %lu 帧；输入发出 %lu / 失败 %lu\n",
+                   closedByUser ? "用户关闭" : "到时",
+                   (unsigned long)frameView.framesRendered,
+                   (unsigned long)frameView.framesDropped,
+                   (unsigned long)winSent, (unsigned long)winSendFail);
+        } else {
+            [NSThread sleepForTimeInterval:durationMs / 1000.0];
+        }
 
         [client flushFrames];
         [client flushSaves];
@@ -673,6 +864,17 @@ int main(int argc, char **argv) {
                client.maxControlGapMs, client.maxGapAtOffsetMs);
         PrintFlowStats(client, "client");
         printf("  状态序列: %s\n", [client.stateLog componentsJoinedByString:@" → "].UTF8String);
+        if (frameView) {
+            printf("  上屏：%lu 帧（丢 %lu 帧积压），单帧转 CGImage 最近 %.1f ms / 峰值 %.1f ms\n",
+                   (unsigned long)frameView.framesRendered,
+                   (unsigned long)frameView.framesDropped,
+                   frameView.lastRenderMs, frameView.maxRenderMs);
+            printf("  输入：发出 %lu / 丢弃 %lu / 拒绝 %lu（窗口采集 %lu 条）\n",
+                   (unsigned long)client.session.inputEventsSent,
+                   (unsigned long)client.session.inputEventsDropped,
+                   (unsigned long)client.session.inputEventsRejected,
+                   (unsigned long)frameView.inputEventsEmitted);
+        }
         printf("  已保存 PNG %lu 张 → %s\n",
                (unsigned long)client.savedPaths.count, outdir.UTF8String);
         for (NSString *p in client.savedPaths) printf("    %s\n", p.lastPathComponent.UTF8String);
@@ -701,6 +903,17 @@ int main(int argc, char **argv) {
         json[@"maxGapAtOffsetMs"] = @(round(client.maxGapAtOffsetMs));
         json[@"controlArrivals"] = client.controlArrivals;
         json[@"savedPNGs"] = @(client.savedPaths.count);
+        if (frameView) {
+            json[@"windowed"] = @YES;
+            json[@"framesRendered"] = @(frameView.framesRendered);
+            json[@"renderDropped"] = @(frameView.framesDropped);
+            json[@"lastRenderMs"] = @(round(frameView.lastRenderMs * 10) / 10.0);
+            json[@"maxRenderMs"] = @(round(frameView.maxRenderMs * 10) / 10.0);
+            json[@"inputEmitted"] = @(frameView.inputEventsEmitted);
+            json[@"inputSent"] = @(client.session.inputEventsSent);
+            json[@"inputDropped"] = @(client.session.inputEventsDropped);
+            json[@"inputRejected"] = @(client.session.inputEventsRejected);
+        }
         json[@"outdir"] = outdir;
         if (outPath.length > 0) {
             NSData *d = JSONData(json);
@@ -711,7 +924,8 @@ int main(int argc, char **argv) {
         NSMutableArray *notes = [NSMutableArray array];
         if (!client.streaming) [notes addObject:@"未到 STREAMING"];
         if (rs.framesDecoded == 0) [notes addObject:@"没解出任何画面"];
-        if (client.savedPaths.count == 0) [notes addObject:@"没有 PNG 落盘"];
+        if (client.savedPaths.count == 0 && !frameView) [notes addObject:@"没有 PNG 落盘"];
+        if (frameView && frameView.framesRendered == 0) [notes addObject:@"窗口一帧都没贴上"];
         if (client.maxControlGapMs > 3000) {
             [notes addObject:[NSString stringWithFormat:@"控制通道最大间隔 %.0fms 超 3s（疑似被推流挤掉）",
                               client.maxControlGapMs]];

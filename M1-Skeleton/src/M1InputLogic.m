@@ -36,6 +36,31 @@ CGPoint M1PointInDisplayRect(double nx, double ny, CGRect displayRect) {
                        displayRect.origin.y + y * displayRect.size.height);
 }
 
+CGRect M1AspectFitRect(CGSize videoSize, CGRect bounds) {
+    if (videoSize.width <= 0 || videoSize.height <= 0 ||
+        bounds.size.width <= 0 || bounds.size.height <= 0) {
+        return bounds;
+    }
+    double sx = bounds.size.width / videoSize.width;
+    double sy = bounds.size.height / videoSize.height;
+    double s = sx < sy ? sx : sy;          // 取小的那个：整幅画面必须放得下
+    double w = videoSize.width * s;
+    double h = videoSize.height * s;
+    return CGRectMake(bounds.origin.x + (bounds.size.width - w) / 2.0,
+                      bounds.origin.y + (bounds.size.height - h) / 2.0,
+                      w, h);
+}
+
+CGPoint M1NormalizedPointFromViewPoint(CGPoint viewPoint, CGRect videoRect) {
+    if (videoRect.size.width <= 0 || videoRect.size.height <= 0) {
+        return CGPointMake(0, 0);
+    }
+    double nx = (viewPoint.x - videoRect.origin.x) / videoRect.size.width;
+    // AppKit 视图原点在左下，协议原点在左上：y 要翻。
+    double ny = 1.0 - (viewPoint.y - videoRect.origin.y) / videoRect.size.height;
+    return CGPointMake(M1Clamp01(nx), M1Clamp01(ny));
+}
+
 static NSError *M1InputErr(NSInteger code, NSString *desc) {
     return [NSError errorWithDomain:M1InputLogicErrorDomain code:code
         userInfo:@{ NSLocalizedDescriptionKey: desc }];

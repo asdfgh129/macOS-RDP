@@ -30,8 +30,12 @@ SOURCES=(
   "$SRC/M1CapturePipeline.m"
   "$SRC/M1FrameReceiver.m"
   "$SRC/M1FramePipeline.m"
+  "$SRC/M1FrameView.m"
+  "$SRC/M1InputLogic.m"
+  "$SRC/M1InputInjector.m"
   "$P1SRC/ProtocolCodec.m"
   "$P1SRC/P1SessionState.m"
+  "$P1SRC/P1InputCodec.m"
   "stream_probe.m"
 )
 
@@ -43,6 +47,7 @@ done
   -isysroot "$SDKROOT" -I "$SRC" -I "$P1SRC" \
   -Wall -Wno-unused-parameter -Wno-deprecated-declarations \
   "${SOURCES[@]}" \
+  -framework AppKit \
   -framework Foundation -framework Network -framework Security -framework QuartzCore \
   -framework CoreGraphics -framework CoreMedia -framework CoreVideo \
   -framework ScreenCaptureKit -framework VideoToolbox \

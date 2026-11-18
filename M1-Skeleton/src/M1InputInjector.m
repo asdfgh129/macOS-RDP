@@ -96,6 +96,41 @@ static void M1Post(CGEventRef e, pid_t pid) {
 
 @end
 
+#pragma mark - 记录型下沉（不注入）
+
+@interface M1RecordingEventSink ()
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *mutablePlans;
+@end
+
+@implementation M1RecordingEventSink
+
+- (instancetype)init {
+    if ((self = [super init])) _mutablePlans = [NSMutableArray array];
+    return self;
+}
+
+- (BOOL)postPlan:(NSDictionary<NSString *, id> *)plan error:(NSError **)error {
+    // 注入发生在控制收包队列，读取发生在主线程（打印/断言），加锁避免并发改数组。
+    @synchronized (self) {
+        [_mutablePlans addObject:[plan copy]];
+    }
+    return YES;
+}
+
+- (NSArray<NSDictionary *> *)plans {
+    @synchronized (self) { return [_mutablePlans copy]; }
+}
+
+- (NSUInteger)postCount {
+    @synchronized (self) { return _mutablePlans.count; }
+}
+
+- (void)reset {
+    @synchronized (self) { [_mutablePlans removeAllObjects]; }
+}
+
+@end
+
 #pragma mark - Injector
 
 @interface M1InputInjector ()

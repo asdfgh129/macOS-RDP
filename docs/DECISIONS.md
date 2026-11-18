@@ -790,6 +790,52 @@ D-15 验证时发现：3440×1440 的关键帧会超过 v1 帧头的分片上限
 
 ---
 
+## D-17 M1-B 客户端上屏与输入回传
+
+**状态**：已实现 + 单测通过（2026-11-18）；端到端验证待解锁执行。
+
+### 背景
+
+M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——能证明「画面正确」，
+证明不了「能用」。M1-B 补两件事：画面实时上屏、键鼠操作回到主机。
+
+### 事实
+
+| 编号 | 事实 | 依据 |
+|---|---|---|
+| F-17.1 | 协议 §3.1 早已冻结 `input` 消息，`P1InputCodec` 也完整（构造/校验/限速），但 `M1ControlSession` 的分发里把它**静默忽略** | 原代码注释「其余类型（input / keyframe-*）属帧通道阶段」 |
+| F-17.2 | `P1InputCodec.P1MakeInputMessage` 把 `displayID` 放在 `event` 内；`PROTOCOL.md` §3.1 写在消息层 | 两处读法不一致 |
+| F-17.3 | 锁屏时 `SCShareableContent.displays` 为空，SCK 采集直接失败 | §5.9 实测 `该 displayID 不在 SCShareableContent.displays 中` |
+| F-17.4 | AppKit 视图原点在左下，协议 y=0 在顶边 | 坐标必须翻 y，否则上下颠倒 |
+
+### 决策
+
+| 编号 | 决策 | 落点 |
+|---|---|---|
+| C-17.1 | 输入走**现有控制通道**，不开新通道：1000 event/s 上限对键鼠足够，且已经有 seq/ACK 可靠性 | `M1ControlSession sendInputEvent:` |
+| C-17.2 | 输入只在 **STREAMING 态**收发；非 STREAMING 一律**静默丢弃并计数**，不 `failWith`——高频路径上丢几条不该把会话判死 | `sendInputEvent:` / `handleInput:` |
+| C-17.3 | `displayID` 发送时**两处都带**，接收时 event 内缺失回落到消息层（F-17.2） | `M1ControlSession.m` |
+| C-17.4 | 上屏用 `CIContext → CGImage → layer.contents`，不用 `AVSampleBufferDisplayLayer`：后者要喂压缩 sample，会绕开 `M1FrameReceiver` 的解码统计 | `M1FrameView` |
+| C-17.5 | 画面转换在独立串行队列，只把 `layer.contents` 赋值回主线程；积压 >2 帧丢新帧 | `M1FrameView presentPixelBuffer:` |
+| C-17.6 | letterbox 几何与坐标反算**共用同一组纯函数**（`M1AspectFitRect` / `M1NormalizedPointFromViewPoint`），避免「看到的」与「点到的」错位；落在黑边上的事件不产生输入 | `M1InputLogic` |
+| C-17.7 | `keyUp` 不单独发：协议 `key` 无 down/up 位，Host 侧本就成对注入 | `M1FrameView keyUp:` |
+| C-17.8 | 单机环回默认 `--inject record`（`M1RecordingEventSink`），真注入需显式 `--inject real` | `stream_probe` |
+| C-17.9 | 修饰键走**状态同步**（变化时发全量 `flags`），不逐事件带 flags | `M1FrameView syncModifierStateIfNeeded` |
+| C-17.10 | 视图构造时后台跑一次 16×16 空转转换，预热 `CIContext`——首次转换实测 623 ms，之后 3.3 ms，与 D-15 的 VT 会话同类 | `M1FrameView warmUpRenderPath` |
+| C-17.11 | 上屏正确性用**离屏自检**（喂已知图案、采样 `layer.contents`）而非只靠肉眼截图：颜色通道反转在截图里不容易发现 | `tools/render_selftest.m` |
+
+### 代价与边界
+
+- 上屏路径是 `createCGImage`，离屏实测单帧 1.3–2.1 ms（640×360 源）；全分辨率
+  3440×1440 的耗时仍未知，超过 ~15 ms 就应改 `IOSurface` 直贴或 `CAMetalLayer`。
+- `CIContext` 首次转换 623 ms 属全系统 GPU 管线冷启动，预热只能在进程内提前，
+  跨进程/重启后仍需再付一次。
+- 客户端不做本地节流：1000 Hz 鼠标会先把控制通道塞满再被 Host 丢弃。M1-C 再改。
+- 环回时窗口会被自己采集进去，出现「画中画递归」，是预期现象。
+- 端到端判据（窗口出画面 + 三点坐标换算）尚未在解锁环境下执行。
+
+---
+
 ## 附：协议实现进度（2026-11-17）
 
 | 模块 | 状态 | 测试 |
@@ -801,6 +847,7 @@ D-15 验证时发现：3440×1440 的关键帧会超过 v1 帧头的分片上限
 | 信令状态机（§2） | ✅ 完成（2026-11-18） | 8 态迁移表、STREAMING 输入门控、SUSPENDED→NEGOTIATED 重连、CLOSED 终态；37 项断言 |
 | QUIC 数据报端到端 | ✅ 完成（2026-11-18，本机环回） | `quic_probe`；协商上限 1497B、1150B 分片零丢零乱序；突发丢 43.6% |
 | 分片上限 1150 B | ✅ 完成（2026-11-18） | `P1FrameMaxPayload` 由 1200 下调为 1150，帧头校验与分片器共用，单测含头空间校验 |
+| 输入回传（input 收发 + 注入） | ✅ 代码完成（2026-11-18） | `sendInputEvent:` / `didReceiveInputEvent:` + `M1FrameView` 采集 + `M1InputInjector` 注入；单测 193 项全过，端到端待解锁 |
 | 帧头 v2（分片序号 16 位） | ✅ 完成（2026-11-18） | 18B 帧头，单帧上限 65535 片；400 片大帧重组逐字节一致、256 片合法、65536 片仍拒发；3440×1440 推流 `sendFail=0` |
 | 控制通道可靠性（datagram 上自建） | ✅ 完成（2026-11-18） | `M1ControlLink`：14B 头、累计 ACK、250ms×8 重传、乱序持有、去重；`control_probe` 实 socket 验证 |
 | 控制通道分帧 + 会话语义 | ✅ 完成（2026-11-18） | `M1ControlChannel` + `M1ControlSession`：8 态、TOFU/配对码、心跳、synthetic 显示占位；148 断言全过 |

@@ -23,6 +23,7 @@ bash ./gen_quic_identity.sh .state rdp-identity rdpdev >/dev/null
   src/M1ControlSession.m \
   "$P1SRC/ProtocolCodec.m" \
   "$P1SRC/P1SessionState.m" \
+  "$P1SRC/P1InputCodec.m" \
   control_probe.m \
   -framework Foundation -framework Network -framework Security -framework QuartzCore \
   -o ./control_probe

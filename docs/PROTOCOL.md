@@ -57,6 +57,7 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 ```json
 {"type":"input","seq":N,"displayID":4128835,"event":{
   "kind":"mouse|key|scroll|flags",
+  "displayID":4128835,        // 与消息层同值；两处都带，读任一处均可（见下）
   "x":0.0,"y":0.0,            // 归一化 0..1（相对目标虚拟屏，Renderer 已做坐标变换）
   "button":"left|right|other", "action":"down|up|move|drag",
   "keyCode":0, "unicode":"",   // key：keyCode 为主，IME 组合串走 unicode（A-03）
@@ -65,7 +66,12 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 }}
 ```
 
+- **`displayID` 的位置**：消息层与 `event` 内**都写**，接收方读任一处均可。
+  冻结时（2026-11-17）文档写在消息层，而 `P1InputCodec` 实现放在 `event` 内；
+  2026-11-18（D-17 C-17.3）改为发送时两处都带、接收时 `event` 内缺失则回落到消息层，
+  消除「照文档实现就对不上」的坑。`kind:"flags"` 的 `displayID` 记为 0（不参与屏坐标）。
 - 坐标一律归一化传输，Host 侧乘以目标屏实际 points 尺寸——分辨率协商变化不影响输入通路。
+- 仅 STREAMING 态收发：非该态发送方丢弃并计数，接收方丢弃并计数，都不视为协议错误。
 - 修饰键采用**状态同步**而非逐事件转发：Client 维护状态机，变化时发 `kind:"flags"` 全量；重连后必发一次全量复位。
 - Host 注入速率限制：单会话 ≤ 1000 event/s，超限丢弃 move 类（保留 down/up/key）。
 
@@ -116,4 +122,4 @@ v1 帧头一律按 `BadVersion` 拒绝，不做兼容回退（双端始终同版
 
 - D-01 已决（2026-11-17，QUIC datagram）；**v1 已冻结（2026-11-18 11:20）**。帧通道实现细则（ALPN `macos-rdp-v1`、idle timeout 30s、max UDP payload 1200B、分片上限 1150B）见 D-01 与 §4，由 M1 按此实现，不再作为冻结前置；拥塞控制使用 Network.framework 默认策略，P2 双机实测后再评估调优。
 - 光标通道（FR-10, P2）预留 `type:"cursor"`，本期不实现。
-- 变更记录：v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram）；2026-11-18 分片上限由 1200 下调为 1150 B，并补齐 §3.1 输入编解码与 §2 状态机的单测实现；2026-11-18 11:20 **冻结为 v1**（评审通过，M1 基线），QUIC 实现细则以 D-01 为准，双机端到端实测转入 P2 验收。
+- 变更记录：v1.1-draft 2026-11-18 **§3.1 明确 `displayID` 位置（两处都带）+ 只在 STREAMING 态收发**，实现见 D-17；v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram）；2026-11-18 分片上限由 1200 下调为 1150 B，并补齐 §3.1 输入编解码与 §2 状态机的单测实现；2026-11-18 11:20 **冻结为 v1**（评审通过，M1 基线），QUIC 实现细则以 D-01 为准，双机端到端实测转入 P2 验收。

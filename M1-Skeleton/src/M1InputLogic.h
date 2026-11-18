@@ -26,6 +26,18 @@ uint64_t M1EventFlagsFromDict(NSDictionary<NSString *, NSNumber *> * _Nullable f
 CGPoint M1PointInDisplayRect(double nx, double ny, CGRect displayRect)
     NS_SWIFT_NAME(pointInDisplayRect(nx:ny:rect:));
 
+// 等比适配（letterbox）：把 videoSize 按原比例放进 bounds 并居中，返回画面矩形。
+// 客户端上屏与坐标映射必须用同一个结果，否则「看到的」和「点到的」会错位。
+CGRect M1AspectFitRect(CGSize videoSize, CGRect bounds)
+    NS_SWIFT_NAME(aspectFitRect(videoSize:bounds:));
+
+// 视图坐标 → 协议归一化坐标。
+//   · 视图用 AppKit 默认的左下原点，协议 y=0 是画面顶边，这里负责翻 y；
+//   · videoRect 是 M1AspectFitRect 的结果（不是整个视图，否则黑边会被算进画面）；
+//   · 落在画面外会被 clamp 到 [0,1]——调用方通常先用 scale 判断是否在画面内。
+CGPoint M1NormalizedPointFromViewPoint(CGPoint viewPoint, CGRect videoRect)
+    NS_SWIFT_NAME(normalizedPoint(fromViewPoint:videoRect:));
+
 // 输入事件 → 注入计划字典。计划是可序列化的描述，真实注入由 M1CGEventSink 执行。
 // 返回 nil 表示不支持/非法事件。
 // 计划形状：@{@"kind":..., @"displayID":..., ...}

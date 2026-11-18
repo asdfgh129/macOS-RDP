@@ -68,6 +68,12 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 - (void)controlSessionDidReachStreaming:(M1ControlSession *)session;
 - (void)controlSession:(M1ControlSession *)session didChangeState:(P1SessionState)state;
 - (void)controlSession:(M1ControlSession *)session didFailWithError:(NSError *)error;
+
+// Host 侧：收到客户端输入事件。
+//   · 只在 STREAMING 态回调（PROTOCOL §3.1）；
+//   · 事件已过 P1InputCodec 校验（kind/坐标/键码/flags 合法）与 1000 event/s 限速；
+//   · 回调在控制收包队列上，注入动作若可能阻塞需自行切队列。
+- (void)controlSession:(M1ControlSession *)session didReceiveInputEvent:(NSDictionary *)event;
 @end
 
 @interface M1ControlSession : NSObject <M1ControlChannelDelegate>
@@ -93,6 +99,18 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 @property (nonatomic, readonly, nullable) NSString *sessionID;
 @property (nonatomic, readonly) NSArray<NSDictionary *> *remoteDisplays;
 @property (nonatomic, readonly, nullable) NSError *lastError;
+
+#pragma mark - 输入（PROTOCOL §3.1）
+
+// Client：发一条输入事件（kind/mouse 的 x,y 归一化/...）。
+//   非 STREAMING 态一律不发送也不报错——输入是高频路径，状态抖动不该掀掉会话；
+//   调用方可用 inputEventsDropped 观察。
+- (BOOL)sendInputEvent:(NSDictionary *)event error:(NSError * _Nullable * _Nullable)error;
+
+@property (nonatomic, readonly) NSUInteger inputEventsSent;      // 已发出
+@property (nonatomic, readonly) NSUInteger inputEventsReceived;  // Host 已接受并回调
+@property (nonatomic, readonly) NSUInteger inputEventsDropped;   // 限速丢弃 / 非 STREAMING
+@property (nonatomic, readonly) NSUInteger inputEventsRejected;  // 校验失败（畸形事件）
 
 @end
 

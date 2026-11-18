@@ -9,11 +9,14 @@
 #import "M1SessionCoordinator.h"
 #import "M1DriverLogic.h"
 #import "M1InputLogic.h"
+#import "M1InputInjector.h"
 #import "M1FrameSender.h"
 #import "M1DatagramSink.h"
 #import "M1MessageSink.h"
 #import "M1ControlChannel.h"
 #import "M1ControlSession.h"
+#import "P1InputCodec.h"
+#import <math.h>
 
 static int gPass = 0, gFail = 0;
 static void OK(BOOL cond, const char *name) {
@@ -263,6 +266,69 @@ static void TestInputLogic(void) {
 
     // 非法 kind → nil + error
     OK(M1InjectionPlan(@{ @"kind":@"bogus" }, rect, &err) == nil && err != nil, "plan-bad-kind");
+
+    // ---- 客户端上屏的 letterbox 与坐标反算（M1-B）----
+    // 画面 1920x1080 放进 1000x1000 的视图：等比后 1000x562.5，上下各留 218.75 黑边。
+    CGRect fit = M1AspectFitRect(CGSizeMake(1920, 1080), CGRectMake(0, 0, 1000, 1000));
+    OK(fabs(fit.size.width - 1000) < 1e-9 && fabs(fit.size.height - 562.5) < 1e-9,
+       "fit-size");
+    OK(fabs(fit.origin.x) < 1e-9 && fabs(fit.origin.y - 218.75) < 1e-9, "fit-origin-centered");
+
+    // 竖屏源放进横屏视图：高度受限
+    CGRect fitTall = M1AspectFitRect(CGSizeMake(1080, 1920), CGRectMake(0, 0, 1000, 1000));
+    OK(fabs(fitTall.size.height - 1000) < 1e-9 && fabs(fitTall.size.width - 562.5) < 1e-9,
+       "fit-tall-height-bound");
+
+    // 退化输入不得除零
+    CGRect fitBad = M1AspectFitRect(CGSizeMake(0, 0), CGRectMake(0, 0, 1000, 1000));
+    OK(fitBad.size.width == 1000 && fitBad.size.height == 1000, "fit-degenerate-passthrough");
+
+    // 视图坐标 → 归一化：视图原点在左下，协议 y=0 在顶边，必须翻 y
+    CGPoint centerPt = M1NormalizedPointFromViewPoint(
+        CGPointMake(CGRectGetMidX(fit), CGRectGetMidY(fit)), fit);
+    OK(fabs(centerPt.x - 0.5) < 1e-9 && fabs(centerPt.y - 0.5) < 1e-9, "norm-center");
+
+    CGPoint topLeft = M1NormalizedPointFromViewPoint(
+        CGPointMake(CGRectGetMinX(fit), CGRectGetMaxY(fit)), fit);
+    OK(fabs(topLeft.x) < 1e-9 && fabs(topLeft.y) < 1e-9, "norm-top-left");
+
+    CGPoint bottomRight = M1NormalizedPointFromViewPoint(
+        CGPointMake(CGRectGetMaxX(fit), CGRectGetMinY(fit)), fit);
+    OK(fabs(bottomRight.x - 1.0) < 1e-9 && fabs(bottomRight.y - 1.0) < 1e-9,
+       "norm-bottom-right");
+
+    // 落在黑边上：clamp 到边界（调用方本该先判 CGRectContainsPoint 丢掉）
+    CGPoint inBar = M1NormalizedPointFromViewPoint(CGPointMake(500, 10), fit);
+    OK(fabs(inBar.y - 1.0) < 1e-9, "norm-bar-clamped");
+
+    // 上屏坐标 → 归一化 → 注入计划，必须回到同一个物理点（往返一致性）
+    CGRect hostRect = CGRectMake(0, 0, 3440, 1440);
+    CGPoint viewPt = CGPointMake(CGRectGetMinX(fit) + fit.size.width * 0.25,
+                                 CGRectGetMinY(fit) + fit.size.height * 0.75);
+    CGPoint norm = M1NormalizedPointFromViewPoint(viewPt, fit);
+    CGPoint back = M1PointInDisplayRect(norm.x, norm.y, hostRect);
+    // 视图 y=0.75（偏上）翻成协议 y=0.25（偏上），3440x1440 下就是 860,360
+    OK(fabs(norm.y - 0.25) < 1e-9, "norm-roundtrip-flip");
+    OK(fabs(back.x - 860) < 1e-6 && fabs(back.y - 360) < 1e-6, "norm-roundtrip");
+
+    // 注入器 + 记录型 sink：确认「归一化事件 → 全局座标」这一跳真的走了 sink
+    M1RecordingEventSink *rec = [[M1RecordingEventSink alloc] init];
+    M1InputInjector *inj = [[M1InputInjector alloc] initWithSink:rec];
+    inj.targetDisplayRect = hostRect;
+    NSError *injErr = nil;
+    OK([inj injectEvent:@{ @"kind":@"mouse", @"displayID":@1000, @"x":@0.5, @"y":@0.5,
+                           @"button":@"left", @"action":@"move", @"flags":@{} } error:&injErr],
+       "inject-mouse-ok");
+    OK(rec.postCount == 1, "inject-recorded");
+    NSDictionary *recPlan = rec.plans.firstObject;
+    OK([recPlan[@"x"] doubleValue] == 1720 && [recPlan[@"y"] doubleValue] == 720,
+       "inject-plan-center");
+    OK([inj injectEvent:@{ @"kind":@"flags", @"flags":@{ @"shift":@1 } } error:&injErr],
+       "inject-flags-ok");
+    OK(rec.postCount == 2 && [rec.plans.lastObject[@"flags"] unsignedLongLongValue] == (1ULL<<17),
+       "inject-flags-recorded");
+    [rec reset];
+    OK(rec.postCount == 0, "inject-record-reset");
 }
 
 #pragma mark - 帧管线：分片发送与重组一致性
@@ -539,11 +605,19 @@ static void TestControlChannel(void) {
 
 @interface M1TestSessionWatcher : NSObject <M1ControlSessionDelegate>
 @property (nonatomic, strong, nullable) NSError *error;
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *inputs;
 @end
 
 @implementation M1TestSessionWatcher
+- (instancetype)init {
+    if ((self = [super init])) _inputs = [NSMutableArray array];
+    return self;
+}
 - (void)controlSession:(M1ControlSession *)session didFailWithError:(NSError *)error {
     if (!self.error) self.error = error;
+}
+- (void)controlSession:(M1ControlSession *)session didReceiveInputEvent:(NSDictionary *)event {
+    [_inputs addObject:event];
 }
 @end
 
@@ -602,6 +676,9 @@ static NSDictionary *RunPairFull(NSString *clientCode, NSString *hostCode,
     Pump(pending);
 
     return @{ @"client": client, @"host": host,
+              @"clientWatcher": cw, @"hostWatcher": hw,
+              @"clientChannel": cCh, @"hostChannel": hCh,
+              @"pending": pending,
               @"clientError": cw.error ?: (id)[NSNull null],
               @"hostError": hw.error ?: (id)[NSNull null] };
 }
@@ -659,6 +736,80 @@ static void TestControlSessionPairingCode(void) {
        "ctl-fingerprint-mismatch-not-streaming");
 }
 
+#pragma mark - 控制会话（输入通路）
+
+// 输入是对外行为的核心：坐标一旦偏了，画面再清晰也没法用。
+// 这里钉住四件事：事件原样到达、畸形事件被拒不掀会话、非 STREAMING 静默丢弃、
+// Host 不能反向发 input。
+static void TestControlSessionInput(void) {
+    printf("=== control session (input) ===\n");
+    NSDictionary *r = RunPair(nil, nil, FP(@"ab"), FP(@"cd"));
+    M1ControlSession *client = r[@"client"];
+    M1ControlSession *host = r[@"host"];
+    M1TestSessionWatcher *hw = r[@"hostWatcher"];
+    NSMutableArray<NSArray *> *pending = r[@"pending"];
+    OK(client.reachedStreaming && host.reachedStreaming, "in-both-streaming");
+
+    NSError *err = nil;
+    OK([client sendInputEvent:P1MakeMouseEvent(1000, 0.25, 0.75, @"left", @"move", nil)
+                        error:&err], "in-send-mouse");
+    Pump(pending);
+    OK(hw.inputs.count == 1, "in-host-received");
+    OK([hw.inputs.firstObject[@"kind"] isEqualToString:@"mouse"], "in-kind-mouse");
+    OK(fabs([hw.inputs.firstObject[@"x"] doubleValue] - 0.25) < 1e-9 &&
+       fabs([hw.inputs.firstObject[@"y"] doubleValue] - 0.75) < 1e-9,
+       "in-coords-preserved");
+    OK([hw.inputs.firstObject[@"displayID"] intValue] == 1000, "in-displayid-preserved");
+    OK([hw.inputs.firstObject[@"button"] isEqualToString:@"left"], "in-button-preserved");
+
+    OK([client sendInputEvent:P1MakeKeyEvent(1000, 0, @"A", @{ @"cmd": @1 }) error:&err],
+       "in-send-key");
+    OK([client sendInputEvent:P1MakeScrollEvent(1000, 0, -12, nil) error:&err], "in-send-scroll");
+    OK([client sendInputEvent:P1MakeFlagsEvent(@{ @"cmd": @0 }) error:&err], "in-send-flags");
+    Pump(pending);
+    OK(hw.inputs.count == 4, "in-multi-received");
+    OK([hw.inputs[1][@"unicode"] isEqualToString:@"A"], "in-key-unicode");
+    OK([hw.inputs[1][@"flags"][@"cmd"] boolValue], "in-key-flags-preserved");
+    OK(fabs([hw.inputs[2][@"dy"] doubleValue] + 12.0) < 1e-9, "in-scroll-preserved");
+    OK([hw.inputs[3][@"kind"] isEqualToString:@"flags"], "in-flags-kind");
+    OK([client inputEventsSent] == 4, "in-sent-count");
+
+    // 畸形事件（坐标越界）：拒绝、计数、不过线、不掀会话
+    NSUInteger sentBefore = client.inputEventsSent;
+    OK(![client sendInputEvent:@{ @"kind": @"mouse", @"x": @2.0, @"y": @0.5 } error:&err],
+       "in-reject-bad-coord");
+    OK(client.inputEventsRejected == 1 && client.inputEventsSent == sentBefore,
+       "in-reject-counted");
+    Pump(pending);
+    OK(hw.inputs.count == 4, "in-reject-not-delivered");
+    OK(client.lastError == nil && host.reachedStreaming, "in-reject-keeps-session");
+
+    // displayID 写在消息层（PROTOCOL §3.1 文档写法）时 Host 也要能取到——
+    // 否则「文档照抄的客户端」推到真机就是 displayID=0、输入落不到目标屏。
+    M1ControlChannel *cCh = r[@"clientChannel"];
+    OK([cCh sendMessage:@{ @"type": @"input", @"displayID": @777,
+                           @"event": @{ @"kind": @"flags", @"flags": @{} } } error:&err],
+       "in-message-level-displayid-send");
+    Pump(pending);
+    OK([hw.inputs.lastObject[@"displayID"] intValue] == 777, "in-message-level-displayid");
+
+    // Host 反向发 input 不合法
+    OK(![host sendInputEvent:P1MakeFlagsEvent(nil) error:&err], "in-host-cannot-send");
+
+    // 未进入 STREAMING：丢弃而不是报错（输入是高频路径，状态抖动不该中断会话）
+    M1MemoryMessageSink *deadSink = [M1MemoryMessageSink new];
+    M1ControlChannel *deadCh = [[M1ControlChannel alloc] initWithSink:deadSink];
+    M1ControlSessionConfig *cfg = [M1ControlSessionConfig new];
+    cfg.role = M1ControlRoleClient;
+    cfg.heartbeatIntervalMs = 0;
+    M1ControlSession *lone = [[M1ControlSession alloc] initWithChannel:deadCh config:cfg];
+    NSError *preErr = nil;
+    OK(![lone sendInputEvent:P1MakeMouseEvent(1, 0.5, 0.5, @"left", @"move", nil)
+                        error:&preErr], "in-pre-streaming-dropped");
+    OK(lone.inputEventsDropped == 1, "in-pre-streaming-drop-counted");
+    OK(preErr.code == M1ControlSessionErrorInvalidState, "in-pre-streaming-error-code");
+}
+
 int main(void) {
     @autoreleasepool {
         TestPairing();
@@ -670,6 +821,7 @@ int main(void) {
         TestControlChannel();
         TestControlSessionOverPipe();
         TestControlSessionPairingCode();
+        TestControlSessionInput();
         printf("\n=== %d passed, %d failed ===\n", gPass, gFail);
         printf("%s\n", gFail == 0 ? "ALL PASS" : "FAILURES");
         return gFail == 0 ? 0 : 1;

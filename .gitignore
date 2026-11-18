@@ -59,3 +59,5 @@ M1-Skeleton/test_skeleton
 M1-Skeleton/guardian_handshake_test
 M1-Skeleton/stream_probe
 M1-Skeleton/vt_session_cost
+M1-Skeleton/cursor_move
+M1-Skeleton/render_selftest

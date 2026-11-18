@@ -32,6 +32,15 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) pid_t targetPID;
 @end
 
+// 只记录不注入的 sink。
+// 两个用途：单测断言「归一化事件被换算成哪个屏幕座标」；单机环回验证时
+// 不能真把光标移走（本机既是 Host 又是 Client，真注入会自己踩自己）。
+@interface M1RecordingEventSink : NSObject <M1EventSink>
+@property (nonatomic, readonly) NSArray<NSDictionary *> *plans;   // 已记录的注入计划
+@property (nonatomic, readonly) NSUInteger postCount;
+- (void)reset;
+@end
+
 @interface M1InputInjector : NSObject
 
 // 目标显示坐标：注入时把归一化坐标映射到该 rect。禁屏后通常是唯一 active 虚拟屏。

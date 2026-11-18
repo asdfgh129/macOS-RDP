@@ -11,6 +11,7 @@ SOURCES=(
   "src/M1SessionCoordinator.m"
   "src/M1DriverLogic.m"
   "src/M1InputLogic.m"
+  "src/M1InputInjector.m"
   "src/M1PipelineTypes.m"
   "src/M1DatagramSink.m"
   "src/M1FrameSender.m"
@@ -19,6 +20,7 @@ SOURCES=(
   "src/M1ControlSession.m"
   "$P1SRC/ProtocolCodec.m"
   "$P1SRC/P1SessionState.m"
+  "$P1SRC/P1InputCodec.m"
   "tests/test_skeleton.m"
 )
 for f in "${SOURCES[@]}"; do
@@ -27,7 +29,7 @@ done
 "$CLANG" -fobjc-arc -fmodules -O0 -g -mmacosx-version-min=13.0 \
   -isysroot "$SDKROOT" -I src -I "$P1SRC" \
   -Wall -Wno-unused-parameter \
-  "${SOURCES[@]}" -framework Foundation -o ./test_skeleton
+  "${SOURCES[@]}" -framework Foundation -framework ApplicationServices -o ./test_skeleton
 ./test_skeleton
 
 # 负向安全测试：宿主没实现 --guardian 时，守护握手必须失败（禁止无兜底禁屏）。
