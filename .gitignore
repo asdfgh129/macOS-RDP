@@ -25,4 +25,5 @@ __pycache__/
 P0V-RootDaemon/build/
 P0V-SessionRecon/recon
 P0V-DisplayIsolation/v01probe
+P0V-AltCapture/altprobe
 P0-TahoeProbe/last_min.log

@@ -80,13 +80,13 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 | 8 | frameSeq | 4 | 单调递增，重组与丢帧判据 |
 | 12 | fragIdx | 1 | 分片序号 |
 | 13 | fragCount | 1 | 总分片数（≤255） |
-| 14 | payloadLen | 2 | 本分片载荷字节数（≤1200，见下方 D-01 说明） |
+| 14 | payloadLen | 2 | 本分片载荷字节数（≤1150，见下方 D-01 说明） |
 
 载荷：AVCC（长度前缀 NALU）；关键帧分片带 SPS/PPS（flags bit2）。pts 不随帧传——实时流以到达时间渲染，延迟统计走控制通道 `heartbeat.ts` 回环。
 
 丢帧策略：FrameReceiver 检测 frameSeq 缺口 → 丢弃该帧全部分片 → `keyframe-request`；解码器在关键帧到达前不产出。旧帧迟到直接丢弃（实时性优先）。已由 `P1FrameReassembler` 实现并单测。
 
-**D-01 补充**：帧通道已定为 QUIC datagram（`nw_quic_set_stream_is_datagram`）。QUIC short header + AEAD tag 约 20–30 B，实际下发建议按 **1150 B** 分片（当前实现常量 1200，需在 P2 联调前下调并同步单测）。
+**D-01 补充**：帧通道已定为 QUIC datagram（`nw_quic_set_stream_is_datagram`）。QUIC short header + AEAD tag 约 20–30 B，分片上限已按 **1150 B** 下调（`P1FrameMaxPayload`），为 1200 B MTU 留出头部余量；帧头 payloadLen 与分片器共用该常量，并已同步单测。
 
 ## 5. 错误码（session-error.code）
 
@@ -110,4 +110,4 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 
 - D-01 已决（2026-11-17，QUIC datagram）；待补帧通道握手/ALPN/拥塞控制参数后冻结为 v1。
 - 光标通道（FR-10, P2）预留 `type:"cursor"`，本期不实现。
-- 变更记录：v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram），并标注分片 1150 B 待调。
+- 变更记录：v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram）；2026-11-18 分片上限由 1200 下调为 1150 B，并补齐 §3.1 输入编解码与 §2 状态机的单测实现（仍待双机端到端冻结 v1）。

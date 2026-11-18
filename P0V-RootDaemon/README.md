@@ -189,3 +189,18 @@ p0vprobe capture --ms 1500
 2. 注入用的是 `CGEventPostToPid(loginwindow)`；若被拒，备选是 `CGEventPostToPSN`、或先 `CGSGetSessionConnection` 拿到登录会话连接再投递。
 3. 单屏（主屏）测试。多屏登录窗行为未覆盖。
 4. 未处理 Secure Input 对注入的影响（注入 v.s. 监听是两回事，Secure Input 主要挡监听，理论上不影响投递，但没实测）。
+
+## 2026-11-18 Tahoe 26.5.2 实测（用户会话路径）
+
+探针新增 `lock`（调用 `SACLockScreenImmediate`）、`capture --display ID`、
+`inject-test --text STR`，用于自动化锁屏态验证。
+
+| 项 | 结果 | 证据 |
+|---|---|---|
+| V-04a 锁屏捕获 | ✅ `session.screenIsLocked=true`、`HAS_CONTENT`、17 帧、0 黑帧 | `/tmp/tahoe-20261118-r2-v04a.json` |
+| V-04b 定向注入 | ⚠️ 未确认：r1 用 `aa` 后用户手动解锁，判据污染；r2 改用 `zzzzzzzz` 但抓屏时会话已解锁、256/256 格无变化 | `/tmp/tahoe-20261118-{,r2-}v04b.json` |
+| V-04c 正确密码解锁 | 未测（不向助手提供凭据） | — |
+| V-04d 登录窗建屏+禁屏 | ❌ 不成立：锁屏态虚拟屏 `active=false`；一次抓屏发生在解锁后，数据无效 | `docs/RESULTS-BY-OS.md` §3.3 |
+
+**Tahoe 上 Path A 不成立，不能沿用 Sequoia 的用户态锁屏结论。** 完整按 OS 分离的结论见
+`docs/RESULTS-BY-OS.md`。

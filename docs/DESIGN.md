@@ -2,11 +2,12 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v0.3-draft |
-| 日期 | 2026-11-17 |
+| 文档版本 | v1.0-draft |
+| 日期 | 2026-11-18 |
 | 状态 | **草稿，待评审**；A-01 已于 2026-11-17 关闭（单屏 P0 通过），定稿仍须关闭 A-02 |
 | 关联工程 | `P0-TahoeProbe/`（可行性探针；Tahoe 26.5.2 建屏/捕获/编码/HiDPI 全通过，见其 README §13–§15）；`P0V-SessionRecon/`（独占会话能力侦察，见其 README）；`P1-ClientProbe/`（协议编解码 + 坐标变换） |
 | 评审记录 | 无（首次起草） |
+| 实测结论 | **按 OS 分离记录于 `docs/RESULTS-BY-OS.md`**；Sequoia 15.5 与 Tahoe 26.5.2 的结论禁止互相外推 |
 
 ---
 
@@ -110,8 +111,8 @@
 | A-05 | HiDPI（2x points/pixels）与混合缩放渲染正确 | P1 渲染探针 | 本期只支持 1x，HiDPI 降级为 P2 |
 | A-06 | 安全更新不破坏私有 SPI | 每次更新后 probe+verify 回归（NFR-08） | 版本锁定回滚 + 社区补丁跟进 |
 | A-07 | Ventura 13 / Sonoma 14 上私有 SPI 与 Sequoia 行为一致（selector 已在 15/26/27 复核一致，13/14 未实测） | 各版本真机 probe+verify（P0-R，M3 前关闭） | OS 策略按版本加分支；个别版本不支持则从适配范围剔除并记录 |
-| **A-08** | 独占态的物理屏可以「只对现场置黑」，且不影响虚拟屏的建屏与捕获：`SLSConfigureDisplayEnabled` 在显示配置事务内可提交 | **P0-V**：V-01 禁用**一块**物理屏后虚拟屏仍 `HAS_CONTENT`，且按键/触控板/触控 ID 等唤醒事件**不会**把物理屏重新 enable；V-03 禁用**全部**物理屏（只剩虚拟屏）后系统仍可建屏/捕获/注入输入（C-09 的极限情形，但**建屏必须在禁用物理屏之前完成**：Sequoia/Intel 实测，零 active 物理屏 + 残留槽位时新建虚拟屏会触发 WindowServer `canonical_mirror_master` 断言）；V-02 锁屏态下 a) 能否捕获到锁屏界面而非黑帧、b) 能否把键鼠注入 loginwindow、c) 能否用注入密码完成解锁 | 退化为公开 API：`CGDisplayCapture` 独占物理屏 + 高窗口层遮罩 + **强制光标接管**（D-05 §3），并把「非绝对安全」写进产品说明 |
-| **A-09** | Host 在锁屏 / 登录窗态下，远程仍能拿到登录界面并完成登录（从而"断开后锁屏"与"可重连"同时成立） | **P0-V V-04a/b/c/d**（SCK 捕获登录窗、定向注入、注入密码解锁、登录窗态建虚拟屏）。见 D-08。**Sequoia 15.5 实测：V-04a/b 在用户会话进程通过（锁屏截图真实、`INJECTION_ACCEPTED_UI_CHANGED`、密码框出现输入）；root daemon 路径被 TCC 路径条目 + 无 GUI 会话挡住。** V-04c 待凭据，V-04d 未实现 | 四项任一失败 → 退回 Path B：Host 常驻登录态、禁闲置锁屏、"断开后锁屏"降级为可选（D-07） |
+| **A-08** | 独占态的物理屏可以「只对现场置黑」，且不影响虚拟屏的建屏与捕获：`SLSConfigureDisplayEnabled` 在显示配置事务内可提交 | **P0-V**：V-01 禁用**一块**物理屏后虚拟屏仍 `HAS_CONTENT`，且按键/触控板/触控 ID 等唤醒事件**不会**把物理屏重新 enable；V-03 禁用**全部**物理屏（只剩虚拟屏）后系统仍可建屏/捕获/注入输入（C-09 的极限情形，但**建屏必须在禁用物理屏之前完成**：Sequoia/Intel 实测，零 active 物理屏 + 残留槽位时新建虚拟屏会触发 WindowServer `canonical_mirror_master` 断言）；V-02 锁屏态下 a) 能否捕获到锁屏界面而非黑帧、b) 能否把键鼠注入 loginwindow、c) 能否用注入密码完成解锁。**2026-11-18 Tahoe 26.5.2：V-01 全项 PASS；V-03 的禁屏/指针/注入/20–30s 无重新 enable/恢复全通过，但 SCK 在零 active 物理屏下 4 次运行出现 1 次全黑、2 次多数帧黑、1 次白色窗口对照仍全黑；系统截图证明桌面仍在正常合成 ⇒ SCK 送帧异常，A-08 在 Tahoe 未关闭**；2026-11-18 追加：V-02 锁屏态虚拟屏创建后 `active=false`，不成立；替代采集路径 `CGDisplayCreateImage`/`CGWindowListCreateImage` 在零 active 物理屏下稳定 `HAS_CONTENT`（见 `docs/RESULTS-BY-OS.md`） | 退化为公开 API：`CGDisplayCapture` 独占物理屏 + 高窗口层遮罩 + **强制光标接管**（D-05 §3），并把「非绝对安全」写进产品说明 |
+| **A-09** | Host 在锁屏 / 登录窗态下，远程仍能拿到登录界面并完成登录（从而"断开后锁屏"与"可重连"同时成立） | **P0-V V-04a/b/c/d**（SCK 捕获登录窗、定向注入、注入密码解锁、登录窗态建虚拟屏）。见 D-08。**Sequoia 15.5 实测：V-04a/b 在用户会话进程通过（锁屏截图真实、`INJECTION_ACCEPTED_UI_CHANGED`、密码框出现输入）；root daemon 路径被 TCC 路径条目 + 无 GUI 会话挡住。** V-04c 待凭据，V-04d 未实现。**2026-11-18 Tahoe 26.5.2：V-04a 通过（锁屏态 `HAS_CONTENT`，17 帧、0 黑帧）；V-04b 因用户手动解锁/提前解锁两次判据污染，未确认；V-04c 未测；V-04d 因锁屏态虚拟屏无法 active 而不成立** | 四项任一失败 → 退回 Path B：Host 常驻登录态、禁闲置锁屏、"断开后锁屏"降级为可选（D-07） |
 
 ---
 
@@ -276,9 +277,9 @@ Client 窗口坐标 → 归一化到对应虚拟屏坐标 → 控制通道 → H
 |---|---|---|---|
 | P0 | 被控端链路探针（Sequoia 基线） | verify pass（双屏+编码环回） | **已完成 2026-11-16** |
 | P0-T | Tahoe 真机 P0（README §11 交接清单） | 真机 verdict.pass=true，诊断包回传 | ✅ **建屏/捕获/编码/HiDPI/多屏容量 全部通过 2026-11-17**（`encode_rc=0 hidpi_rc=0`；2 物理+4 虚拟=6 屏在线，README §14–§16）。注：§16.2「捕获优先」结论已作废（镜像语义，见 D-04） |
-| **P0-V** | **独占会话能力验证**：物理屏 disable 后可与虚拟屏共存且不被唤醒事件重新 enable（V-01）、全部物理屏 disable 的极限情形（V-03）、锁屏态下建屏与采集（V-02） | A-08 关闭：`SLSConfigureDisplayEnabled` 在事务内提交成功且虚拟屏仍 `HAS_CONTENT` | 侦察已完成（`P0V-SessionRecon/`）；root daemon 探针已就绪（`P0V-RootDaemon/`，TCC 待人工授权）；**V-01 已通过（Sequoia 15.5：禁用一块屏，虚拟屏 `HAS_CONTENT`、SCK 干净、指针逐屏 0 偏差且不入禁用屏、输入注入通过、20s 唤醒观察 0 次重新 enable、恢复精确）。V-03 核心已完整通过（3 块全禁、60fps `HAS_CONTENT`、SCK 干净、指针 0 偏差、输入注入通过、20s 唤醒观察 0 次重新 enable、恢复精确）；但重建测试（零物理屏下创建第 2 块虚拟屏）触发 WindowServer `canonical_mirror_master` 断言崩溃，根因是 WindowServer 的 5 个停放槽位（`0xFFFFFFFF/offline/1x1`）。已实测该槽位**无法从用户态清除**（`CDVirtualDisplayDestroy` 只收进程内 client、`SL2CDVirtualDisplayDestroy` 只查本进程表、同身份重建不复用旧槽位、休眠/唤醒只回收在线孤儿），注销/重启是唯一路径。探针改为检测槽位后**自动跳过该子项**、V-03 核心照常执行，不再要求重启；`--count > 1` 需 `--allow-stale-slots`。**M1 据此加硬约束：全部虚拟屏必须在禁用物理屏之前建齐，会话期间不得新建虚拟屏。** V-02 未开始；V-04a/b 已在用户会话路径通过（锁屏真实可捕获、注入被 loginwindow 接受），root daemon 路径因 TCC 路径条目 + 无 GUI 会话失败，V-04c 按决定记为未测（主动跳过，留待正式签名后验证）、V-04d 未实现，Path A 形态改为“正确签名的用户态 App + 用户授权”；M1 会话层开工前必须关闭 V-02 与 V-04c/d** |
+| **P0-V** | **独占会话能力验证**：物理屏 disable 后可与虚拟屏共存且不被唤醒事件重新 enable（V-01）、全部物理屏 disable 的极限情形（V-03）、锁屏态下建屏与采集（V-02） | A-08 关闭：`SLSConfigureDisplayEnabled` 在事务内提交成功且虚拟屏仍 `HAS_CONTENT` | 侦察已完成（`P0V-SessionRecon/`）；root daemon 探针已就绪（`P0V-RootDaemon/`，TCC 待人工授权）；**V-01 已通过（Sequoia 15.5：禁用一块屏，虚拟屏 `HAS_CONTENT`、SCK 干净、指针逐屏 0 偏差且不入禁用屏、输入注入通过、20s 唤醒观察 0 次重新 enable、恢复精确）。V-03 核心已完整通过（3 块全禁、60fps `HAS_CONTENT`、SCK 干净、指针 0 偏差、输入注入通过、20s 唤醒观察 0 次重新 enable、恢复精确）；但重建测试（零物理屏下创建第 2 块虚拟屏）触发 WindowServer `canonical_mirror_master` 断言崩溃，根因是 WindowServer 的 5 个停放槽位（`0xFFFFFFFF/offline/1x1`）。已实测该槽位**无法从用户态清除**（`CDVirtualDisplayDestroy` 只收进程内 client、`SL2CDVirtualDisplayDestroy` 只查本进程表、同身份重建不复用旧槽位、休眠/唤醒只回收在线孤儿），注销/重启是唯一路径。探针改为检测槽位后**自动跳过该子项**、V-03 核心照常执行，不再要求重启；`--count > 1` 需 `--allow-stale-slots`。**M1 据此加硬约束：全部虚拟屏必须在禁用物理屏之前建齐，会话期间不得新建虚拟屏。** V-02 未开始；V-04a/b 已在用户会话路径通过（锁屏真实可捕获、注入被 loginwindow 接受），root daemon 路径因 TCC 路径条目 + 无 GUI 会话失败，V-04c 按决定记为未测（主动跳过，留待正式签名后验证）、V-04d 未实现，Path A 形态改为“正确签名的用户态 App + 用户授权”；M1 会话层开工前必须关闭 V-02 与 V-04c/d**。2026-11-18 在 Tahoe 26.5.2 重建 `v01probe` 并完成只读 `probe` + `--dry-run`：SCK 可见 2 物理屏、私有符号可解析、虚拟屏建屏与 `HAS_CONTENT` 通过（6 个停放槽位仍在，单块建屏不受影响）；**AX 授权后 2026-11-18 实测：V-01 全项 PASS；V-03 显示隔离机制全通过但 SCK 在零 active 物理屏下送帧不稳定（4 次中 1 次全黑、2 次多数帧黑、白色窗口对照仍全黑，系统截图证明桌面正常合成）。A-08 在 Tahoe 未关闭，需先验证替代采集路径或按 D-05 降级** |
 | P0-R | Ventura/Sonoma 真机回归（probe+verify，可借测机器，与 P1 并行） | 13/14 各出基线报告（A-07 关闭） | M3 前完成 |
-| P1 | 控制端探针 `P1-ClientProbe/`：硬解+Metal 渲染、N 窗口坐标、IME 注入 | §7 四项各出实证报告 | 待启动 |
+| P1 | 控制端探针 `P1-ClientProbe/`：硬解+Metal 渲染、N 窗口坐标、IME 注入 | §7 四项各出实证报告 | 协议层（输入编解码/状态机/1150B 分片）2026-11-18 完成，140 断言全过；**硬解+Metal 渲染、A-03 IME 双机实证未做** |
 | P2 | 双机联调 spike：glass-to-glass 延迟 | NFR-01/02 达标或降级结论（A-02 关闭） | 依赖 P0-T、P1 |
 | **M1** | 产品骨架：MIT 基座集成 + 本文档模块划分落地 + 控制协议 v1 | 单屏会话端到端跑通（发现/配对/推流/输入） | A-01 已关闭；**仍待 A-02**（glass-to-glass 延迟），M1 可先做不依赖延迟数据的骨架工作 |
 | M2 | 多屏 + 完整输入（IME/修饰键/沉浸模式）+ 动态协商 | FR-05/06/07 验收 | |
@@ -321,3 +322,6 @@ Client 窗口坐标 → 归一化到对应虚拟屏坐标 → 控制通道 → H
 | v0.5-draft | 2026-11-17 | 编码面与 HiDPI 面通过（`encode_rc=0 hidpi_rc=0`）；新增两条硬约束：**HiDPI 必须在 `initWithDescriptor:` 一次给足（事后 `applySettings` 静默无效）**、**不得对同屏重复提交相同模式（会清屏为纯黑）**；P0-T 仅剩双虚拟屏未测；协议 D-01/D-02 已定 | WorkBuddy 协助核对 |
 | v0.6-draft | 2026-11-17 | **架构修正**：实测 2 物理+4 虚拟=6 屏在线，虚拟屏不占 Intel DDI 通道 → 推翻「UHD 630 三屏上限会卡住虚拟屏」的错误推论，A-04 关闭；新增 **D-03 捕获优先**（有物理屏则 0 建屏直接采，首帧 124ms）并据此改写 FR-01；明确与 RDP 的本质差距是「会话隔离」而非「屏数」 | WorkBuddy 协助核对 |
 | v0.7-draft | 2026-11-17 | **产品形态澄清（用户纠正）**：目标是独占式会话，不是 VNC 镜像 —— 新增 FR-00 独占、改写 FR-01 为「只建虚拟屏、绝不捕获物理屏」、新增 C-07 禁止镜像 / C-08 单会话模型、A-08 物理屏置黑假设、P0-V 里程碑；作废 D-03 捕获优先 | WorkBuddy 协助核对 |
+| v0.8-draft | 2026-11-18 | Tahoe 环境巡检：`v01probe` 重建 + `probe`/`--dry-run` 通过（AX 未授权，禁屏实测待做）；P1 协议层补齐输入事件编解码、会话状态机、1150B 分片上限，单测 140 断言全过 | WorkBuddy 协助核对 |
+| v0.9-draft | 2026-11-18 | Tahoe V-01 全项 PASS；V-03 显示隔离机制通过但 SCK 在零 active 物理屏下送不稳定（系统截图有内容、SCK 帧多黑/全黑，白色窗口对照仍全黑），A-08 在 Tahoe 未关闭，新增替代采集路径验证或 D-05 降级的前置工作 | WorkBuddy 协助核对 |
+| v1.0-draft | 2026-11-18 | 建立 `docs/RESULTS-BY-OS.md` 按 OS 分离结论；Tahoe V-02 不成立（锁屏态虚拟屏 `active=false`）、V-04a 通过、V-04b 未确认、V-04c 未测、V-04d 不成立；`CGDisplayCreateImage`/`CGWindowListCreateImage` 在零 active 物理屏下稳定可用，SCK 不稳定。Path A 在 Tahoe 不成立，M1 采集层改以公开抓屏 API 为候选 | WorkBuddy 协助核对 |

@@ -164,6 +164,9 @@ int main(void) {
                err.code == P1ProtocolErrorTruncated, "header-truncated");
 
         // ---------------- 分片与重组 ----------------
+        // D-01：QUIC 头空间安全值 1150，留出 1200B MTU 的余量
+        ExpectInt((long)P1FrameMaxPayload, 1150, "frame-max-payload-1150");
+        Expect(P1FrameMaxPayload + 50 <= 1200, "datagram-headroom-ok");
         NSMutableData *payload = [NSMutableData data];
         for (int i = 0; i < 3000; i++) {
             uint8_t b = (uint8_t)(i & 0xFF);

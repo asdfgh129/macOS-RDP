@@ -110,3 +110,10 @@ Apple 支持文档《Screen sharing type options on Mac》（macOS 14+）：
 bash run.sh                 # 只读侦察
 bash run.sh --test-config   # 额外验证「开显示事务 → 取消」（不提交变更）
 ```
+
+## 2026-11-18 Tahoe 26.5.2 实测补记（V-02）
+
+- `p0vprobe lock` 调用 `SACLockScreenImmediate` 可程序化锁屏，实测 `screenIsLocked=true`（见 `P0V-RootDaemon`）。
+- 锁屏后 active 集合里**已没有物理屏**，`v01probe --dry-run` 因「没有可禁用的物理屏」直接 `ABORTED`（`/tmp/tahoe-20261118-r2-v02-dryrun.log`）。
+- `P0V-AltCapture/altprobe --no-disable` 在锁屏态能创建虚拟屏 4128835、mode 1280×720 提交成功，但 8s liveness 内始终 `online=true / active=false / usable=0`，退出码 2（`/tmp/tahoe-20261118-v02lock-alt.log`）。
+- **结论：V-02 在 Tahoe 不成立——锁屏态建不出 active 虚拟屏**。Sequoia 未测，不可外推。详细说明见 `docs/RESULTS-BY-OS.md`。

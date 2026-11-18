@@ -33,7 +33,7 @@ extern const NSUInteger P1ControlMaxFrameBytes;
 extern const uint16_t P1FrameMagic;        // 0x4D52 'MR'
 extern const uint8_t  P1ProtocolVersion;   // 1
 extern const NSUInteger P1FrameHeaderSize; // 16
-extern const NSUInteger P1FrameMaxPayload; // 1200（MTU 安全值）
+extern const NSUInteger P1FrameMaxPayload; // 1150（QUIC datagram 头空间安全值）
 
 typedef NS_OPTIONS(uint8_t, P1FrameFlags) {
     P1FrameFlagKeyframe      = 1 << 0,  // bit0

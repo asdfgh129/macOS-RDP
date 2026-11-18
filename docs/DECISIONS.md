@@ -5,6 +5,7 @@
 | 版本 | v0.1 |
 | 日期 | 2026-11-17 |
 | 上位文档 | `docs/DESIGN.md`（§4.3 传输、§5 模块）、`docs/PROTOCOL.md` |
+| 实测结论 | 按 OS 分离记录于 `docs/RESULTS-BY-OS.md`；决策中的实测证据均须标注 OS/build |
 | 状态 | **提议，待评审确认**。确认后 D-01 冻结 PROTOCOL v1 的帧通道细节 |
 
 ---
@@ -211,6 +212,7 @@ Host 不为每个会话预先创建虚拟屏。会话开始时的供给顺序是
   - 同日 22:15 **V-01 通过**（`--mode one --watch-secs 20`）：禁用的物理屏退出 active，虚拟屏 `HAS_CONTENT`，SCK 干净，指针逐屏采样 0 偏差且 0 次落入禁用屏，输入注入 `axTrusted=1` 通过，20s 唤醒观察 0 次重新 enable，恢复后 bounds/主屏身份精确回原值。**V-01 在 Sequoia 15.5 / Macmini8,1 关闭。** 注意：禁用一块屏期间 WindowServer 会临时重排剩余物理屏（模式/位置变化），恢复后还原；M1 窗口布局快照仍是必需项。
   - 同日 22:35 **V-03 核心完整版通过**（`--mode all --watch-secs 20`）：3 块物理屏全部退出 active、虚拟屏 60fps `HAS_CONTENT`、SCK 干净、指针逐屏 0 偏差、输入注入 `axTrusted=1` 通过、20s 唤醒观察 0 次重新 enable、恢复后 bounds/mode/主屏身份精确回原值；重建子项由预检自动跳过（`rebuildTested=false`），未再崩溃。**V-03 核心在 Sequoia 15.5 / Macmini8,1 关闭。**
   - 顺带修复：WindowServer 残留虚拟屏槽位会让新建屏继承镜像态、mode 卡死；`VDManager` 已加单屏自愈（详见 `P0-TahoeProbe/README.md` §17）。
+  - **2026-11-18 Tahoe 26.5.2 新增风险**：V-01 全项 PASS；V-03 的禁屏、指针、注入、20–30s 无重新 enable、恢复全部通过，但同一状态下 **SCK 送帧多数为黑**（4 次：1 次全黑、2 次多数黑、1 次放白色 TextEdit 窗口仍全黑），而 `screencapture` 能抓到完整桌面 ⇒ 合成正常、SCK 路径异常。**C-09 的「全部物理屏退出 active」在 Tahoe 上目前不能与 SCK 采集同时成立**；M1 前必须新增替代采集对照（`CGDisplayCreateImage` / `CGWindowListCreateImage`）或启用本决定第 3 条降级。2026-11-18 后续实测：两条公开抓屏 API 在 Tahoe 零 active 物理屏下**稳定 `HAS_CONTENT`**（`minMean=37–39`、`maxVar≈1500`、0 黑采样，恢复 OK，见 `/tmp/p0v-alt-tahoe3.json` 与 `/tmp/p0v-alt-tahoe-1080.json`），可优先作为 M1 采集候选；SCK 同场景不稳定（V-03 全黑/多数黑，altprobe 中仅 2–4fps），不能再作为该场景唯一路径。并把「非绝对安全」写入产品说明。Sequoia 的 V-03 `HAS_CONTENT` 结论不可外推到 Tahoe。
 - **窗口重排副作用**：物理屏被移出空间时 WindowServer 会把原在该屏的窗口搬到剩余屏；断开后**不会**自动回原位。必须会话前快照 display 布局 + 各窗口 frame，断开后还原。这是 M1 的一个独立工作项，不是"顺手就能好"的细节。
 - **`disable` 权限**：`SLSConfigureDisplayEnabled` 的符号可调已实测（`P0V-SessionRecon`），V-01/V-03 均已在事务内真正生效并恢复。若运行环境（非 Intel / 非 Sequoia）被 WindowServer 拒绝，走决定第 3 条 + `CGDisplayCapture` 降级。
 
@@ -392,6 +394,12 @@ daemon 实测：`session.available=0`、`axTrusted=0`、SCK `6s 超时`、注入
 （完整解锁需要真实凭据，留到正式签名后的产品验证）；V-04d 未实现。**Path A 的
 推荐形态改为“正确签名的用户态 App + 用户授权”，root daemon 仅在无人登录场景再评估。**
 
+**2026-11-18 Tahoe 26.5.2 追加（见 `docs/RESULTS-BY-OS.md`）**：V-04a 在用户会话路径
+通过（锁屏态 `HAS_CONTENT`，17 帧、0 黑帧）；V-04b 两次判据均被污染（r1 用户手动解锁，
+r2 抓屏时已解锁且 256/256 格无变化），未确认；V-04c 仍未测；V-04d 因锁屏态虚拟屏
+只能 `online` 不能 `active` 而不成立。**结论：Path A 在 Tahoe 不成立，不能沿用
+Sequoia 的用户态锁屏结论；M1 必须按 Path B（D-07）或重新设计登录态流程。**
+
 ---
 
 ## 附：协议实现进度（2026-11-17）
@@ -401,9 +409,11 @@ daemon 实测：`session.available=0`、`axTrusted=0`、SCK `6s 超时`、注入
 | 控制通道帧（4B 长度前缀 + JSON） | ✅ 完成 | 含粘包/逐字节拆包/零长度前缀/坏版本等 18 项 |
 | 帧头 16B pack/unpack | ✅ 完成 | 字节序、magic、fragIdx 越界、payloadLen 上限等 9 项 |
 | 分片 / 重组 / 丢帧判据 | ✅ 完成 | 3000B→3 片、seq 缺口、中间片先到、双屏交错等 12 项 |
-| 输入事件编解码（§3.1） | ⏳ 待做 | 依赖坐标变换（已有） |
-| 信令状态机（§2） | ⏳ 待做 | 会话状态迁移表 |
-| QUIC 数据报端到端 | ⏳ 待验证 | P2 双机 |
+| 输入事件编解码（§3.1） | ✅ 完成（2026-11-18） | 鼠标/键/滚动/flags 四类、IME unicode、修饰键全量状态、1000 event/s 限速（超限只丢 move/scroll）；34 项断言 |
+| 信令状态机（§2） | ✅ 完成（2026-11-18） | 8 态迁移表、STREAMING 输入门控、SUSPENDED→NEGOTIATED 重连、CLOSED 终态；37 项断言 |
+| QUIC 数据报端到端 | ⏳ 待验证 | P2 双机；参数与分片上限 1150 B 已就绪 |
+| 分片上限 1150 B | ✅ 完成（2026-11-18） | `P1FrameMaxPayload` 由 1200 下调为 1150，帧头校验与分片器共用，单测含头空间校验 |
 
-代码：`P1-ClientProbe/src/ProtocolCodec.{h,m}`，测试 `P1-ClientProbe/tests/test_protocol.m`，
-运行 `cd P1-ClientProbe && bash build_tests.sh`（当前 69 个断言全过、零警告）。
+代码：`P1-ClientProbe/src/ProtocolCodec.{h,m}`、`P1InputCodec.{h,m}`、`P1SessionState.{h,m}`；
+测试 `P1-ClientProbe/tests/test_protocol.m`、`test_input.m`、`test_session.m`，
+运行 `cd P1-ClientProbe && bash build_tests.sh`（当前 140 个断言全过、零警告）。

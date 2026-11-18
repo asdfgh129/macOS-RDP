@@ -17,3 +17,5 @@ build_and_run() {
 
 build_and_run coordinate tests/test_coordinate.m src/P1Coordinate.m
 build_and_run protocol   tests/test_protocol.m   src/ProtocolCodec.m
+build_and_run input      tests/test_input.m      src/P1InputCodec.m src/ProtocolCodec.m
+build_and_run session    tests/test_session.m    src/P1SessionState.m

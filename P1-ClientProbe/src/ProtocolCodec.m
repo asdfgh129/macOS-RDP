@@ -11,7 +11,8 @@ const NSUInteger P1ControlMaxFrameBytes = 1024 * 1024;  // 1 MiB
 const uint16_t P1FrameMagic = 0x4D52;                   // 'MR'
 const uint8_t  P1ProtocolVersion = 1;
 const NSUInteger P1FrameHeaderSize = 16;
-const NSUInteger P1FrameMaxPayload = 1200;
+// QUIC short header + AEAD tag 约 20–30 B，1200 B MTU 下留足头空间（D-01）
+const NSUInteger P1FrameMaxPayload = 1150;
 
 static NSError *P1Err(P1ProtocolErrorCode code, NSString *desc) {
     return [NSError errorWithDomain:P1ProtocolErrorDomain

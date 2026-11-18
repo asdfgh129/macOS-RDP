@@ -19,6 +19,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <libproc.h>
+#import <dlfcn.h>
 #import <math.h>
 #import <stdlib.h>
 
@@ -29,6 +30,8 @@ extern CFDictionaryRef CGSessionCopyCurrentDictionary(void);
 static NSArray<NSNumber *> *P0VShareableDisplayIDs(NSError **outError);
 
 static NSString *const kOutPath = @"/tmp/p0v-root.json";
+static CGDirectDisplayID gOverrideDisplay = 0;
+static NSString *gInjectText = @"aa";
 
 #pragma mark - 日志
 
@@ -379,6 +382,17 @@ static NSDictionary *P0VDiffGrid(NSArray *a, NSArray *b) {
 
 #pragma mark - 子命令
 
+static int P0VCmdLock(void) {
+    void *h = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/A/login", RTLD_NOW);
+    if (!h) { printf("{\"ok\":false,\"error\":\"dlopen login.framework failed\"}\n"); return 1; }
+    typedef void (*LockFn)(void);
+    LockFn fn = (LockFn)dlsym(h, "SACLockScreenImmediate");
+    if (!fn) { printf("{\"ok\":false,\"error\":\"SACLockScreenImmediate not found\"}\n"); return 1; }
+    fn();
+    printf("{\"ok\":true,\"called\":\"SACLockScreenImmediate\"}\n");
+    return 0;
+}
+
 static int P0VCmdProbe(void) {
     NSDictionary *env = P0VEnv();
     NSData *json = [NSJSONSerialization dataWithJSONObject:env
@@ -390,9 +404,14 @@ static int P0VCmdProbe(void) {
 
 static int P0VCmdCapture(int ms) {
     NSDictionary *env = P0VEnv();
-    NSArray *list = env[@"displays"][@"list"];
-    if (list.count == 0) { printf("{\"ok\":false,\"error\":\"no active display\"}\n"); return 2; }
-    NSNumber *did = list[0][@"id"];
+    NSNumber *did = nil;
+    if (gOverrideDisplay != 0) {
+        did = @(gOverrideDisplay);
+    } else {
+        NSArray *list = env[@"displays"][@"list"];
+        if (list.count == 0) { printf("{\"ok\":false,\"error\":\"no active display\"}\n"); return 2; }
+        did = list[0][@"id"];
+    }
     NSDictionary *cap = P0VCapture((CGDirectDisplayID)did.unsignedIntValue, ms, NO);
     NSMutableDictionary *r = [cap mutableCopy];
     r[@"session"] = env[@"session"];
@@ -417,7 +436,7 @@ static NSDictionary *P0VInjectTest(void) {
     r[@"before"] = a[@"verdict"] ?: @"?";
     r[@"beforeFrames"] = a[@"frames"] ?: @0;
 
-    P0VTypeToPid(lw, @"aa");
+    P0VTypeToPid(lw, gInjectText);
     P0VPostKeyToPid(lw, 36, true);   // Return
     P0VPostKeyToPid(lw, 36, false);
     [NSThread sleepForTimeInterval:1.2];
@@ -493,12 +512,18 @@ int main(int argc, const char *argv[]) {
         int ms = 600;
         for (int i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--ms") == 0 && i + 1 < argc) ms = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--display") == 0 && i + 1 < argc) {
+                gOverrideDisplay = (CGDirectDisplayID)strtoul(argv[++i], NULL, 0);
+            } else if (strcmp(argv[i], "--text") == 0 && i + 1 < argc) {
+                gInjectText = [NSString stringWithUTF8String:argv[++i]];
+            }
         }
-        if ([cmd isEqualToString:@"probe"])        return P0VCmdProbe();
-        if ([cmd isEqualToString:@"capture"])      return P0VCmdCapture(ms);
-        if ([cmd isEqualToString:@"inject-test"])  return P0VCmdInject();
-        if ([cmd isEqualToString:@"daemon-run"])   return P0VCmdDaemonRun();
-        fprintf(stderr, "用法: p0vprobe {probe|capture|inject-test|daemon-run} [--ms N]\n");
+        if ([cmd isEqualToString:@"lock"])          return P0VCmdLock();
+        if ([cmd isEqualToString:@"probe"])         return P0VCmdProbe();
+        if ([cmd isEqualToString:@"capture"])       return P0VCmdCapture(ms);
+        if ([cmd isEqualToString:@"inject-test"])   return P0VCmdInject();
+        if ([cmd isEqualToString:@"daemon-run"])    return P0VCmdDaemonRun();
+        fprintf(stderr, "用法: p0vprobe {lock|probe|capture|inject-test|daemon-run} [--ms N] [--display ID] [--text STR]\n");
         return 1;
     }
 }

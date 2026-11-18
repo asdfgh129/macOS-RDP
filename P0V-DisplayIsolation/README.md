@@ -127,6 +127,67 @@ bash build.sh          # 产物 ./v01probe，ad-hoc 签名 com.p0v.displayisolat
   **注意：下午的 Tahoe 机结果与晚上的 Sequoia 机不能混用**，执行前先确认 `probe` 打印的
   `osVersion` / `model`。
 
+### 2026-11-18 Tahoe 环境预检（`probe` + `--dry-run`，未禁物理屏）
+
+环境：**Tahoe 26.5.2（25F84）/ Macmini8,1 / x86_64**。本文其余 V-01/V-03 结论仍只来自 Sequoia 15.5。
+
+- 构建：`bash build.sh` 零警告，ad-hoc 签名 `com.p0v.displayisolation`。
+- `./v01probe probe`：`26.5.2 x86_64 / Macmini8,1`、`parent=zsh GUI=yes AX=no`、
+  `SLSConfigureDisplayEnabled` 可解析；2 块物理屏 active，SCK 两块都可见。
+- 停放槽位：**6 个**（4128829、4128831–4128835），与 Sequoia 的 5 个略有不同；
+  单块建屏仍复用 4128835，未触发重建测试。
+- `run --dry-run --yes --spec 1280x720 --capture-ms 800 --watch-secs 0`
+  → `label=DRY_RUN`、退出码 1（dry-run 语义）、恢复 OK；虚拟屏 4128835
+  `HAS_CONTENT`，物理屏未被禁用。日志 `/tmp/p0v-tahoe-dryrun.log`，结果
+  `/tmp/p0v-tahoe-dryrun.json`。
+- **阻塞项**：`AX=no`，输入注入判据目前会假失败；用户需在系统设置 → 隐私与安全性 →
+  辅助功能中为责任进程（WorkBuddy 或运行探针的终端）授权后重跑 V-01/V-03。
+
+### 2026-11-18 Tahoe V-01 / V-03 实测（AX=yes）
+
+用户给责任进程（WorkBuddy）开通辅助功能后复检 `AX=yes`，执行禁屏实测。
+
+**V-01（`--mode one --watch-secs 20`）→ `PASS`，退出码 0，恢复 OK**
+结果 `/tmp/p0v-tahoe-one.json`，日志 `/tmp/p0v-tahoe-one.log`。
+
+| 判据 | 结果 | 数据 |
+|---|---|---|
+| `disableEffective` | ✅ | 目标屏 817925634 退出 active |
+| `virtualCapture` | ✅ | 1920x1080 `HAS_CONTENT`，minLumaMean=151 |
+| `sckClean` | ✅ | SCK 不含被禁屏 |
+| `pointerContained` | ✅ | 逐屏 5 点最大偏差 0，落入禁用屏 0 次 |
+| `inputInjected` | ✅ | `axTrusted=1`，move 距离 2797，零偏差 |
+| `noReenable` | ✅ | 20s 唤醒观察 0 次重新 enable |
+| `activeSetMatchesExpected` | ✅ | active = 虚拟屏 + 剩余物理屏 |
+| 恢复 | ✅ | bounds / mode / 主屏身份全部回原值，mismatches 为空 |
+
+**V-03（`--mode all`，重建子项跳过）→ 显示隔离机制全部通过，但 SCK 捕获不稳定**
+结果 `/tmp/p0v-tahoe-all{,2,3,4}.json`，日志同名 `.log`。
+四次运行中 `disableEffective` / `sckClean` / `pointerContained` / `inputInjected` /
+`noReenable`（20s 与 30s 两轮）/ `activeSetMatchesExpected` / **恢复**全部通过；
+唯一失败面是禁屏后 SCK 送出的帧：
+
+| 运行 | 观察 | 虚拟屏捕获帧 |
+|---|---|---|
+| #1（20s） | `FAIL` | `MOSTLY_BLACK`，34/34 帧黑，maxLumaVariance=0 |
+| #2（0s） | `PASS_NO_WAKE_TEST` | `HAS_CONTENT` 但 45/61 帧黑，maxVar=4074 |
+| #3（30s） | `PASS` | `HAS_CONTENT` 但 22/39 帧黑，maxVar=393 |
+| #4（0s，放白色 TextEdit 窗口对照） | `FAIL` | `MOSTLY_BLACK`，62/62 帧黑，maxVar=0 |
+
+**根因定位**：第 3 次运行在禁用期间用 `screencapture -x` 抓到完整桌面
+（WorkBuddy 窗口、菜单栏、Dock 可见，图 `/tmp/tahoe-v03-main.png`），说明
+WindowServer **仍在正常合成虚拟屏**；黑色来自 **SCK 在「零 active 物理屏」状态下
+送帧异常**，不是桌面无内容。第 4 次用白色窗口做对照仍全黑，排除了「深色桌面
+本来就很暗」的解释。
+
+**结论**：Tahoe 上 V-01 关闭；**V-03 的显示隔离机制成立，但 `SCK + 零 active
+物理屏` 这条采集路径不可靠，A-08 不能在 Tahoe 上按原判据关闭**。M1 若坚持 C-09
+（物理屏全部退出 active 空间），必须先在 P0V 新增对照探针，验证
+`CGDisplayCreateImage` / `CGWindowListCreateImage` 等替代采集路径；否则只能按
+D-05 第 3 条降级（`CGDisplayCapture` + 遮罩 + 强制光标接管），并在产品说明中
+标注「非绝对安全」。Sequoia 15.5 上 V-03 核心 `HAS_CONTENT` 的旧结论仍然成立，
+但**不可外推到 Tahoe**。
+
 ## 手动恢复
 
 ```bash
