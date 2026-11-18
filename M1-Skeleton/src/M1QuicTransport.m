@@ -34,10 +34,54 @@ static NSString *M1DescribeNWError(nw_error_t e) {
     nw_error_domain_t d = nw_error_get_error_domain(e);
     int code = (int)nw_error_get_error_code(e);
     NSString *dom = (d == nw_error_domain_posix) ? @"posix" : @"dns";
+    CFErrorRef cf = nw_error_copy_cf_error(e);
+    NSString *detail = cf ? [(__bridge NSError *)cf localizedDescription] : nil;
+    if (cf) CFRelease(cf);
+    if (detail.length > 0) return [NSString stringWithFormat:@"%@/%d (%@)", dom, code, detail];
     return [NSString stringWithFormat:@"%@/%d", dom, code];
 }
 
 #pragma mark - 身份与指纹
+
+// 本进程专用的临时钥匙串。
+//
+// 为什么不能用默认（登录）钥匙串：SecPKCS12Import 不带 kSecImportExportKeychain 时会把
+// 条目写进登录钥匙串并持久化，ACL 里记的是「当时那个二进制」。我们是 ad-hoc 签名，
+// 重新构建一次就换了身份，于是后续进程签名时 securityd 会判定 ACL 不符 → 拉起
+// SecurityAgent 授权框 → 后台 CLI 永远等不到答复 → SecKeyCreateSignature 里的
+// mach_msg 永久阻塞 → TLS 服务端发不出 CertificateVerify → 握手卡在 preparing
+// 直到超时，全程无错误码（实测调用栈见 docs/RESULTS-BY-OS.md NEG-03）。
+//
+// 放进一次性临时钥匙串后，条目不会污染用户钥匙串，ACL 每次都按当前进程现建。
+static SecKeychainRef gM1TempKeychain = NULL;
+
+static void M1DestroyTempKeychain(void) {
+    if (gM1TempKeychain) {
+        SecKeychainDelete(gM1TempKeychain);
+        CFRelease(gM1TempKeychain);
+        gM1TempKeychain = NULL;
+    }
+}
+
+static SecKeychainRef M1TempKeychain(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *path = [NSTemporaryDirectory()
+            stringByAppendingPathComponent:
+                [NSString stringWithFormat:@"m1rdp-identity-%d.keychain", getpid()]];
+        const char *pw = "m1rdp-ephemeral";
+        OSStatus st = SecKeychainCreate(path.fileSystemRepresentation,
+                                       (UInt32)strlen(pw), pw, false, NULL, &gM1TempKeychain);
+        if (st != errSecSuccess || !gM1TempKeychain) {
+            M1QLOG("临时钥匙串创建失败 st=%d（回退到默认钥匙串）", (int)st);
+            gM1TempKeychain = NULL;
+            return;
+        }
+        SecKeychainUnlock(gM1TempKeychain, (UInt32)strlen(pw), pw, true);
+        atexit(M1DestroyTempKeychain);
+    });
+    return gM1TempKeychain;
+}
 
 static SecIdentityRef M1CopyIdentity(NSString *path, NSString *password,
                                     NSError * _Nullable * _Nullable error) {
@@ -47,10 +91,27 @@ static SecIdentityRef M1CopyIdentity(NSString *path, NSString *password,
             [NSString stringWithFormat:@"读不到身份文件 %@", path]);
         return NULL;
     }
-    NSDictionary *opts = @{ (__bridge id)kSecImportExportPassphrase: password ?: @"" };
+    // ACL 只信任当前进程；钥匙串用一次性临时库（见上）。
+    SecAccessRef access = NULL;
+    SecTrustedApplicationRef selfApp = NULL;
+    if (SecTrustedApplicationCreateFromPath(NULL, &selfApp) == errSecSuccess && selfApp) {
+        const void *trusted[] = { selfApp };
+        CFArrayRef trustedList = CFArrayCreate(NULL, trusted, 1, &kCFTypeArrayCallBacks);
+        if (trustedList) {
+            SecAccessCreate(CFSTR("macOS-RDP M1 identity"), trustedList, &access);
+            CFRelease(trustedList);
+        }
+        CFRelease(selfApp);
+    }
+    NSMutableDictionary *opts = [@{ (__bridge id)kSecImportExportPassphrase: password ?: @"" }
+                                 mutableCopy];
+    if (access) opts[(__bridge id)kSecImportExportAccess] = (__bridge id)access;
+    SecKeychainRef kc = M1TempKeychain();
+    if (kc) opts[(__bridge id)kSecImportExportKeychain] = (__bridge id)kc;
     CFArrayRef items = NULL;
     OSStatus st = SecPKCS12Import((__bridge CFDataRef)p12,
                                   (__bridge CFDictionaryRef)opts, &items);
+    if (access) CFRelease(access);
     if (st != errSecSuccess || items == NULL || CFArrayGetCount(items) == 0) {
         if (items) CFRelease(items);
         if (error) *error = M1QuicErr(M1QuicErrorIdentityUnusable,
@@ -70,6 +131,53 @@ static SecIdentityRef M1CopyIdentity(NSString *path, NSString *password,
     return ident;
 }
 
+// 同一个 p12 在**一个进程里只导入一次**。
+//
+// 原因：每次 SecPKCS12Import 都会往临时钥匙串里再插一条同证书的私钥条目，
+// 而私钥条目带 ACL —— 重复条目会让 securityd 在后续签名时去挑条目并可能走授权流程，
+// 一旦走授权就会永久阻塞（NEG-03 的完整现象）。这里按「路径+密码+size+mtime」去重，
+// 让一个进程内只有一条私钥条目，签名路径稳定。
+//
+// 缓存键带 size+mtime，探针重新生成身份后不会读到旧条目。
+typedef struct {
+    void *key;          // CFStringRef
+    SecIdentityRef ident;
+} M1IdentityCacheEntry;
+
+static os_unfair_lock gIdLock = OS_UNFAIR_LOCK_INIT;
+static M1IdentityCacheEntry gIdCache[4];
+static size_t gIdCacheCount = 0;
+
+static SecIdentityRef M1CopyIdentityCached(NSString *path, NSString *password,
+                                           NSError * _Nullable * _Nullable error) {
+    NSDictionary *st = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%llu|%.3f", path, password ?: @"",
+                     (unsigned long long)[st fileSize],
+                     [[st fileModificationDate] timeIntervalSince1970]];
+
+    os_unfair_lock_lock(&gIdLock);
+    for (size_t i = 0; i < gIdCacheCount; i++) {
+        if ([(__bridge NSString *)gIdCache[i].key isEqualToString:key]) {
+            SecIdentityRef hit = (SecIdentityRef)CFRetain(gIdCache[i].ident);
+            os_unfair_lock_unlock(&gIdLock);
+            return hit;
+        }
+    }
+    os_unfair_lock_unlock(&gIdLock);
+
+    SecIdentityRef fresh = M1CopyIdentity(path, password, error);
+    if (!fresh) return NULL;
+
+    os_unfair_lock_lock(&gIdLock);
+    if (gIdCacheCount < 4) {
+        gIdCache[gIdCacheCount].key = (void *)CFBridgingRetain(key);
+        gIdCache[gIdCacheCount].ident = (SecIdentityRef)CFRetain(fresh);
+        gIdCacheCount++;
+    }
+    os_unfair_lock_unlock(&gIdLock);
+    return fresh;   // 调用方持有 +1
+}
+
 // 叶子证书 DER 的 SHA-256，小写 hex。配对层 TOFU 用的就是这串。
 static NSString *M1FingerprintOfSecCertificate(sec_certificate_t cert) {
     SecCertificateRef ref = sec_certificate_copy_ref(cert);
@@ -85,8 +193,32 @@ static NSString *M1FingerprintOfSecCertificate(sec_certificate_t cert) {
     return hex;
 }
 
-#pragma mark - 统计
+NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, NSError **error) {
+    SecIdentityRef identity = M1CopyIdentityCached(identityPath, password, error);
+    if (!identity) return nil;
+    SecCertificateRef cert = NULL;
+    OSStatus st = SecIdentityCopyCertificate(identity, &cert);
+    CFRelease(identity);
+    if (st != errSecSuccess || !cert) {
+        if (error) *error = M1QuicErr(M1QuicErrorIdentityUnusable,
+            [NSString stringWithFormat:@"取不到证书（OSStatus %d）", (int)st]);
+        return nil;
+    }
+    CFDataRef der = SecCertificateCopyData(cert);
+    CFRelease(cert);
+    if (!der) {
+        if (error) *error = M1QuicErr(M1QuicErrorIdentityUnusable, @"证书没有 DER 数据");
+        return nil;
+    }
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(CFDataGetBytePtr(der), (CC_LONG)CFDataGetLength(der), digest);
+    CFRelease(der);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [hex appendFormat:@"%02x", digest[i]];
+    return hex;
+}
 
+#pragma mark - 统计
 @interface M1QuicTransportStats ()
 @property (nonatomic, assign) uint64_t datagramsSent;
 @property (nonatomic, assign) uint64_t bytesSent;
@@ -115,6 +247,10 @@ static NSString *M1FingerprintOfSecCertificate(sec_certificate_t cert) {
 @property (nonatomic, strong) NSCondition *readyCond;
 @property (nonatomic, assign) BOOL readyFlag;
 @property (nonatomic, strong) NSError *failError;
+
+@property (nonatomic, strong) nw_parameters_t baseParams;   // 重试要复用同一份参数
+@property (nonatomic, assign) NSUInteger connGeneration;    // 每次重连 +1，丢弃过期回调
+@property (nonatomic, readwrite) NSUInteger connectAttempts;
 
 @property (nonatomic, copy) NSString *alpn;
 @property (nonatomic, copy, nullable) NSString *identityPath;
@@ -184,6 +320,9 @@ static NSString *M1FingerprintOfSecCertificate(sec_certificate_t cert) {
     _state = M1QuicStateIdle;
     _readyCond = [NSCondition new];
     _maxDatagramPayload = 0;
+    _connectTimeoutMs = 3000;
+    _maxConnectAttempts = 2;
+    _connectAttempts = 0;
 }
 
 #pragma mark 参数构造
@@ -191,7 +330,7 @@ static NSString *M1FingerprintOfSecCertificate(sec_certificate_t cert) {
 - (nw_parameters_t)makeParametersWithError:(NSError **)error {
     SecIdentityRef identity = NULL;
     if (self.identityPath.length > 0) {
-        identity = M1CopyIdentity(self.identityPath, self.identityPass, error);
+        identity = M1CopyIdentityCached(self.identityPath, self.identityPass, error);
         if (!identity) return NULL;
     }
 
@@ -200,9 +339,17 @@ static NSString *M1FingerprintOfSecCertificate(sec_certificate_t cert) {
 
     nw_protocol_options_t quic = nw_quic_create_options();
     // ★ D-01：这条连接只有一条 QUIC datagram flow，不重传、不排序。
+    // 可靠控制通道不在这里做：本机实测 QUIC stream 模式无法完成握手（见 D-14），
+    // 控制消息改走 M1ControlLink 在同一条 datagram 连接上自建确认/重传。
     nw_quic_set_stream_is_datagram(quic, true);
+    // 诊断开关：M1_QUIC_FORCE_STREAM=1 时退回 QUIC 普通流模式，用于复核 D-14 的前提。
+    if (getenv("M1_QUIC_FORCE_STREAM")) {
+        nw_quic_set_stream_is_datagram(quic, false);
+        M1QLOG("诊断：强制 QUIC stream 模式（非 datagram）");
+    }
     // 我们愿意接收的单帧上限（对端会取 min 后通过传输参数协商）。
     nw_quic_set_max_datagram_frame_size(quic, 1500);
+    // idle 超时：帧通道 30s（有持续推流）；控制通道更短，靠 1s 心跳保活、断了要快速发现。
     nw_quic_set_idle_timeout(quic, 30000);
     // 注意：keepalive 只有 metadata 版本（nw_quic_set_keepalive_interval 收 metadata），
     // 不能在 options 阶段设置；连接 ready 后可再补。
@@ -342,24 +489,77 @@ static NSString *M1FingerprintOfSecCertificate(sec_certificate_t cert) {
     }
 
     // 客户端
+    self.baseParams = params;
+    [self startClientAttempt];
+}
+
+// 客户端建立/重建连接。每次尝试建新 nw_connection 并重新挂handler，用 generation 丢弃旧回调。
+- (void)startClientAttempt {
+    self.connectAttempts += 1;
+    self.connGeneration += 1;
+    NSUInteger gen = self.connGeneration;
+
     NSString *portStr = [NSString stringWithFormat:@"%u", (unsigned)self.port];
     nw_endpoint_t ep = nw_endpoint_create_host(self.host.UTF8String, portStr.UTF8String);
-    nw_connection_t conn = nw_connection_create(ep, params);
+    nw_connection_t conn = nw_connection_create(ep, self.baseParams);
     if (!conn) {
         [self transitionFailed:M1QuicErr(M1QuicErrorConnectionFailed, @"nw_connection_create 失败")];
         return;
     }
     self.conn = conn;
     [self beginConnection];
+    [self armConnectWatchdogForGeneration:gen];
+}
+
+// 握手看门狗：QUIC Initial 丢包会按 1s/2s/4s 退避重传，实测出现 6–11s 的离群。
+// 与其让上层干等，不如在 N 毫秒后换一条新连接重来——重试几乎总能立刻成功。
+- (void)armConnectWatchdogForGeneration:(NSUInteger)gen {
+    if (self.connectTimeoutMs == 0 || self.isListener) return;
+    __weak typeof(self) weakSelf = self;
+    uint32_t timeoutMs = self.connectTimeoutMs;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMs * NSEC_PER_MSEC),
+                   self.queue, ^{
+        M1QuicTransport *s = weakSelf;
+        if (!s) return;
+        if (s.connGeneration != gen) return;              // 已重试过，回调过期
+        if (s.state != M1QuicStatePreparing) return;      // 已 ready / 已失败
+        if (M1QLogOn()) {
+            if (s.conn) {
+                char *desc = nw_connection_copy_description(s.conn);
+                M1QLOG("conn desc: %s", desc ? desc : "(nil)");
+                if (desc) free(desc);
+            } else {
+                M1QLOG("conn desc: conn is nil (state=%d)", (int)s.state);
+            }
+        }
+        nw_connection_t dead = s.conn;
+        s.conn = nil;
+        if (dead) nw_connection_cancel(dead);
+        M1QLOG("connect watchdog: %.0fms 未 ready，第 %lu 次尝试作废",
+               (double)timeoutMs, (unsigned long)s.connectAttempts);
+        if (s.connectAttempts < s.maxConnectAttempts) {
+            [s startClientAttempt];
+        } else {
+            [s transitionFailed:M1QuicErr(M1QuicErrorTimeout,
+                [NSString stringWithFormat:@"握手 %u 次尝试均超时（每次 %ums）",
+                 (unsigned)s.maxConnectAttempts, (unsigned)timeoutMs])];
+        }
+    });
 }
 
 // 给已有 nw_connection_t 装 handler 并 start（客户端 / 入站连接共用）。
 - (void)beginConnection {
     nw_connection_set_queue(self.conn, self.queue);
     __weak typeof(self) weakSelf = self;
+    NSUInteger gen = self.connGeneration;   // 被看门狗作废的连接，其回调一律忽略
     nw_connection_set_state_changed_handler(self.conn, ^(nw_connection_state_t st, nw_error_t e) {
         M1QuicTransport *strong = weakSelf;
         if (!strong) return;
+        if (strong.connGeneration != gen) {
+            M1QLOG("stale conn gen=%lu (now %lu) state %d 忽略",
+                   (unsigned long)gen, (unsigned long)strong.connGeneration, (int)st);
+            return;
+        }
         M1QLOG("connection state -> %d %s", (int)st, M1DescribeNWError(e).UTF8String);
         switch (st) {
             case nw_connection_state_ready:
@@ -512,5 +712,6 @@ static NSString *M1FingerprintOfSecCertificate(sec_certificate_t cert) {
             [strong receiveNext];
         });
 }
+
 
 @end

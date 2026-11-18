@@ -637,8 +637,67 @@ C-13.3 的理由是实测出来的：只让 verify block `complete(false)` 时�
 
 ### 未决
 
-- 偶发 6–11s 握手离群（UX 上等于「连接中卡住」），需在接控制通道前定位；
+- ~~偶发 6–11s 握手离群（UX 上等于「连接中卡住」），需在接控制通道前定位~~
+  → **已定位并修复**：不是 QUIC Initial 重传退避，而是 p12 私钥的 keychain ACL 触发
+  securityd 授权阻塞，`SecKeyCreateSignature` 卡在 `mach_msg`，服务端发不出
+  `CertificateVerify`，客户端永停 `preparing` 且**无错误码**。修复后 13.5–19.3ms 稳定，
+  10 轮无离群。详见 `RESULTS-BY-OS.md` §5.6 NEG-02。
 - 双向并发（客户端也发输入帧）时 datagram flow 的单流特性是否成为瓶颈，待 M1-C 验证。
+
+---
+
+## D-14 控制通道的可靠性：datagram 之上自建 M1ControlLink
+
+**状态**：已实现并实测（2026-11-18，Tahoe / Intel 本机环回）。
+
+### 背景
+
+M1-A 第 3 步要把 8 态状态机 + 控制帧（4B 长度前缀 + JSON）送上真实连接，并要求
+「双端状态序列逐条一致、粘包/拆包在真 socket 上仍正确」。控制消息不能丢、不能乱序，
+而 D-13 定的帧通道是**不可靠** datagram，所以先要回答：可靠性从哪来。
+
+曾经的做法是开一条 QUIC 普通（非 datagram）流来承载控制消息，并把「本机 stream 模式
+握不上手」当作既成事实写进了本节初稿。**该事实是错的**：那个现象与 stream/datagram
+无关，是 NEG-02 的签名阻塞造成的（`M1_QUIC_FORCE_STREAM=1` 复核：stream 模式握手
+64.6ms / 80.4ms 正常完成）。本节的立论已按真实约束重写。
+
+### 事实
+
+| 编号 | 事实 | 依据 |
+|---|---|---|
+| F-14.1 | 一个 `nw_connection` 只承载**一条** QUIC 流；SDK 不暴露 `nw_quic_create_stream` | `quic_options.h` 符号清单 + 实测 |
+| F-14.2 | 故「可靠流 + 不可靠 datagram 共存于一条连接」在 Network.framework 上做不到 | 由 F-14.1 推出 |
+| F-14.3 | 要一条可靠流，就得**再开一条连接** = 第二次握手、第二个端口、第二个指纹 | 由 F-14.1 推出 |
+| F-14.4 | datagram 上自建 seq/ACK/重传在环回可用且稳定：控制帧 2–3 条/会话，零丢零重 | §5.6 |
+
+### 决策
+
+| 编号 | 决策 | 落点 |
+|---|---|---|
+| C-14.1 | 控制消息**走同一条 datagram 连接**，可靠性由 `M1ControlLink` 自建：14B 头（magic `'C'`/ver/kind/flags/seq/ack/payloadLen）+ 累计 ACK + 有界重传 | `M1ControlLink.m` |
+| C-14.2 | 帧通道与控制通道**共用一个 datagram flow**，靠魔数分流：帧片 `'M'`(0x4D)、控制 `'C'`(0x43) | `M1FrameSender` / `M1ControlLink` |
+| C-14.3 | 控制载荷上限 1200B（14+1200=1214 < 1497 协商下限），超长控制消息在 `M1ControlLink` 上层就报错，不做分片 | `M1ControlLinkMaxPayload` |
+| C-14.4 | 重传默认 250ms × 8 次，耗尽即 `M1ControlLinkErrorUnacked` 让会话失败，不做无限重试 | `M1ControlLink` |
+| C-14.5 | 分帧仍是 4B 大端长度前缀 + JSON，跑在 link 之上，与 PROTOCOL §3 一致 | `M1ControlChannel` |
+| C-14.6 | **一个 p12 只导入一次，且导入到进程私有临时钥匙串**（见 NEG-02），否则握手会无错误码地永久卡住 | `M1CopyIdentity` |
+
+选 C-14.1 而不选「第二条连接跑 stream」的理由：本产品是单端口单连接模型（一次握手、
+一个 TOFU 指纹、一处 NAT 穿透），而控制消息量极小（每会话 2–3 条 + 1s 心跳），
+自带 14B 头 + 重传的代价远低于维护第二条连接的生命周期与第二个端口的可达性。
+
+### 代价与边界
+
+- 如果 M2/M3 出现「大块、必须有序、必须可靠」的控制数据（例如文件传输、剪贴板同步），
+  不该继续往 `M1ControlLink` 上叠：那时按 C-14.3 的边界另起一条 QUIC stream 连接更合适，
+  代价是双握手。**这是一个明确的后续复核点**，不是禁止项。
+- datagram 单流共享意味着控制帧和视频帧争同一个拥塞窗口；控制帧小且稀疏，实测无影响，
+  但 M1-C 双向并发时要复测（D-13 未决项）。
+
+### 实现与验证
+
+`M1MessageSink`（seam）← `M1ControlLink`（可靠性）← `M1ControlChannel`（分帧）←
+`M1ControlSession`（8 态语义 + TOFU/配对码 + 心跳）。验收数据见 `RESULTS-BY-OS.md` §5.6：
+5/5 轮、两进程通过、148 断言全过、握手 13.5–19.3ms。
 
 ---
 
@@ -651,8 +710,10 @@ C-13.3 的理由是实测出来的：只让 verify block `complete(false)` 时�
 | 分片 / 重组 / 丢帧判据 | ✅ 完成 | 3000B→3 片、seq 缺口、中间片先到、双屏交错等 12 项 |
 | 输入事件编解码（§3.1） | ✅ 完成（2026-11-18） | 鼠标/键/滚动/flags 四类、IME unicode、修饰键全量状态、1000 event/s 限速（超限只丢 move/scroll）；34 项断言 |
 | 信令状态机（§2） | ✅ 完成（2026-11-18） | 8 态迁移表、STREAMING 输入门控、SUSPENDED→NEGOTIATED 重连、CLOSED 终态；37 项断言 |
-| QUIC 数据报端到端 | ⏳ 待验证 | P2 双机；参数与分片上限 1150 B 已就绪 |
+| QUIC 数据报端到端 | ✅ 完成（2026-11-18，本机环回） | `quic_probe`；协商上限 1497B、1150B 分片零丢零乱序；突发丢 43.6% |
 | 分片上限 1150 B | ✅ 完成（2026-11-18） | `P1FrameMaxPayload` 由 1200 下调为 1150，帧头校验与分片器共用，单测含头空间校验 |
+| 控制通道可靠性（datagram 上自建） | ✅ 完成（2026-11-18） | `M1ControlLink`：14B 头、累计 ACK、250ms×8 重传、乱序持有、去重；`control_probe` 实 socket 验证 |
+| 控制通道分帧 + 会话语义 | ✅ 完成（2026-11-18） | `M1ControlChannel` + `M1ControlSession`：8 态、TOFU/配对码、心跳、synthetic 显示占位；148 断言全过 |
 
 代码：`P1-ClientProbe/src/ProtocolCodec.{h,m}`、`P1InputCodec.{h,m}`、`P1SessionState.{h,m}`；
 测试 `P1-ClientProbe/tests/test_protocol.m`、`test_input.m`、`test_session.m`，

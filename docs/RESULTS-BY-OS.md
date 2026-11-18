@@ -224,6 +224,78 @@
 
 ---
 
+### 5.6 控制通道端到端 + 三个负结果的更正（M1-A 第 3 步，2026-11-18 18:0x–18:5x，Tahoe）
+
+`control_probe`：8 态状态机 + 控制帧跑在真实 QUIC 连接上，控制流走 `M1ControlLink`
+（datagram 之上自建 seq/累计 ACK/重传，D-14），本机环回。
+
+| 项 | 结果 |
+|---|---|
+| 同进程双端自检（`--self`） | **5/5 轮通过**；状态序列双端逐条一致 |
+| 状态序列 | `DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → STREAMING` |
+| sessionID | 双端一致（`session-ready` 协商值相同） |
+| 控制帧计数 | client 发 2 / host 收 2；host 发 3 / client 收 3（含 `bye` 在关闭前送出） |
+| 握手耗时 | **13.5–19.3ms**（修复后 p50≈15ms，10 轮无离群） |
+| 两进程 `--host` / `--client` | 通过，握手 28–121ms，host 多一个终态 `CLOSED` |
+| 单测 | `test_skeleton` **148 断言全过**（含粘包、逐字节拆包、坏长度前缀、TOFU 全序列、配对码、指纹不符拒绝） |
+| loopback UDP 裸测 | 2000×1200B 突发 **0 丢包**（排除网络层） |
+
+#### NEG-02（重要更正）握手「随机 6–11s 离群 / 必失败」的真因：securityd 授权阻塞
+
+此前 §5.5 把偶发 6–11s 握手记为「疑为 QUIC Initial 重传退避」，并把同一身份时好时坏
+归因于「证书材料随机损坏」。**两个判断都不对。** 卡住时 `sample` 抓到的主线程栈是：
+
+```
+SecKeyCreateSignature
+  → SecKeyRunAlgorithmAndCopyResult → SecKeyCopyDigestForMessage
+  → SecKeyRSACopyEMSASignature → SecCDSAKeyCopyOperationResult
+  → CSSM_SignData → Security::SecurityServer::ClientSession::generateSignature
+  → mach_msg                          ← 永久等待 securityd
+```
+
+服务端在 TLS 里发 `CertificateVerify` 时要签名，而签名被 keychain ACL 授权卡住：
+securityd 拉起 SecurityAgent 授权框（实测进程存在），后台 CLI 永远等不到答复。
+后果是 QUIC 服务端发不出证书，客户端 `nw_connection` 停在 `preparing`（state 2）
+直到超时——**没有任何错误码**，表现与「对端没监听 / 网络不通」完全一样。
+
+根因是 `SecPKCS12Import` 不带 `kSecImportExportKeychain` 时会把条目写进**登录钥匙串**并持久化，
+ACL 里记的是「当时那个二进制」。ad-hoc 二进制每次重建 cdhash 都变，后续进程签名时
+ACL 判定不符 → 走授权 → 阻塞。所以现象才会像「同一张证书时好时坏」「换个构建就好」。
+
+**修复**（`M1QuicTransport.M1CopyIdentity`）：
+
+1. 导入到**进程私有的一次性临时钥匙串**（`SecKeychainCreate` + `kSecImportExportKeychain`，
+   `atexit` 删除），不再污染/复用登录钥匙串条目；
+2. ACL 显式信任**当前进程**（`SecTrustedApplicationCreateFromPath(NULL)` → `SecAccessCreate`），
+   签名不再问 securityd；
+3. 同一 p12 在进程内只导入一次（按 路径+密码+size+mtime 缓存），避免重复条目。
+
+修复后同一张曾「必挂」的证书 13.5–19.3ms 稳定握手。
+
+> 副作用待清：早期实现已往登录钥匙串写了若干 `CN=macOS-RDP M1 dev` 测试证书
+> （`security find-certificate -c "macOS-RDP M1 dev"` 可见），可手工删除，不影响功能。
+
+#### NEG-01（结论更正）QUIC stream 模式并非不可用
+
+此前记「QUIC 普通流模式在本机永远握不上手（永远停在 `preparing`）」，据此定的 D-14。
+用 `M1_QUIC_FORCE_STREAM=1` 复核：**握手正常完成，64.6ms / 80.4ms**。
+当时的失败同样是 NEG-02 的签名阻塞，与 stream/datagram 无关。
+
+D-14 因此改为按「一个 `nw_connection` 只能承载一条流」立论，而不是按「stream 模式坏」——
+见 `DECISIONS.md` D-14。本次 stream 模式下控制帧计数为「发 1 / 收 0」属预期：
+帧仍按 datagram 发送，stream 模式下没有 datagram flow。
+
+#### NEG-03 走错方向的几次假设（记录以免重犯）
+
+| 假设 | 证伪方式 | 结论 |
+|---|---|---|
+| 应用防火墙 / loopback UDP 丢包 | 裸 UDP 2000×1200B 突发 0 丢失 | 排除 |
+| 证书材料随机损坏（重生成就好） | 同一 p12 在修复前 8 次全挂、修复后同文件稳定通过 | 排除，是 ACL 不是材料 |
+| 重复导入 p12 破坏私钥 | 单次导入仍阻塞；临时钥匙串 + ACL 后两次导入也无碍 | 排除（缓存仍保留，理由变为避免重复条目） |
+| 新编出的二进制才有问题 | 同一二进制在 securityd 条目被授权后行为改变 | 假象：真实变量是钥匙串里那条 ACL |
+
+---
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe |
@@ -249,3 +321,4 @@
 - v0.9-draft 2026-11-18 16:20：**新增 §5.3 负结果（首次禁屏独占实测致整机黑屏）**。不是 SPI/WindowServer 故障，而是探针兜底链路四处断裂：① 宿主未实现 `--guardian`，守护进程 exit(2) 后父进程仍禁屏；② 快照在建虚拟屏之后才拍，虚拟屏被当成 main；③ `keepIDs:@[]` 把虚拟屏一起禁掉 → 零显示；④ C-09 判据对空集恒真，零显示被放行。另 `@finally` 是唯一恢复出口，信号直接终止进程时不执行。已按 D-12 修完：守护就绪握手（`<snapshot>.guardian-ready`，失败即禁止禁屏）、快照前移建屏前、keep 并入会话虚拟屏并自检 active 非空、`M1IsolationViolation()` 拒绝空 active、信号自管道 + 看门狗、守护兜底额外清孤儿虚拟屏。新增负向测试 `tests/guardian_handshake_test.m` 与 `--preflight` 预检；单测 120 断言全过。禁屏条件下的帧管线数据仍为空。
 - v0.10-draft 2026-11-18 16:40：**修复后首次取得禁屏独占有效数据（§5.4）**：1080p20 环回 181/181 帧、零丢零错、稳态 ≈20.6fps（全窗口 14.2fps 被 3.9s 首帧拖低），码率 610kbps、平均分片 1072B。D-10 的 20fps 档在禁屏条件下可达；首帧 3924ms 明显劣于 M1-Pre 的 739–1031ms，新增待查项；60fps 仍无证据，A-02 保持开放。同时修掉 `M1FramePipeline` 在 `stop` 后把采集尺寸报成 0×0 的问题（尺寸随统计一起固化）。
 - v0.11-draft 2026-11-18 17:10：**新增 §5.5 QUIC datagram 帧通道实测（M1-A 第 1/2 步）**。400 帧/1200 分片/1.22MB 环回零丢失零重复零乱序，协商上限 1497B，9.6Mbps。两条硬结论：① 瞬时突发 1200 片丢 43.6%（整帧级），发送必须按帧节奏投递；② 指纹不符只 `complete(false)` 会吊在 preparing（20s 无结论），必须主动 cancel（D-13 C-13.3）。待查：偶发 6–11s 握手离群。
+- v0.12-draft 2026-11-18 18:55：**新增 §5.6 控制通道端到端 + 两个结论更正**。控制通道 8 态在真实 QUIC 连接上跑通（`--self` 5/5、两进程 host/client 通过、148 单测全过、握手 13.5–19.3ms）。三处更正：① **§5.5 的「6–11s 离群疑为 QUIC Initial 退避」作废**——真因是 p12 私钥的 keychain ACL 触发 securityd 授权阻塞，`SecKeyCreateSignature` 卡在 `mach_msg`，服务端发不出 `CertificateVerify`，客户端永停 `preparing` 且无错误码（NEG-02）；② **「QUIC stream 模式不可用」作废**——复核握手 64.6/80.4ms 正常，此前失败同因（NEG-01），D-14 改按「一个连接一条流」立论；③ 「证书材料随机损坏」假象撤回。修复：临时钥匙串 + ACL 信任当前进程 + 进程内单次导入。

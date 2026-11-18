@@ -48,3 +48,12 @@ P0V-DisplayIsolation/recover_displays
 P0V-DisplayIsolation/recover_v2
 P0V-DisplayIsolation/recover_v4
 P0V-DisplayIsolation/recover_v5
+
+# M1 探针二进制
+M1-Skeleton/control_probe
+M1-Skeleton/quic_probe
+M1-Skeleton/driver_probe
+M1-Skeleton/pipeline_probe
+M1-Skeleton/pipeline_kiosk_probe
+M1-Skeleton/test_skeleton
+M1-Skeleton/guardian_handshake_test

@@ -14,7 +14,11 @@ SOURCES=(
   "src/M1PipelineTypes.m"
   "src/M1DatagramSink.m"
   "src/M1FrameSender.m"
+  "src/M1MessageSink.m"
+  "src/M1ControlChannel.m"
+  "src/M1ControlSession.m"
   "$P1SRC/ProtocolCodec.m"
+  "$P1SRC/P1SessionState.m"
   "tests/test_skeleton.m"
 )
 for f in "${SOURCES[@]}"; do

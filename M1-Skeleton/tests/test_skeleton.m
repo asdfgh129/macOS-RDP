@@ -11,6 +11,9 @@
 #import "M1InputLogic.h"
 #import "M1FrameSender.h"
 #import "M1DatagramSink.h"
+#import "M1MessageSink.h"
+#import "M1ControlChannel.h"
+#import "M1ControlSession.h"
 
 static int gPass = 0, gFail = 0;
 static void OK(BOOL cond, const char *name) {
@@ -454,6 +457,196 @@ static void TestFrameSender(void) {
     }
 }
 
+#pragma mark - 控制通道（分帧 / 粘包 / 拆包）
+
+@interface M1TestCollector : NSObject <M1ControlChannelDelegate>
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *messages;
+@property (nonatomic, strong) NSMutableArray<NSError *> *errors;
+@end
+
+@implementation M1TestCollector
+- (instancetype)init {
+    if ((self = [super init])) {
+        _messages = [NSMutableArray array];
+        _errors = [NSMutableArray array];
+    }
+    return self;
+}
+- (void)controlChannel:(M1ControlChannel *)channel didReceiveMessage:(NSDictionary *)message {
+    [self.messages addObject:message];
+}
+- (void)controlChannel:(M1ControlChannel *)channel didFailWithError:(NSError *)error {
+    [self.errors addObject:error];
+}
+@end
+
+static void TestControlChannel(void) {
+    printf("=== control channel framing ===\n");
+
+    M1MemoryMessageSink *sink = [M1MemoryMessageSink new];
+    M1ControlChannel *tx = [[M1ControlChannel alloc] initWithSink:sink];
+    NSError *err = nil;
+    OK([tx sendMessage:@{@"type": @"hello", @"role": @"client"} error:&err], "ctl-send-hello");
+    OK([tx sendMessage:@{@"type": @"heartbeat", @"ts": @1} error:&err], "ctl-send-hb");
+    OK(sink.messages.count == 2, "ctl-two-frames-written");
+    OK(tx.nextSeq == 3, "ctl-seq-monotonic");
+
+    // 一次投喂两条完整帧（粘包）
+    M1ControlChannel *rx = [[M1ControlChannel alloc] initWithSink:[M1MemoryMessageSink new]];
+    M1TestCollector *col = [M1TestCollector new];
+    rx.delegate = col;
+    [rx feedBytes:[sink concatenated]];
+    OK(col.messages.count == 2, "ctl-coalesced-two-messages");
+    OK([col.messages[0][@"type"] isEqualToString:@"hello"], "ctl-order-preserved");
+    OK([col.messages[0][@"seq"] intValue] == 1 && [col.messages[1][@"seq"] intValue] == 2,
+       "ctl-seq-preserved");
+
+    // 逐字节拆包：3 字节时还凑不出长度前缀，必须缓冲而不是报错
+    M1ControlChannel *rx2 = [[M1ControlChannel alloc] initWithSink:[M1MemoryMessageSink new]];
+    M1TestCollector *col2 = [M1TestCollector new];
+    rx2.delegate = col2;
+    NSData *frame = sink.messages[0];
+    [rx2 feedBytes:[frame subdataWithRange:NSMakeRange(0, 3)]];
+    OK(col2.messages.count == 0 && rx2.bufferedBytes == 3, "ctl-partial-prefix-buffered");
+    [rx2 feedBytes:[frame subdataWithRange:NSMakeRange(3, 5)]];
+    OK(col2.messages.count == 0, "ctl-partial-body-waits");
+    [rx2 feedBytes:[frame subdataWithRange:NSMakeRange(8, frame.length - 8)]];
+    OK(col2.messages.count == 1, "ctl-partial-completed");
+    OK(col2.errors.count == 0, "ctl-partial-no-error");
+
+    // 长度前缀不可信 ⇒ 报协议错，而不是继续攒内存
+    M1ControlChannel *rx3 = [[M1ControlChannel alloc] initWithSink:[M1MemoryMessageSink new]];
+    M1TestCollector *col3 = [M1TestCollector new];
+    rx3.delegate = col3;
+    uint8_t bad[8] = {0xFF, 0xFF, 0xFF, 0xFF, 'x', 'x', 'x', 'x'};
+    [rx3 feedBytes:[NSData dataWithBytes:bad length:sizeof(bad)]];
+    OK(rx3.protocolErrors == 1 && col3.errors.count == 1, "ctl-bad-prefix-reported");
+}
+
+#pragma mark - 控制会话（双端状态序列）
+
+@interface M1TestSessionWatcher : NSObject <M1ControlSessionDelegate>
+@property (nonatomic, strong, nullable) NSError *error;
+@end
+
+@implementation M1TestSessionWatcher
+- (void)controlSession:(M1ControlSession *)session didFailWithError:(NSError *)error {
+    if (!self.error) self.error = error;
+}
+@end
+
+// 把两端的控制通道用队列接起来：发送只入队，由 Pump 逐个送达，避免回调重入。
+static void Pump(NSMutableArray<NSArray *> *pending) {
+    NSUInteger guard = 0;
+    while (pending.count > 0 && guard++ < 500) {
+        NSArray *item = pending.firstObject;
+        [pending removeObjectAtIndex:0];
+        M1ControlChannel *dest = item[0];
+        [dest feedBytes:item[1]];
+    }
+}
+
+static NSError *ErrOf(id v) {
+    return [v isKindOfClass:[NSError class]] ? (NSError *)v : nil;
+}
+
+// 建一对真实会话（帧通道不参与，只跑控制流），返回观测结果。
+// 显式给两端的本地指纹，才能构造「指纹不符」这类负向场景。
+static NSDictionary *RunPairFull(NSString *clientCode, NSString *hostCode,
+                                 NSString *clientLocal, NSString *clientExpect,
+                                 NSString *hostLocal, NSString *hostExpect) {
+    M1MemoryMessageSink *c2h = [M1MemoryMessageSink new];
+    M1MemoryMessageSink *h2c = [M1MemoryMessageSink new];
+    M1ControlChannel *cCh = [[M1ControlChannel alloc] initWithSink:c2h];
+    M1ControlChannel *hCh = [[M1ControlChannel alloc] initWithSink:h2c];
+    NSMutableArray<NSArray *> *pending = [NSMutableArray array];
+    c2h.onSend = ^BOOL(NSData *m, NSError **e) { [pending addObject:@[ hCh, m ]]; return YES; };
+    h2c.onSend = ^BOOL(NSData *m, NSError **e) { [pending addObject:@[ cCh, m ]]; return YES; };
+
+    M1ControlSessionConfig *cc = [M1ControlSessionConfig new];
+    cc.role = M1ControlRoleClient;
+    cc.localFingerprint = clientLocal;
+    cc.expectedPeerFingerprint = clientExpect;
+    cc.pairingCode = clientCode;
+    cc.heartbeatIntervalMs = 0;
+    cc.specs = @[ @{ @"w": @1920, @"h": @1080, @"hidpi": @NO, @"refresh": @60 } ];
+
+    M1ControlSessionConfig *hc = [M1ControlSessionConfig new];
+    hc.role = M1ControlRoleHost;
+    hc.localFingerprint = hostLocal;
+    hc.expectedPeerFingerprint = hostExpect;
+    hc.pairingCode = hostCode;
+    hc.heartbeatIntervalMs = 0;
+
+    M1ControlSession *client = [[M1ControlSession alloc] initWithChannel:cCh config:cc];
+    M1ControlSession *host = [[M1ControlSession alloc] initWithChannel:hCh config:hc];
+    M1TestSessionWatcher *cw = [M1TestSessionWatcher new];
+    M1TestSessionWatcher *hw = [M1TestSessionWatcher new];
+    client.delegate = cw;
+    host.delegate = hw;
+
+    [client begin];
+    [host begin];
+    Pump(pending);
+
+    return @{ @"client": client, @"host": host,
+              @"clientError": cw.error ?: (id)[NSNull null],
+              @"hostError": hw.error ?: (id)[NSNull null] };
+}
+
+// 常规场景：本地指纹取「对端期望值」，两端自然对得上。
+static NSDictionary *RunPair(NSString *clientCode, NSString *hostCode,
+                             NSString *clientExpect, NSString *hostExpect) {
+    return RunPairFull(clientCode, hostCode,
+                       hostExpect ? hostExpect : FP(@"cd"), clientExpect,
+                       clientExpect ? clientExpect : FP(@"ab"), hostExpect);
+}
+
+static void TestControlSessionOverPipe(void) {
+    printf("=== control session (TOFU) ===\n");
+    NSDictionary *r = RunPair(nil, nil, FP(@"ab"), FP(@"cd"));
+    M1ControlSession *client = r[@"client"];
+    M1ControlSession *host = r[@"host"];
+
+    OK(client.reachedStreaming, "ctl-client-streaming");
+    OK(host.reachedStreaming, "ctl-host-streaming");
+    OK([r[@"clientError"] isKindOfClass:[NSNull class]], "ctl-client-no-error");
+    OK([r[@"hostError"] isKindOfClass:[NSNull class]], "ctl-host-no-error");
+
+    NSArray *expect = @[@"DISCOVERED", @"TLS_CONNECTED", @"PAIRED",
+                        @"NEGOTIATED", @"DISPLAYS_READY", @"STREAMING"];
+    OK([client.stateLog isEqualToArray:expect], "ctl-client-state-sequence");
+    OK([host.stateLog isEqualToArray:expect], "ctl-host-state-sequence");
+    OK([client.stateLog isEqualToArray:host.stateLog], "ctl-state-logs-identical");
+    OK(host.sessionID.length > 0 && [host.sessionID isEqualToString:client.sessionID],
+       "ctl-session-id-agree");
+    OK(client.remoteDisplays.count == 1, "ctl-displays-count");
+    OK([client.remoteDisplays.firstObject[@"synthetic"] boolValue], "ctl-display-synthetic-marked");
+    OK([client.stateMachine canAcceptInput], "ctl-input-allowed-in-streaming");
+}
+
+static void TestControlSessionPairingCode(void) {
+    printf("=== control session (pairing code) ===\n");
+    NSDictionary *ok = RunPair(@"123456", @"123456", nil, nil);
+    OK([(M1ControlSession *)ok[@"client"] reachedStreaming] &&
+       [(M1ControlSession *)ok[@"host"] reachedStreaming],
+       "ctl-pair-code-success");
+
+    NSDictionary *bad = RunPair(@"000000", @"123456", nil, nil);
+    NSError *hostErr = ErrOf(bad[@"hostError"]);
+    OK(hostErr != nil && hostErr.code == M1ControlSessionErrorPairingCode,
+       "ctl-pair-code-mismatch-rejected");
+    OK(![(M1ControlSession *)bad[@"host"] reachedStreaming], "ctl-pair-code-mismatch-not-streaming");
+
+    // hello 指纹与钉死值不符必须拒绝（Client 期望 zz，Host 实际通告 ab）
+    NSDictionary *fpBad = RunPairFull(nil, nil, FP(@"cd"), FP(@"zz"), FP(@"ab"), FP(@"cd"));
+    NSError *fpErr = ErrOf(fpBad[@"clientError"]);
+    OK(fpErr != nil && fpErr.code == M1ControlSessionErrorFingerprint,
+       "ctl-hello-fingerprint-mismatch");
+    OK(![(M1ControlSession *)fpBad[@"client"] reachedStreaming],
+       "ctl-fingerprint-mismatch-not-streaming");
+}
+
 int main(void) {
     @autoreleasepool {
         TestPairing();
@@ -462,6 +655,9 @@ int main(void) {
         TestDriverLogic();
         TestInputLogic();
         TestFrameSender();
+        TestControlChannel();
+        TestControlSessionOverPipe();
+        TestControlSessionPairingCode();
         printf("\n=== %d passed, %d failed ===\n", gPass, gFail);
         printf("%s\n", gFail == 0 ? "ALL PASS" : "FAILURES");
         return gFail == 0 ? 0 : 1;

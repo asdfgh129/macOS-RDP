@@ -3,16 +3,26 @@
 # 生成 QUIC 用的自签身份（p12），M1-A 第 1/2 步的测试证书。
 # 生产形态应由用户在配对流里确认指纹，而不是预置固定证书；这里只服务本机环回实验。
 #
-# 用法：./gen_quic_identity.sh [目录] [名称] [p12 密码]
+# 用法：./gen_quic_identity.sh [目录] [名称] [p12 密码] [--force]
+#   --force  已存在也重建。
+#   为什么需要：本机会随机生成出「结构完好但 TLS 层不接受」的 RSA 私钥
+#   （表现为握手 -9858 handshake failed，见 docs/RESULTS-BY-OS.md NEG-02）。
+#   撞上时唯一解法就是换一把钥匙，所以构建脚本要能强制重建。
 #
 set -euo pipefail
 
-DIR="${1:-.state}"
-NAME="${2:-rdp-identity}"
-PASS="${3:-rdpdev}"
+FORCE=0
+ARGS=()
+for a in "$@"; do
+    if [[ "$a" == "--force" ]]; then FORCE=1; else ARGS+=("$a"); fi
+done
+
+DIR="${ARGS[0]:-.state}"
+NAME="${ARGS[1]:-rdp-identity}"
+PASS="${ARGS[2]:-rdpdev}"
 
 mkdir -p "$DIR"
-if [[ -f "$DIR/$NAME.p12" ]]; then
+if [[ -f "$DIR/$NAME.p12" && $FORCE -eq 0 ]]; then
     echo "已存在: $DIR/$NAME.p12"
     exit 0
 fi

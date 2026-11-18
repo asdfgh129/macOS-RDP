@@ -93,6 +93,13 @@ typedef NS_ENUM(NSInteger, M1QuicState) {
 @property (nonatomic, readonly) M1QuicState state;
 @property (nonatomic, readonly) M1QuicTransportStats *stats;
 
+// 客户端握手看门狗：超时即丢弃这条连接重试一条（治 QUIC Initial 重传退避导致的 6–11s 离群）。
+// connectTimeoutMs=0 关闭；默认 3000ms、2 次尝试。
+@property (nonatomic, assign) uint32_t connectTimeoutMs;
+@property (nonatomic, assign) NSUInteger maxConnectAttempts;
+// 已发起的握手次数（含重试），用于观测离群是否被重试吃掉。
+@property (nonatomic, readonly) NSUInteger connectAttempts;
+
 @property (nonatomic, readonly) BOOL isListener;
 @property (nonatomic, readonly) uint16_t listenPort;          // 仅 listener 有意义
 // 当前连接可用的最大 datagram 载荷（含我们自己的 16B 帧头）。0 = 尚未协商出来。
@@ -114,6 +121,12 @@ typedef NS_ENUM(NSInteger, M1QuicState) {
 - (BOOL)waitUntilReadyTimeoutMs:(uint32_t)timeoutMs;
 
 @end
+
+// 读取 p12 身份并返回其叶子证书 SHA-256（小写 hex）。
+// 配对 UI 要展示「本机指纹」、自检要比对钉死值，都需要它。
+NSString * _Nullable M1QuicIdentityFingerprint(NSString *identityPath,
+                                               NSString * _Nullable password,
+                                               NSError * _Nullable * _Nullable error);
 
 NS_ASSUME_NONNULL_END
 
