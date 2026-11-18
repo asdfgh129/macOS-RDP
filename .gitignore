@@ -24,6 +24,23 @@ __pycache__/
 # P0V 探针构建产物（源码入库，二进制不入库）
 P0V-RootDaemon/build/
 P0V-SessionRecon/recon
+P0V-SessionRecon/gui_session_probe
 P0V-DisplayIsolation/v01probe
 P0V-AltCapture/altprobe
 P0-TahoeProbe/last_min.log
+
+# M1 骨架与采编探针构建产物（源码入库，二进制不入库）
+M1-Pre-CaptureCodec/capturecodec
+M1-Skeleton/test_skeleton
+M1-Skeleton/guardian_handshake_test
+M1-Skeleton/driver_probe
+M1-Skeleton/pipeline_probe
+M1-Skeleton/pipeline_kiosk_probe
+RDPApp/.build/
+RDPApp/rdpapp
+
+# 显示恢复应急工具二进制（源码入库，二进制不入库）
+P0V-DisplayIsolation/recover_displays
+P0V-DisplayIsolation/recover_v2
+P0V-DisplayIsolation/recover_v4
+P0V-DisplayIsolation/recover_v5
