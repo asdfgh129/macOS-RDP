@@ -111,9 +111,28 @@ bash run.sh                 # 只读侦察
 bash run.sh --test-config   # 额外验证「开显示事务 → 取消」（不提交变更）
 ```
 
-## 2026-11-18 Tahoe 26.5.2 实测补记（V-02）
+## 2026-11-18 Tahoe 26.5.2 实测补记（V-02/V-04，最终结论）
 
-- `p0vprobe lock` 调用 `SACLockScreenImmediate` 可程序化锁屏，实测 `screenIsLocked=true`（见 `P0V-RootDaemon`）。
-- 锁屏后 active 集合里**已没有物理屏**，`v01probe --dry-run` 因「没有可禁用的物理屏」直接 `ABORTED`（`/tmp/tahoe-20261118-r2-v02-dryrun.log`）。
-- `P0V-AltCapture/altprobe --no-disable` 在锁屏态能创建虚拟屏 4128835、mode 1280×720 提交成功，但 8s liveness 内始终 `online=true / active=false / usable=0`，退出码 2（`/tmp/tahoe-20261118-v02lock-alt.log`）。
-- **结论：V-02 在 Tahoe 不成立——锁屏态建不出 active 虚拟屏**。Sequoia 未测，不可外推。详细说明见 `docs/RESULTS-BY-OS.md`。
+- `p0vprobe lock` 调用 `SACLockScreenImmediate` 可程序化锁屏，实测 `screenIsLocked=true`。
+- **时间线陷阱**：锁屏后 2–3s 显示睡眠，`CGGetActiveDisplayList` 与 SCK 的 displayIDs
+  都变空。必须先 `caffeinate -d` 再锁屏，才能保持屏亮态。早前「锁屏后 active 无物理屏、
+  `v01probe` ABORTED」是屏睡导致的，不是物理屏消失。
+- **假阴性根因**：`altprobe --no-disable` 旧版在 `waitUntilUsable`（要求 `active=true`）
+  提前退出，且 `run_v02_locked.sh` 用 `awk $3` 取虚拟屏 ID（实际在 `$2`），三路径捕获
+  从未执行 ⇒ 「`active=false` / V-02 不成立」是错的。修正后锁屏态虚拟屏 `online=1/active=1`。
+- ✅ **V-02 / V-04d 最终成立**：`run_patha_tahoe.sh`（聚焦）与 `run_patha_nofocus.sh`
+  （不聚焦）两轮，在锁屏+屏亮态建 active 虚拟屏后**禁掉全部物理屏**，
+  `altprobe` 抓到的截图出现完整登录界面（日期/时钟/`bemin` 头像/`Enter Password` 框）：
+  `/tmp/tahoe-20261118-r5-shot.png.disabled.png`、`/tmp/tahoe-20261118-r6-shot.png.disabled.png`。
+  两轮均成立 ⇒ **登录 UI 迁移的充分条件是「零 active 物理屏」，与光标聚焦无关**。
+- ✅ **V-04b/c 干净通过**：两轮 `INJECTION_ACCEPTED_AND_UNLOCKED`、256/256 变化、
+  `sessionAfter.screenIsLocked=false`。**凭据只经 `P0V_PW` 环境变量在运行时传入**：
+
+```bash
+P0V_PW='<你的密码>' bash run_patha_tahoe.sh      # 聚焦对照（已验证）
+P0V_PW='<你的密码>' bash run_patha_nofocus.sh    # 无聚焦对照（已验证）
+```
+
+  脚本本身/日志/JSON/文档**不落盘明文密码**；运行时由助手程序化注入，锁屏期间无需用户
+  看终端标记。结论：**Path A 端到端成立**，前置是常驻防显示睡眠断言。
+  Sequoia 未做本组实验，不可外推。详见 `docs/RESULTS-BY-OS.md`。

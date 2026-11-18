@@ -29,6 +29,8 @@ static NSUInteger optHeight = 720;
 static int optCaptureMs = 1200;
 static NSString *optOut = @"/tmp/p0v-alt-capture.json";
 static BOOL optNoDisable = NO;
+static BOOL optFocus = NO;
+static NSString *optShotPath = nil;
 
 static void AltUsage(void) {
     fprintf(stderr,
@@ -95,25 +97,46 @@ static NSDictionary *AltAnalyzeImage(CGImageRef image) {
     };
 }
 
-static NSString *optShotPath = nil;
+// 把 CGImage 存成 PNG；用于人工核对「抓到的是壁纸还是登录 UI」。
+static BOOL AltSaveShot(CGImageRef img, NSString *path) {
+    if (!img || !path) return NO;
+    NSURL *url = [NSURL fileURLWithPath:path];
+    CFStringRef pngType = CFSTR("public.png");
+    CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)url,
+                                                pngType, 1, NULL);
+    if (!dest) return NO;
+    CGImageDestinationAddImage(dest, img, NULL);
+    BOOL ok = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    return ok;
+}
 
-static NSDictionary *AltSampleCGDisplay(CGDirectDisplayID displayID, int samples) {
+// 把鼠标移到虚拟屏中心并点一下；macOS 多屏锁屏时登录框通常跟随光标所在屏。
+static NSDictionary *AltFocusDisplay(CGDirectDisplayID displayID) {
+    CGRect b = CGDisplayBounds(displayID);
+    CGPoint local = CGPointMake(b.size.width / 2.0, b.size.height / 2.0);
+    CGPoint global = CGPointMake(CGRectGetMidX(b), CGRectGetMidY(b));
+    CGError moveErr = CGDisplayMoveCursorToPoint(displayID, local);
+    CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, global, kCGMouseButtonLeft);
+    CGEventRef up = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp, global, kCGMouseButtonLeft);
+    CGEventPost(kCGHIDEventTap, down);
+    CGEventPost(kCGHIDEventTap, up);
+    if (down) CFRelease(down);
+    if (up) CFRelease(up);
+    [NSThread sleepForTimeInterval:0.8];
+    return @{ @"moveError": @(moveErr),
+              @"axTrusted": @(AXIsProcessTrusted()),
+              @"point": NSStringFromPoint(global),
+              @"bounds": NSStringFromRect(b) };
+}
+
+static NSDictionary *AltSampleCGDisplay(CGDirectDisplayID displayID, int samples, NSString *shotPath) {
     NSMutableArray *rows = [NSMutableArray array];
     BOOL savedShot = NO;
     int blackCount = 0, maxVar = 0, minMean = 999;
     for (int i = 0; i < samples; i++) {
         CGImageRef img = CGDisplayCreateImage(displayID);
-        if (img && optShotPath && !savedShot) {
-            NSURL *url = [NSURL fileURLWithPath:optShotPath];
-            CFStringRef pngType = CFSTR("public.png");
-            CGImageDestinationRef dest = CGImageDestinationCreateWithURL((__bridge CFURLRef)url,
-                                                        pngType, 1, NULL);
-            if (dest) {
-                CGImageDestinationAddImage(dest, img, NULL);
-                savedShot = CGImageDestinationFinalize(dest);
-                CFRelease(dest);
-            }
-        }
+        if (img && shotPath && !savedShot) savedShot = AltSaveShot(img, shotPath);
         NSDictionary *row = AltAnalyzeImage(img);
         if (img) CGImageRelease(img);
         [rows addObject:row];
@@ -228,17 +251,22 @@ static int AltRun(void) {
     printf("虚拟屏就绪: %u\n", displayID);
     fflush(stdout);
 
+    out[@"axTrusted"] = @(AXIsProcessTrusted());
     NSError *sckErr = nil;
     NSArray *sckIDs = [PipelineProbe shareableDisplayIDsWithError:&sckErr];
     out[@"sckVisible"] = @([sckIDs containsObject:@(displayID)]);
     out[@"sckError"] = sckErr.localizedDescription ?: [NSNull null];
+    if (optFocus) out[@"focus"] = AltFocusDisplay(displayID);
 
     CGRect bounds = CGDisplayBounds(displayID);
     int samples = MAX(2, optCaptureMs / 300);
+    NSString *baseShot = optShotPath;
+    NSString *disabledShot = optShotPath
+        ? [optShotPath stringByAppendingString:@".disabled.png"] : nil;
     out[@"stage"] = @"baseline";
     out[@"baseline"] = @{
         @"sck": [PipelineProbe captureDisplayID:displayID durationMs:optCaptureMs withEncoder:NO],
-        @"cgDisplay": AltSampleCGDisplay(displayID, samples),
+        @"cgDisplay": AltSampleCGDisplay(displayID, samples, baseShot),
         @"windows": AltSampleWindows(bounds, samples),
     };
 
@@ -288,7 +316,7 @@ static int AltRun(void) {
     out[@"disabledBounds"] = NSStringFromRect(disabledBounds);
     out[@"disabled"] = @{
         @"sck": [PipelineProbe captureDisplayID:displayID durationMs:optCaptureMs withEncoder:NO],
-        @"cgDisplay": AltSampleCGDisplay(displayID, samples),
+        @"cgDisplay": AltSampleCGDisplay(displayID, samples, disabledShot),
         @"windows": AltSampleWindows(disabledBounds, samples),
     };
 
@@ -362,6 +390,8 @@ int main(int argc, const char *argv[]) {
                 // 兼容 v01probe 习惯；本探针默认无需交互
             } else if (strcmp(argv[i], "--no-disable") == 0) {
                 optNoDisable = YES;
+            } else if (strcmp(argv[i], "--focus") == 0) {
+                optFocus = YES;
             } else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
                 optShotPath = [NSString stringWithUTF8String:argv[++i]];
             } else {

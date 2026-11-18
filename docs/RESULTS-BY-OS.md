@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.2-draft |
+| 版本 | v0.4-draft |
 | 日期 | 2026-11-18 |
 | 原则 | **结论绑定具体 OS build 与机器，禁止跨版本外推**。同一判据在 Sequoia 与 Tahoe 分别记录，未测就写未测。 |
 | 上位文档 | `docs/DESIGN.md` §8、`docs/DECISIONS.md` |
@@ -73,11 +73,12 @@
 
 | 项 | Sequoia 15.5 | Tahoe 26.5.2 |
 |---|---|---|
-| V-02 | 未测 | ⚠️ **更正为「建屏成立、登录 UI 未验证」**：此前 `active=false` 是探针在 `waitUntilUsable` 提前退出 + 脚本 `awk $3` 取错 ID 造成的**假阴性**（捕获从未执行）。修正探针后：锁屏+屏睡态与锁屏+屏亮态，虚拟屏均为 `online=1 / active=1`；`/tmp/tahoe-20261118-r3-sleep-direct.json`、`/tmp/tahoe-20261118-r4-capture.json` |
-| V-02 采集（屏睡态） | 未测 | SCK `NO_FRAMES_TCC_OR_STALE`；`CGDisplayCreateImage` `HAS_CONTENT` mean=163；但截图仅为**锁屏壁纸、无登录框**（`/tmp/tahoe-r3-lockscreen.png`） |
-| V-02 采集（屏亮态） | 未测 | SCK `HAS_CONTENT` 50 帧；`CGDisplayCreateImage` / `CGWindowListCreateImage` 均 `HAS_CONTENT`（mean 148/149 var 1639/1514）；截图仍**仅壁纸、无登录框**（`/tmp/tahoe-20261118-r4-lockscreen.png`） |
-| V-04d | 未实现 | ⚠️ **不成立但理由更正**：虚拟屏能 active，但登录 UI 没有迁移到虚拟屏（两态截图均只有壁纸）。`CGWindowListCreateImage` 在屏亮态 `HAS_CONTENT` 是壁纸内容，不是登录框 |
-| 证据 | — | `/tmp/tahoe-20261118-r4-t{0,1,2,3,5}.json`、`/tmp/tahoe-20261118-r4-capture.json`、`/tmp/tahoe-r3-lockscreen.png`、`/tmp/tahoe-20261118-r4-lockscreen.png` |
+| V-02 | 未测 | ✅ **成立**（2026-11-18 10:49）：锁屏+屏亮态下虚拟屏 4128835 `online=1/active=1`；`--focus` 与无 focus 两轮，`disable` 后 active 只剩 `[4128835]`、恢复 OK；此前 `active=false` 是探针 `waitUntilUsable` 提前退出 + 脚本 `awk $3` 取错 ID 的假阴性（捕获从未执行） |
+| V-02 采集（屏睡态） | 未测 | SCK `NO_FRAMES`；`CGDisplayCreateImage` `HAS_CONTENT` mean=163；截图仅壁纸（`/tmp/tahoe-r3-lockscreen.png`）。**屏睡态不满足 Path A 采集判据**，需 caffeinate 先于 lock 或等价防睡眠 |
+| V-02 采集（屏亮态） | 未测 | 三路径全 `HAS_CONTENT`：SCK 50 帧；`CGDisplayCreateImage` mean≈148/var≈1650；`CGWindowListCreateImage` mean≈149/var≈1550（`/tmp/tahoe-20261118-r4-capture.json`） |
+| V-04d | 未实现 | ✅ **成立**（2026-11-18 10:49/10:52 两轮）：禁掉全部物理屏后，**登录 UI 完整渲染到虚拟屏**——截图含 `Wed Nov 18`、时钟、`bemin` 头像与 `Enter Password` 输入框（`/tmp/tahoe-20261118-r5-shot.png.disabled.png`、`/tmp/tahoe-20261118-r6-shot.png.disabled.png`）。v0.3「仅壁纸、登录框未迁移」结论作废：此前探针只建屏未禁屏，登录 UI 仍留在物理屏上 |
+| 登录框迁移触发条件 | — | **「零 active 物理屏」是充分条件，与光标聚焦无关**：r5 移光标+点击、r6 不移动，两轮禁屏后截图均出现完整登录框；`--focus` 非必需，产品实现可省略该步 |
+| 证据 | — | `/tmp/tahoe-20261118-r4-t{0,1,2,3,5}.json`、`/tmp/tahoe-20261118-r5-{migrate,inject}.json`、`/tmp/tahoe-20261118-r6-{migrate,inject}.json`、两张 `.disabled.png` 截图 |
 
 ---
 
@@ -87,10 +88,10 @@
 |---|---|---|
 | root LaunchDaemon 路径 | ❌ 失败：TCC 只记路径条目（`client_type=1`），`axTrusted=0`，SCK 6s 超时；无 GUI 会话 | 未重测（已知门槛是 TCC 身份与 GUI 会话归属，不是 root 特权） |
 | V-04a 用户态锁屏捕获 | ✅ 真实登录界面，`HAS_CONTENT` | ✅ 通过：`session.screenIsLocked=true`、`HAS_CONTENT`、17 帧、`minMean=134`、0 黑帧（`/tmp/tahoe-20261118-r2-v04a.json`） |
-| V-04b 用户态定向注入 | ✅ `INJECTION_ACCEPTED_UI_CHANGED`，152/256 格变化 | ⚠️ **未确认**：r1 的 `aa`+Return 后用户手动解锁，判据被污染；r2 改用长错误密码但抓屏时会话已解锁、256/256 格无变化。需在全程锁屏下重测 |
-| V-04c 正确密码解锁 | ⏸ 主动跳过、记为未测（需真实凭据） | 同样跳过，不向助手提供密码 |
-| V-04d 登录窗建屏+禁屏 | 未实现 | ⚠️ 不成立：虚拟屏可 active，但登录 UI 未迁移到虚拟屏（见 §3.3） |
-| 结论 | loginwindow 不阻止用户会话进程捕获/定向注入；推荐形态改为正确签名的用户态 App | **2026-11-18 10:40 更正**：撤回「Path A 在 Tahoe 不成立」的过度推论。已证：① 锁屏态虚拟屏可 active；② 锁屏+屏亮时 SCK 可捕获 50 帧；③ 屏睡是 SCK 无帧的原因，caffeinate 先于 lock 可避免。未证：登录框是否渲染到虚拟屏（截图仅壁纸）、V-04b 干净重测、V-04c。**Path A 应记为「未验证」，不是「失败」** |
+| V-04b 用户态定向注入 | ✅ `INJECTION_ACCEPTED_UI_CHANGED`，152/256 格变化 | ✅ **通过**（2026-11-18 10:49/10:52 两轮）：`INJECTION_ACCEPTED_AND_UNLOCKED`、256/256 格变化、`maxCellDiff=196`；注入全程由助手程序化执行，无人工干预（`/tmp/tahoe-20261118-r5-inject.json`、`r6-inject.json`） |
+| V-04c 正确密码解锁 | ⏸ 主动跳过、记为未测（需真实凭据） | ✅ **通过**：用户提供真实凭据，经环境变量 `P0V_PW` 在运行时注入（`P0V-SessionRecon/run_patha_*.sh` 脚本与日志均不含明文）；两轮 `sessionAfter`：`screenIsLocked=false / available=true / loginDone=true / onConsole=true / auditID=100001` |
+| V-04d 登录窗建屏+禁屏 | 未实现 | ✅ 通过：禁全部物理屏后登录 UI 完整出现在虚拟屏（见 §3.3） |
+| 结论 | loginwindow 不阻止用户会话进程捕获/定向注入；推荐形态改为正确签名的用户态 App | ✅ **Path A 在 Tahoe 26.5.2 端到端成立（2026-11-18 10:52）**：全程锁屏+屏亮 → 建 active 虚拟屏 → 禁全部物理屏 → 登录 UI 迁移到虚拟屏且三路径可捕获 → 密码注入成功解锁。前置条件：必须先防显示睡眠（caffeinate 或产品内断言）；采集在屏亮态 SAF，屏睡态 SCK 无帧。D-08 四项全过，**不再需要回退 Path B** |
 
 ---
 
@@ -114,8 +115,8 @@
 |---|---|---|
 | A-01 Tahoe SPI 可用 | — | ✅ 关闭 |
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 |
-| A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ⚠️ 部分：V-01 关闭；V-03 机制通过但 SCK 采集不可靠；V-02 建屏成立、登录 UI 未证；替代采集路径可行但未接入 |
-| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | V-04a ✅、V-04b 未确认、V-04c 未测、V-04d ⚠️ 登录 UI 未迁移到虚拟屏；**Path A 未验证（非失败）**；关键新发现：锁屏后 2-3s 显示睡眠导致 SCK 无帧，caffeinate 可避免 |
+| A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
+| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） |
 | A-02 glass-to-glass 延迟 | 未测 | 未测 |
 
 ---
@@ -125,3 +126,4 @@
 - v0.1-draft 2026-11-18：首次建立按 OS 分离的结论表；把 Sequoia 与 Tahoe 的 V-01/V-03/V-04 结论拆开，明确禁止跨版本外推。
 - v0.2-draft 2026-11-18：补入 Tahoe V-02（锁屏态虚拟屏 `active=false`，不成立）、V-04a（通过）、V-04b（判据污染，未确认）、V-04d（不成立）；补入替代采集路径对照结果（`CGDisplayCreateImage`/`CGWindowListCreateImage` 稳定可用）。
 - v0.3-draft 2026-11-18 10:40：**重要更正**。发现 v0.2 的 V-02 结论是假阴性——探针 `waitUntilUsable` 提前退出 + 脚本 `awk $3` 取错 ID，捕获从未执行。用户补充「锁屏 2-3 秒后屏睡」后重测：① 屏睡导致 SCK 无帧，caffeinate 先于 lock 可保持屏亮、SCK 恢复 50 帧；② 锁屏态虚拟屏实际 `active=1`（两种状态均是）；③ 截图显示虚拟屏上只有锁屏壁纸、无登录框。撤回「Path A 在 Tahoe 不成立」，改记「Path A 未验证」；V-04d 不成立理由从「不能建 active 屏」更正为「登录 UI 未迁移到虚拟屏」。
+- v0.4-draft 2026-11-18 10:52：**Path A 端到端成立，结论翻转为通过**。v0.3 的「登录框未迁移」是假阴性——此前探针只建虚拟屏、未禁物理屏，登录 UI 自然留在物理屏。本次 r5/r6 两轮在锁屏+屏亮态禁掉全部物理屏后，虚拟屏截图出现完整登录 UI（日期/时钟/`bemin`/密码框），且无 focus 对照同样成立 → 迁移触发条件是「零 active 物理屏」，与光标无关。用户授权的真实凭据经 `P0V_PW` 环境变量在运行时注入，V-04b/c 干净通过（`INJECTION_ACCEPTED_AND_UNLOCKED`、256/256、会话 locked→unlocked），脚本/日志/文档均无明文密码。A-08/A-09 在 Tahoe 关闭，D-08 四项全过，不再回退 Path B。

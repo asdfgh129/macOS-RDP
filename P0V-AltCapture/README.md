@@ -28,6 +28,8 @@ bash build.sh      # 产物 ./altprobe，ad-hoc 签名 com.p0v.altcapture
 
 ```bash
 ./altprobe --spec 1280x720 --capture-ms 1200 --out /tmp/p0v-alt-tahoe.json
+# 可选：--no-disable 只建屏不禁屏；--focus 把光标移到虚拟屏并点击；
+#       --shot /tmp/x.png 存禁屏前帧，另自动存 /tmp/x.png.disabled.png（禁屏后帧）
 ```
 
 流程：
@@ -70,5 +72,18 @@ bash build.sh      # 产物 ./altprobe，ad-hoc 签名 com.p0v.altcapture
   - `CGWindowListCreateImage`：修正禁屏后 bounds 重排（x=4520→0）导致的区域错位后，与整屏路径一致；
   - SCK：V-03 中曾全黑/多数帧黑；本探针中虽 `HAS_CONTENT`，但仅 2–4fps，不可作为实时路径。
   - 恢复 OK。证据：`/tmp/p0v-alt-tahoe3.json`、`/tmp/p0v-alt-tahoe-1080.json`。
-- 锁屏态 `--no-disable`：虚拟屏可创建（4128835）但 8s 内 `online=true / active=false`，
-  退出码 2；证据 `/tmp/tahoe-20261118-v02lock-alt.log`。
+- 锁屏态 `--no-disable`：旧版 8s liveness 判 `active=false` 是假阴性（硬闸门提前退出），
+  修正后锁屏+屏亮态虚拟屏 `active=1`，三路径均 `HAS_CONTENT`。
+- **2026-11-18 10:52 最终结论（Path A 成立）**：在锁屏+屏亮态建 active 虚拟屏后
+  **禁掉全部物理屏**，登录 UI 完整迁移到虚拟屏：
+
+```bash
+# 先 caffeinate -d 保持屏亮，再程序化锁屏（见 P0V-SessionRecon/run_patha_*.sh）
+./altprobe --spec 1280x720 --capture-ms 1500 --focus \
+    --shot /tmp/lock.png --out /tmp/result.json
+# 禁屏后帧存到 /tmp/lock.png.disabled.png：可见日期/时钟/用户名/Enter Password 框
+```
+
+  `--focus`（移光标+点击）**非必需**：`run_patha_nofocus.sh` 不做聚焦，禁屏后同样拿到
+  完整登录框 ⇒ 触发条件是「零 active 物理屏」。两轮禁用/恢复均 OK，
+  SCK/双公开 API 在三路径下全 `HAS_CONTENT`。详见 `docs/RESULTS-BY-OS.md` §3.3/§4。
