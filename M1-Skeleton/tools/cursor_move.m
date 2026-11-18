@@ -19,7 +19,10 @@ int main(int argc, char **argv) {
     @autoreleasepool {
         // 锁屏时 SCK 拿不到 display、窗口收不到输入，验证前必须先排除。
         if (argc >= 2 && !strcmp(argv[1], "locked")) {
-            BOOL locked = NO;
+            // 拿不到会话字典时按「锁定」处理（fail-safe）：
+            // CGSessionCopyCurrentDictionary 在会话切换瞬间会返回 NULL，
+            // 之前把这种情况当成「已解锁」，导致脚本误判后立刻又失败。
+            BOOL locked = YES;
             CFDictionaryRef d = CGSessionCopyCurrentDictionary();
             if (d) {
                 NSDictionary *dict = (__bridge NSDictionary *)d;

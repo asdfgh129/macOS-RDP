@@ -815,13 +815,16 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.1 | 输入走**现有控制通道**，不开新通道：1000 event/s 上限对键鼠足够，且已经有 seq/ACK 可靠性 | `M1ControlSession sendInputEvent:` |
 | C-17.2 | 输入只在 **STREAMING 态**收发；非 STREAMING 一律**静默丢弃并计数**，不 `failWith`——高频路径上丢几条不该把会话判死 | `sendInputEvent:` / `handleInput:` |
 | C-17.3 | `displayID` 发送时**两处都带**，接收时 event 内缺失回落到消息层（F-17.2） | `M1ControlSession.m` |
-| C-17.4 | 上屏用 `CIContext → CGImage → layer.contents`，不用 `AVSampleBufferDisplayLayer`：后者要喂压缩 sample，会绕开 `M1FrameReceiver` 的解码统计 | `M1FrameView` |
+| C-17.4 | 上屏用 `CIContext → IOSurface → layer.contents`（零拷贝），不用 `AVSampleBufferDisplayLayer`：后者要喂压缩 sample，会绕开 `M1FrameReceiver` 的解码统计 | `M1FrameView` |
+| C-17.4b | **不用 `createCGImage` 贴图**：每帧一次 GPU→CPU 回读（3440×1440 BGRA=19.8 MB），实测 0.5–0.9 s/帧；改 `render:toCVPixelBuffer:` 后 10.4 ms/帧 | `M1FrameView presentPixelBuffer:` |
 | C-17.5 | 画面转换在独立串行队列，只把 `layer.contents` 赋值回主线程；积压 >2 帧丢新帧 | `M1FrameView presentPixelBuffer:` |
 | C-17.6 | letterbox 几何与坐标反算**共用同一组纯函数**（`M1AspectFitRect` / `M1NormalizedPointFromViewPoint`），避免「看到的」与「点到的」错位；落在黑边上的事件不产生输入 | `M1InputLogic` |
 | C-17.7 | `keyUp` 不单独发：协议 `key` 无 down/up 位，Host 侧本就成对注入 | `M1FrameView keyUp:` |
 | C-17.8 | 单机环回默认 `--inject record`（`M1RecordingEventSink`），真注入需显式 `--inject real` | `stream_probe` |
 | C-17.9 | 修饰键走**状态同步**（变化时发全量 `flags`），不逐事件带 flags | `M1FrameView syncModifierStateIfNeeded` |
 | C-17.10 | 视图构造时后台跑一次 16×16 空转转换，预热 `CIContext`——首次转换实测 623 ms，之后 3.3 ms，与 D-15 的 VT 会话同类 | `M1FrameView warmUpRenderPath` |
+| C-17.12 | 窗口不可见（`occlusionState` 不含 Visible）时**不贴帧**并计入 `framesSkippedOccluded`：否则 `layer.contents` 赋值会被 CA 合成阻塞 0.3–3 s，把渲染队列堵死 | `M1FrameView` |
+| C-17.13 | tracking area 用 `NSTrackingActiveAlways`（不能用 `...InKeyWindow`）+ 显式 `acceptsMouseMovedEvents=YES`：CLI 起的 App 常常拿不到 key window | `M1FrameView` / `stream_probe` |
 | C-17.11 | 上屏正确性用**离屏自检**（喂已知图案、采样 `layer.contents`）而非只靠肉眼截图：颜色通道反转在截图里不容易发现 | `tools/render_selftest.m` |
 
 ### 代价与边界
@@ -832,7 +835,10 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
   跨进程/重启后仍需再付一次。
 - 客户端不做本地节流：1000 Hz 鼠标会先把控制通道塞满再被 Host 丢弃。M1-C 再改。
 - 环回时窗口会被自己采集进去，出现「画中画递归」，是预期现象。
-- 端到端判据（窗口出画面 + 三点坐标换算）尚未在解锁环境下执行。
+- 端到端判据（窗口出画面 + 三点坐标换算）**未执行**：这台机器的会话在反复自动锁定，
+  窗口虽然 `visible=1` 但 `occluded=1 / key=0 / active=0`（登录窗在最上层），
+  上屏与输入都拿不到。离屏判据已通过（颜色/尺寸/letterbox/覆盖/10.4 ms@3440×1440）。
+  若单机无法稳定解锁，判据并入双机验收（届时窗口在另一台机器上）。
 
 ---
 

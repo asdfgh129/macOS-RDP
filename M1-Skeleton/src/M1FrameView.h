@@ -44,12 +44,19 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) CGRect videoRect;        // letterbox 后的画面矩形（视图坐标）
 @property (nonatomic, readonly) NSUInteger framesRendered;
 @property (nonatomic, readonly) NSUInteger framesDropped; // 渲染积压丢掉的帧
+// 窗口不可见（被遮住/锁屏）而没贴的帧。这个数不为 0 说明画面根本没上屏，
+// 此时 framesRendered 会偏低且渲染耗时统计不可信。
+@property (nonatomic, readonly) NSUInteger framesSkippedOccluded;
 @property (nonatomic, readonly) NSUInteger inputEventsEmitted;
 @property (nonatomic, readonly) double lastRenderMs;
 @property (nonatomic, readonly) double maxRenderMs;
 // CIContext 首次转换的冷启动耗时（实测 600ms 级，之后 3ms）。构造时已在后台预热，
 // 这里只用于观测；预热是否生效看 maxRenderMs 是否落回个位数。
 @property (nonatomic, readonly) double warmUpMs;
+
+// 最近一次渲染的输出缓冲（IOSurface 承载，返回借出的引用，下一次渲染可能重用）。
+// 仅供离屏自检采样；运行时不必读。
+- (CVPixelBufferRef)lastRenderedBuffer;
 
 @end
 

@@ -44,7 +44,10 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
     atomic_uint_fast64_t _framesRendered;
     atomic_uint_fast64_t _framesDropped;
     atomic_uint_fast64_t _inputEmitted;
+    atomic_uint_fast64_t _skippedOccluded;
     atomic_uint_fast32_t _pendingRenders;
+    CVPixelBufferRef _outBuffer;      // 复用的 BGRA 输出（IOSurface 承载），只在 renderQueue 上动
+    CGSize _outSize;
 }
 @property (nonatomic, strong) CIContext *ciContext;
 @property (nonatomic, strong) dispatch_queue_t renderQueue;
@@ -72,6 +75,7 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
         atomic_init(&_framesRendered, 0);
         atomic_init(&_framesDropped, 0);
         atomic_init(&_inputEmitted, 0);
+        atomic_init(&_skippedOccluded, 0);
         atomic_init(&_pendingRenders, 0);
         self.wantsLayer = YES;
         self.layer.backgroundColor = [NSColor blackColor].CGColor;
@@ -85,7 +89,31 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
     return self;
 }
 
-// 用 16x16 的 BUFFER 走完整条「CVPixelBuffer → CIImage → CGImage」路径，结果直接丢弃。
+// 复用一块 BGRA + IOSurface 的输出缓冲；尺寸变化才重建。
+// 必须在 renderQueue 上调用（唯一写入方）。
+- (CVPixelBufferRef)ensureOutputBufferForSize:(CGSize)size {
+    if (_outBuffer && CGSizeEqualToSize(_outSize, size)) return _outBuffer;
+    if (_outBuffer) { CVPixelBufferRelease(_outBuffer); _outBuffer = NULL; }
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+    };
+    CVPixelBufferRef pb = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)size.width, (size_t)size.height,
+                            kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) {
+        return NULL;
+    }
+    _outBuffer = pb;
+    _outSize = size;
+    return _outBuffer;
+}
+
+- (CVPixelBufferRef)lastRenderedBuffer {
+    return _outBuffer;   // 借出，仅自检用；下一次渲染可能被重用
+}
+
+// 用 16x16 的数据走完整条「CVPixelBuffer → CIImage → IOSurface」路径，结果直接丢弃。
 - (void)warmUpRenderPath {
     NSDictionary *attrs = @{
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
@@ -98,12 +126,12 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
     }
     double t0 = M1ViewNowMs();
     CIImage *image = [CIImage imageWithCVPixelBuffer:pb];
-    CGImageRef cg = image ? [self.ciContext createCGImage:image
-                                                fromRect:image.extent
-                                                  format:kCIFormatRGBA8
-                                              colorSpace:M1ViewSRGBColorSpace()] : NULL;
+    CVPixelBufferRef out = image ? [self ensureOutputBufferForSize:image.extent.size] : NULL;
+    if (image && out) {
+        [self.ciContext render:image toCVPixelBuffer:out
+                        bounds:image.extent colorSpace:M1ViewSRGBColorSpace()];
+    }
     self.warmUpMs = M1ViewNowMs() - t0;
-    if (cg) CGImageRelease(cg);
     CVPixelBufferRelease(pb);
 }
 
@@ -130,36 +158,53 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
     dispatch_async(self.renderQueue, ^{
         double t0 = M1ViewNowMs();
         CIImage *image = [CIImage imageWithCVPixelBuffer:held];
-        CGImageRef cg = NULL;
-        if (image) {
-            cg = [self.ciContext createCGImage:image
-                                      fromRect:image.extent
-                                        format:kCIFormatRGBA8
-                                    colorSpace:M1ViewSRGBColorSpace()];
+        CVPixelBufferRef out = image ? [self ensureOutputBufferForSize:image.extent.size] : NULL;
+        if (image && out) {
+            // 渲染到 IOSurface 承载的 BGRA 缓冲：全程 GPU，没有 createCGImage 的
+            // GPU→CPU 回读。3440×1440 下每帧 20 MB，回读实测 0.5~0.9 s/帧。
+            [self.ciContext render:image
+                     toCVPixelBuffer:out
+                              bounds:image.extent
+                          colorSpace:M1ViewSRGBColorSpace()];
         }
         double costMs = M1ViewNowMs() - t0;
         CVPixelBufferRelease(held);
 
-        if (!cg) {
+        IOSurfaceRef surface = out ? CVPixelBufferGetIOSurface(out) : NULL;
+        if (!surface) {
             atomic_fetch_sub(&self->_pendingRenders, 1);
             atomic_fetch_add(&self->_framesDropped, 1);
             return;
         }
-
-        // layer.contents 必须在主线程改；CGImage 由 layer retain，赋完即可释放本地引用。
+        // 主线程赋值期间缓冲可能因尺寸变化被换掉，先把 surface 自己留住。
+        CFRetain(surface);
         dispatch_async(dispatch_get_main_queue(), ^{
+            // 窗口不可见时不要贴帧：CALayer 的 contents 赋值会等合成器提交，
+            // 窗口被遮住/锁屏时实测阻塞到 0.3~3 s，把整条渲染队列堵死。
+            NSWindow *win = self.window;
+            if (win && (win.occlusionState & NSWindowOcclusionStateVisible) == 0) {
+                CFRelease(surface);
+                atomic_fetch_add(&self->_skippedOccluded, 1);
+                atomic_fetch_sub(&self->_pendingRenders, 1);
+                return;
+            }
             if (self.videoSize.width != size.width || self.videoSize.height != size.height) {
                 self.videoSize = size;
                 [self setNeedsLayout:YES];
             }
-            self.layer.contents = (__bridge id)cg;
-            CGImageRelease(cg);
+            // CALayer 支持直接把 IOSurface 当 contents（零拷贝上屏）。
+            self.layer.contents = (__bridge id)surface;
+            CFRelease(surface);
             self.lastRenderMs = costMs;
             if (costMs > self.maxRenderMs) self.maxRenderMs = costMs;
             atomic_fetch_add(&self->_framesRendered, 1);
             atomic_fetch_sub(&self->_pendingRenders, 1);
         });
     });
+}
+
+- (void)dealloc {
+    if (_outBuffer) CVPixelBufferRelease(_outBuffer);
 }
 
 - (CGRect)videoRect {
@@ -169,6 +214,7 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 - (NSUInteger)framesRendered { return (NSUInteger)atomic_load(&_framesRendered); }
 - (NSUInteger)framesDropped  { return (NSUInteger)atomic_load(&_framesDropped); }
 - (NSUInteger)inputEventsEmitted { return (NSUInteger)atomic_load(&_inputEmitted); }
+- (NSUInteger)framesSkippedOccluded { return (NSUInteger)atomic_load(&_skippedOccluded); }
 
 #pragma mark - 输入：坐标与修饰键
 
@@ -226,8 +272,10 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
     if (self.trackingArea) [self removeTrackingArea:self.trackingArea];
+    // 用 NSTrackingActiveAlways 而不是 ...InKeyWindow：命令行起的 App 常常拿不到
+    // key window（实测 inputEmitted 一直是 0），用 key window 限定就一个事件都收不到。
     NSTrackingAreaOptions opts = NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited |
-                                 NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect;
+                                 NSTrackingActiveAlways | NSTrackingInVisibleRect;
     self.trackingArea = [[NSTrackingArea alloc] initWithRect:self.bounds
                                                      options:opts
                                                        owner:self

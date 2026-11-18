@@ -754,11 +754,12 @@ int main(int argc, char **argv) {
             frameWindow.title = [NSString stringWithFormat:
                 @"macOS-RDP 客户端 %d×%d（Esc 退出）", (int)windowW, (int)windowH];
             frameWindow.releasedWhenClosed = NO;
+            // 不设这个，NSWindow 默认不投递 mouseMoved（tracking area 之外的那条路）。
+            frameWindow.acceptsMouseMovedEvents = YES;
             frameView = [[M1FrameView alloc] initWithFrame:content];
             frameWindow.contentView = frameView;
             [frameWindow center];
             [frameWindow makeKeyAndOrderFront:nil];
-            [NSApp activateIgnoringOtherApps:YES];
             [[NSNotificationCenter defaultCenter]
                 addObserverForName:NSWindowWillCloseNotification
                             object:frameWindow
@@ -827,6 +828,30 @@ int main(int argc, char **argv) {
                          atStart:NO];
             });
 
+            // 激活必须发生在事件循环跑起来之后：在 run 之前调 activateIgnoringOtherApps:
+            // 常常不生效，窗口拿不到 key，keyDown 也收不到（M1-B 实测踩过）。
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [NSApp activateIgnoringOtherApps:YES];
+                [frameWindow makeKeyAndOrderFront:nil];
+            });
+            // 定位「窗口收不到事件」时要看的三件事：窗口是否可见、是否被遮住、是不是 key。
+            for (NSNumber *delayMs in @[@800, @2500]) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)delayMs.integerValue * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    NSRect f = frameWindow.frame;
+                    printf("  [窗口 +%dms] visible=%d key=%d active=%d occluded=%d "
+                           "frame=(%.0f,%.0f %.0fx%.0f) screen=%dx%d\n",
+                           delayMs.intValue,
+                           (int)frameWindow.isVisible, (int)frameWindow.isKeyWindow,
+                           (int)[NSApp isActive],
+                           (int)((frameWindow.occlusionState & NSWindowOcclusionStateVisible) == 0),
+                           f.origin.x, f.origin.y, f.size.width, f.size.height,
+                           (int)[NSScreen mainScreen].frame.size.width,
+                           (int)[NSScreen mainScreen].frame.size.height);
+                });
+            }
+
             [NSApp run];
             printf("窗口收尾（%s）——上屏 %lu 帧，丢 %lu 帧；输入发出 %lu / 失败 %lu\n",
                    closedByUser ? "用户关闭" : "到时",
@@ -865,15 +890,17 @@ int main(int argc, char **argv) {
         PrintFlowStats(client, "client");
         printf("  状态序列: %s\n", [client.stateLog componentsJoinedByString:@" → "].UTF8String);
         if (frameView) {
-            printf("  上屏：%lu 帧（丢 %lu 帧积压），单帧转 CGImage 最近 %.1f ms / 峰值 %.1f ms\n",
+            printf("  上屏：%lu 帧（丢 %lu 积压 / 跳过 %lu 不可见），"
+                   "单帧渲染最近 %.1f ms / 峰值 %.1f ms\n",
                    (unsigned long)frameView.framesRendered,
                    (unsigned long)frameView.framesDropped,
+                   (unsigned long)frameView.framesSkippedOccluded,
                    frameView.lastRenderMs, frameView.maxRenderMs);
-            printf("  输入：发出 %lu / 丢弃 %lu / 拒绝 %lu（窗口采集 %lu 条）\n",
+            printf("  输入：窗口采集 %lu 条 → 发出 %lu / 丢弃 %lu / 拒绝 %lu\n",
+                   (unsigned long)frameView.inputEventsEmitted,
                    (unsigned long)client.session.inputEventsSent,
                    (unsigned long)client.session.inputEventsDropped,
-                   (unsigned long)client.session.inputEventsRejected,
-                   (unsigned long)frameView.inputEventsEmitted);
+                   (unsigned long)client.session.inputEventsRejected);
         }
         printf("  已保存 PNG %lu 张 → %s\n",
                (unsigned long)client.savedPaths.count, outdir.UTF8String);
@@ -907,6 +934,7 @@ int main(int argc, char **argv) {
             json[@"windowed"] = @YES;
             json[@"framesRendered"] = @(frameView.framesRendered);
             json[@"renderDropped"] = @(frameView.framesDropped);
+            json[@"renderSkippedOccluded"] = @(frameView.framesSkippedOccluded);
             json[@"lastRenderMs"] = @(round(frameView.lastRenderMs * 10) / 10.0);
             json[@"maxRenderMs"] = @(round(frameView.maxRenderMs * 10) / 10.0);
             json[@"inputEmitted"] = @(frameView.inputEventsEmitted);

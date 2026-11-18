@@ -483,7 +483,7 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 | 层 | 落点 | 说明 |
 |---|---|---|
 | 协议 | `M1ControlSession` | 补上 `sendInputEvent:` 与 Host 侧 `didReceiveInputEvent:` 回调。此前 `input` 消息在分发里被**静默忽略**（代码注释写着「属帧通道阶段」） |
-| 上屏 | `M1FrameView`（新） | `CVPixelBuffer → CIContext → CGImage → layer.contents`，`contentsGravity=kCAGravityResizeAspect` 做 letterbox |
+| 上屏 | `M1FrameView`（新） | `CVPixelBuffer → CIContext → IOSurface（BGRA）→ layer.contents`，`contentsGravity=kCAGravityResizeAspect` 做 letterbox |
 | 坐标 | `M1InputLogic`（扩充） | `M1AspectFitRect` / `M1NormalizedPointFromViewPoint`，纯函数、不依赖 AppKit，可单测 |
 | 注入 | `M1InputInjector` + `M1RecordingEventSink`（新） | 真实 `CGEventPost` 与「只记录不注入」两种下沉；环回默认 record |
 | 编排 | `stream_probe --window` / `--inject record\|real` | 窗口模式跑 `NSApplication` 事件循环；到点/Esc/关窗收尾 |
@@ -492,8 +492,13 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 
 - **上屏不走 `AVSampleBufferDisplayLayer`**。那条路要喂压缩 sample，等于绕开
   `M1FrameReceiver` 的解码统计；M1-B 要的是「同一条解码路径 + 一个显示出口」，
-  所以选 CIContext 转 CGImage。转换放在独立串行队列，只把 `layer.contents` 的赋值
+  所以选 CIContext 渲染。转换放在独立串行队列，只把 `layer.contents` 的赋值
   丢回主线程——否则又会重演 §5.7 的「在热路径上堵住收包线程」。
+- **不用 `createCGImage` 贴图**。第一版是 `createCGImage → layer.contents = CGImage`，
+  那是每帧一次 GPU→CPU 回读（3440×1440 BGRA = 19.8 MB/帧），实测单帧 **0.5–0.9 s**，
+  不可用。改为 `render:toCVPixelBuffer:` 渲染到 IOSurface 承载的 BGRA 缓冲，
+  再把 `layer.contents` 直接设成该 `IOSurfaceRef`（零拷贝），离屏实测 **10.4 ms/帧**
+  （3440×1440），降了两个数量级。
 - **渲染积压超过 2 帧直接丢新帧**，不排队。渲染跟不上时排队只会让看到的画面越来越旧。
 - **单机环回默认 `--inject record`**。Host 与 Client 是同一个桌面，真 `CGEventPost`
   会把光标从窗口里移走、甚至点中背后的 app，验证本身就被污染。双机验收再开 `--inject real`。
@@ -555,20 +560,47 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 3. 主机 `record` 模式收到的三次 `mouse` 计划里，x 分别落在「中心 ±3% 屏宽」与
    「中心 ∓ 按 letterbox 换算的 200 窗口像素」两侧，偏差 < 20%；y 偏离中心 < 8%。
 
-**当前阻塞**：屏幕处于锁定态（`CGSSessionScreenIsLocked=YES`）。锁屏时
-`SCShareableContent.displays` 为空，主机管线直接报
-`该 displayID 不在 SCShareableContent.displays 中`；客户端窗口虽然能创建，但拿不到
-任何鼠标事件。这不是代码问题，`verify_m1b.sh` 在开头就用
-`cursor_move locked` 显式失败退出，不做猜测。解锁后 `./verify_m1b.sh` 一条命令即可。
+**当前阻塞：这台机器的会话在反复自动锁定，无法稳定支撑窗口态验证。**
+
+实测证据（不是一个孤例）：
+
+| 时刻 | 现象 |
+|---|---|
+| 22:47 / 23:01 | `screencapture` 抓到的都是锁屏界面（时钟 + `bemin` 头像 + 密码框） |
+| 端到端轮次内 | 客户端打印 `visible=1 key=0 active=0 occluded=1`——窗口「已创建并 orderFront」，但**没有真正显示**，因为登录窗在最上层 |
+| 同一时刻 | SCK 采集正常、帧照常解码（说明进程与链路都没问题），只有「上屏 + 输入」这两条依赖可见窗口的路径拿不到 |
+| 锁屏状态下 | `SCShareableContent.displays` 为空，主机管线直接报 `该 displayID 不在 SCShareableContent.displays 中` |
+
+还观察到「解锁 → 数秒后又上锁」的反复（`cursor_move locked` 连续 3 次读成解锁、
+脚本随即又失败）。因此 `verify_m1b.sh` 改成了**多轮短尝试**（默认 4 轮 × ~10 s），
+命中解锁窗口即通过。12 轮回放的结论：推流、解码、上屏管线都正常，
+但没有一轮同时满足「窗口可见 + 光标落在窗口内」。
+
+**这不是代码结论，是环境前置条件。** 要跑通需要一次持续 ≥30 s 的解锁会话：
+`./verify_m1b.sh`（一条命令）。若单机始终无法稳定解锁，端到端判据直接并入双机验收——
+那时客户端窗口在另一台机器的屏幕上，不受本机会话锁屏影响。
+
+#### 本轮从失败里挖到的三个真问题（已修）
+
+1. **`createCGImage` 上屏不可用**：每帧 GPU→CPU 回读 19.8 MB，0.5–0.9 s/帧 →
+   改 IOSurface 后 10.4 ms/帧（见上文取舍）。
+2. **窗口不可见时 `layer.contents` 赋值会阻塞**。第一次端到端跑出 `943 / 1610 / 3233 ms`
+   这类荒唐数字，一度以为是渲染慢，实际是窗口被登录窗遮住、CA 合成提交被挂住，
+   赋值顺手把渲染队列堵死。现在赋值前检查 `occlusionState`，不可见就跳过并计入
+   `framesSkippedOccluded`——既不堵队列，也让「画面没上屏」在统计里显式可见。
+3. **CLI 应用的窗口拿不到 key window，tracking area 必须用 `NSTrackingActiveAlways`**。
+   第一版用了 `NSTrackingActiveInKeyWindow`，端到端 `inputEmitted` 恒为 0，
+   一个事件都收不到；另外 `NSWindow.acceptsMouseMovedEvents` 默认 NO，也要显式打开。
 
 #### 遗留
 
-- 上屏走 `CIContext` 转 CGImage，离屏实测单帧 **1.3–2.1 ms（640×360 源）**；
-  **3440×1440 全分辨率下的耗时仍未测**（要有可见窗口才能跑）。若超过 ~15 ms，
-  应改走 `IOSurface` 直贴或 `CAMetalLayer`。
+- 上屏走 `CIContext → IOSurface`，离屏实测 **10.4 ms/帧（3440×1440）**、**1.1 ms（640×360）**。
+  20 fps 下占 21% 预算，可接受；要再快就得上 `CAMetalLayer` + `CVMetalTextureCache`（NV12 直采）。
 - 环回时窗口本身会被采集进去，画面出现「画中画递归」，属预期现象，不影响判据。
 - 输入限速（1000 event/s）只在 Host 侧生效；客户端没有本地节流，高刷鼠标
   （1000 Hz）会先把控制通道塞满再被对端丢弃。M1-C 做链路质量时应改为客户端节流。
+- `keyUp` 不单独发（协议 `key` 无 down/up 位），客户端不支持长按修饰键逐次上报，
+  只有 `flags` 全量同步；真机验收要确认 macOS 的 key repeat 行为符合预期。
 
 ---
 
@@ -599,6 +631,7 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 - v0.11-draft 2026-11-18 17:10：**新增 §5.5 QUIC datagram 帧通道实测（M1-A 第 1/2 步）**。400 帧/1200 分片/1.22MB 环回零丢失零重复零乱序，协商上限 1497B，9.6Mbps。两条硬结论：① 瞬时突发 1200 片丢 43.6%（整帧级），发送必须按帧节奏投递；② 指纹不符只 `complete(false)` 会吊在 preparing（20s 无结论），必须主动 cancel（D-13 C-13.3）。待查：偶发 6–11s 握手离群。
 - v0.12-draft 2026-11-18 18:55：**新增 §5.6 控制通道端到端 + 两个结论更正**。控制通道 8 态在真实 QUIC 连接上跑通（`--self` 5/5、两进程 host/client 通过、148 单测全过、握手 13.5–19.3ms）。三处更正：① **§5.5 的「6–11s 离群疑为 QUIC Initial 退避」作废**——真因是 p12 私钥的 keychain ACL 触发 securityd 授权阻塞，`SecKeyCreateSignature` 卡在 `mach_msg`，服务端发不出 `CertificateVerify`，客户端永停 `preparing` 且无错误码（NEG-02）；② **「QUIC stream 模式不可用」作废**——复核握手 64.6/80.4ms 正常，此前失败同因（NEG-01），D-14 改按「一个连接一条流」立论；③ 「证书材料随机损坏」假象撤回。修复：临时钥匙串 + ACL 信任当前进程 + 进程内单次导入。
 - v0.13-draft 2026-11-18 19:10：**新增 NEG-04 授权弹窗复发根因与清理**。NEG-02 修完之后弹窗仍在，原因是 ① 仓库里 `quic_probe`/`pipeline_probe`/`pipeline_kiosk_probe`/`driver_probe` 四份二进制是修复前编的，仍走登录钥匙串旧路径；② `M1CopyIdentity` 在临时钥匙串创建失败时静默回退到登录钥匙串。修法：全部重建、删除回退分支（失败即报错）、临时钥匙串先 unlink 防 PID 复用残留、新增 `cleanup_stale_identities.sh`，并清掉登录钥匙串里 30 张残留测试证书。验证：`--self` 5/5（12.4–14.7ms）、`quic_probe` 默认 500 帧退出码 0、148 断言全过，且跑完后 `SecurityAgent` 不再出现。
+- v0.18-draft 2026-11-18 23:1x：**§5.9 补齐端到端实测与三个真问题**。上屏从 `createCGImage`（每帧 GPU→CPU 回读 19.8 MB，实测 0.5–0.9 s/帧）改为 `render:toCVPixelBuffer:` 渲染到 IOSurface 再直接当 `layer.contents`（零拷贝），离屏 3440×1440 **10.4 ms/帧**。发现窗口不可见时 `layer.contents` 赋值会被 CA 阻塞（943–3233 ms 的假性能数字由此而来），改为 `occlusionState` 不可见则跳过并计 `framesSkippedOccluded`。发现 CLI 应用拿不到 key window，tracking area 改用 `NSTrackingActiveAlways` + `acceptsMouseMovedEvents`（此前 `inputEmitted` 恒为 0）。端到端仍被「会话反复自动锁定」挡住：窗口 `visible=1 key=0 active=0 occluded=1`，登录窗在最上层；已把 `verify_m1b.sh` 改为多轮短尝试，若单机无法稳定解锁则并入双机验收。
 - v0.17-draft 2026-11-18 21:5x：**新增 §5.9 M1-B 客户端上屏 + 输入回传（代码与单测完成，端到端待解锁验证）**。补上此前被静默忽略的 `input` 消息收发（`sendInputEvent:` / `didReceiveInputEvent:`，含 STREAMING 门禁与 1000 event/s 限速）；新增 `M1FrameView`（CIContext→CGImage→layer，letterbox 与坐标映射共用 `M1AspectFitRect`/`M1NormalizedPointFromViewPoint` 纯函数）、`M1RecordingEventSink`（环回不真注入）、`tools/cursor_move` 与 `verify_m1b.sh`。单测 193 项全过（输入通路 24、letterbox/坐标 12、注入器 6 为新增）；另有离屏渲染自检 `render_selftest` 全过（颜色/尺寸/letterbox/覆盖），并量出 CIContext 首次转换 623 ms，已按同样思路预热到 2 ms 级。顺带修掉 `displayID` 文档与实现位置不一致（两处都带 + event 缺失回落消息层）。阻塞：屏幕锁定导致 SCK 无 display、窗口收不到事件，端到端判据未执行。
 - v0.16-draft 2026-11-18 21:20：**帧头升 v2，修掉 3440×1440 打穿 255 片上限的缺陷**。`fragIdx/fragCount` 由 1 字节扩到 2 字节、帧头 16B→18B，单帧上限从 286 KB 提到 75 MB。先验证并**排除**了「`displayID` 压 16 位、帧头保持 16B」这条更小的改动——实测 `CGMainDisplayID()=2026701824`（0x78CD0400），32 位都紧，压 16 位会截断。`payloadLen` 仍 1150，分片预算不变，不影响 MTU。验证：原生 3440×1440 推流 30/30 帧、`sendFail=0`、首帧 1278 ms（修复前 4069 ms）；400 片大帧重组逐字节一致；`quic_probe` 500 片零丢零乱序；P1 148 项 + M1 全绿。顺带修掉 `quic_probe` 的位图越界隐患（原本固定 32B 位图只够 fragIdx 0..255）。已有二进制必须全部重建，新旧帧头不兼容。
 - v0.15-draft 2026-11-18 21:00：**新增 §5.8 VT 会话预热（M1-A 第 5 步）**。原计划「收到 SPS/PPS 就建会话」不成立（参数集本就随关键帧而来，且代码早已如此）；真因是 **VT 会话子系统的进程内首次初始化**：首次 `VTDecompressionSessionCreate` 260–1110 ms、`VTCompressionSessionCreate` 343–1377 ms，第二次起降到 13–63 ms，且用**不含 SPS/PPS 的裸 format desc 也能建成功** ⇒ 与码流无关、可提前预热。新增 `+[M1VideoEncoder prewarm]` / `+[M1FrameReceiver prewarmDecoder]`（`dispatch_once`、UTILITY 队列，用 USER_INITIATED 会与首次采集抢 CPU 而反噬）。A/B 3×2 轮：解码建会话 271→60 ms、编码建会话 406→56 ms，端到端首帧 1140→783 ms（该列噪声大，判定看确定性指标）。顺带修掉既有崩溃：对端 bye 触发控制队列与主线程**并发双停**，`M1VideoEncoder stop` 二次 `CFRelease` → SIGILL（20:08 起多次复现），改幂等 + 先摘快照。新发现待决：**帧头 `fragIdx/fragCount` 是 uint8，单帧上限 255×1150≈286 KB，3440×1440 关键帧打穿后整帧发不出**（实测首帧 4069 ms、`sendFail=1`），需扩到 16 位或压缩 `displayID`。
