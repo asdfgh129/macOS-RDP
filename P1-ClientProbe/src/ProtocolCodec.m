@@ -9,10 +9,14 @@ NSString * const P1ProtocolErrorDomain = @"P1ProtocolErrorDomain";
 
 const NSUInteger P1ControlMaxFrameBytes = 1024 * 1024;  // 1 MiB
 const uint16_t P1FrameMagic = 0x4D52;                   // 'MR'
-const uint8_t  P1ProtocolVersion = 1;
-const NSUInteger P1FrameHeaderSize = 16;
+const uint8_t  P1ProtocolVersion = 1;      // 控制通道 JSON 版本，与帧头版本相互独立
+const uint8_t  P1FrameHeaderVersion = 2;   // v2：fragIdx/fragCount 扩到 uint16
+const NSUInteger P1FrameHeaderSize = 18;
 // QUIC short header + AEAD tag 约 20–30 B，1200 B MTU 下留足头空间（D-01）
 const NSUInteger P1FrameMaxPayload = 1150;
+// fragCount 是 uint16，故单帧最多 65535 片（≈75MB）。v1 的 255 片上限已在 3440×1440
+// 的关键帧上被证明不够用，见 docs/RESULTS-BY-OS.md §5.8。
+const uint32_t P1FrameMaxFragments = 65535;
 
 static NSError *P1Err(P1ProtocolErrorCode code, NSString *desc) {
     return [NSError errorWithDomain:P1ProtocolErrorDomain
@@ -159,17 +163,21 @@ NSDictionary *P1DecodeControlMessage(NSData *jsonBytes, NSError **error) {
 #pragma mark - 帧通道
 
 NSData *P1PackFrameHeader(P1FrameHeader h) {
-    // 用字面量 16：P1FrameHeaderSize 是 const NSUInteger（运行期只读），
+    // 用字面量 18：P1FrameHeaderSize 是 const NSUInteger（运行期只读），
     // 不能用作 C 数组长度，否则会退化成 VLA 并触发 -Wgnu-folding-constant。
-    uint8_t b[16] = {0};
+    //
+    // v2 布局（大端）：
+    //   0..1 magic | 2 ver | 3 flags | 4..7 displayID | 8..11 frameSeq
+    //   | 12..13 fragIdx | 14..15 fragCount | 16..17 payloadLen
+    uint8_t b[18] = {0};
     P1PutU16(b + 0, P1FrameMagic);
-    b[2] = P1ProtocolVersion;
+    b[2] = P1FrameHeaderVersion;
     b[3] = h.flags;
     P1PutU32(b + 4, h.displayID);
     P1PutU32(b + 8, h.frameSeq);
-    b[12] = h.fragIdx;
-    b[13] = h.fragCount;
-    P1PutU16(b + 14, h.payloadLen);
+    P1PutU16(b + 12, h.fragIdx);
+    P1PutU16(b + 14, h.fragCount);
+    P1PutU16(b + 16, h.payloadLen);
     return [NSData dataWithBytes:b length:P1FrameHeaderSize];
 }
 
@@ -185,7 +193,9 @@ BOOL P1UnpackFrameHeader(NSData *data, P1FrameHeader *out, NSError **error) {
         if (error) *error = P1Err(P1ProtocolErrorBadMagic, @"bad magic");
         return NO;
     }
-    if (b[2] != P1ProtocolVersion) {
+    if (b[2] != P1FrameHeaderVersion) {
+        // v1 帧头（16B、fragIdx/fragCount 各 1B）不再接受：位宽不够，3440×1440 的关键帧
+        // 会被切成 255 片以上而整帧丢失，属于必须换格式才能修的缺陷，不做兼容回退。
         if (error) *error = P1Err(P1ProtocolErrorBadVersion, @"bad frame version");
         return NO;
     }
@@ -193,9 +203,9 @@ BOOL P1UnpackFrameHeader(NSData *data, P1FrameHeader *out, NSError **error) {
     h.flags = b[3];
     h.displayID = P1GetU32(b + 4);
     h.frameSeq = P1GetU32(b + 8);
-    h.fragIdx = b[12];
-    h.fragCount = b[13];
-    h.payloadLen = P1GetU16(b + 14);
+    h.fragIdx = P1GetU16(b + 12);
+    h.fragCount = P1GetU16(b + 14);
+    h.payloadLen = P1GetU16(b + 16);
 
     if (h.fragCount == 0 || h.fragIdx >= h.fragCount) {
         if (error) *error = P1Err(P1ProtocolErrorBadHeader, @"fragIdx out of range");
@@ -216,8 +226,9 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
         return nil;
     }
     NSUInteger count = (payload.length + P1FrameMaxPayload - 1) / P1FrameMaxPayload;
-    if (count > 255) {
-        if (error) *error = P1Err(P1ProtocolErrorPayloadTooLarge, @"too many fragments (>255)");
+    if (count > P1FrameMaxFragments) {
+        if (error) *error = P1Err(P1ProtocolErrorPayloadTooLarge,
+                                  @"too many fragments (>65535)");
         return nil;
     }
     NSMutableArray<NSData *> *out = [NSMutableArray arrayWithCapacity:count];
@@ -226,8 +237,8 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
         NSUInteger off = i * P1FrameMaxPayload;
         NSUInteger n = MIN(P1FrameMaxPayload, payload.length - off);
         P1FrameHeader h = proto;
-        h.fragIdx = (uint8_t)i;
-        h.fragCount = (uint8_t)count;
+        h.fragIdx = (uint16_t)i;
+        h.fragCount = (uint16_t)count;
         h.payloadLen = (uint16_t)n;
         if (i == count - 1) h.flags |= P1FrameFlagLastFragment;
         else h.flags &= (uint8_t)~P1FrameFlagLastFragment;
@@ -245,7 +256,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     BOOL _active;
     uint32_t _curSeq;
     uint32_t _curDisplay;
-    uint8_t _expectIdx;
+    uint16_t _expectIdx;
     BOOL _completedAny;
 }
 

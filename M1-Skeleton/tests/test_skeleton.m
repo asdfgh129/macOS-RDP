@@ -294,10 +294,11 @@ static void TestFrameSender(void) {
             OK((h.flags & P1FrameFlagLastFragment) != 0, "small-last-fragment-set");
             OK(h.displayID == 101, "small-display-id");
             OK(h.frameSeq == 0, "small-seq-zero");
-            OK(sink.datagrams[0].length == 16 + 100, "small-datagram-bytes");
+            // 帧头 v2 是 18B
+            OK(sink.datagrams[0].length == 18 + 100, "small-datagram-bytes");
         }
         OK(tx.stats.framesSent == 1 && tx.stats.fragmentsSent == 1, "small-stats");
-        OK(tx.stats.bytesSent == 116 && tx.stats.payloadBytesSent == 100, "small-stats-bytes");
+        OK(tx.stats.bytesSent == 118 && tx.stats.payloadBytesSent == 100, "small-stats-bytes");
     }
 
     // --- 关键帧 + 参数集标志（由 M1EncodedFrame 翻译成 P1FrameFlags）---
@@ -369,11 +370,22 @@ static void TestFrameSender(void) {
         OK(sink.datagrams.count == 0, "empty-payload-no-datagram");
     }
 
-    // --- 超过 255 片 → 分片失败，不消耗 seq ---
+    // --- 256 片在 v1 会被拒，v2 起必须能发（3440×1440 的关键帧就在这个量级）---
     {
         M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
         M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
-        NSData *huge = [NSMutableData dataWithLength:(1150 * 256)];
+        NSData *big = [NSMutableData dataWithLength:(1150 * 256)];
+        NSError *err = nil;
+        OK([tx sendPayload:big displayID:1 flags:0 error:&err], "256-fragments-accepted");
+        OK(sink.datagrams.count == 256 && err == nil, "256-fragments-emitted");
+        OK(tx.nextFrameSeq == 1, "256-fragments-seq-consumed");
+    }
+
+    // --- 超过 65535 片 → 分片失败，不消耗 seq（v2 的硬上限）---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        NSData *huge = [NSMutableData dataWithLength:(1150 * 65536)];
         NSError *err = nil;
         OK(![tx sendPayload:huge displayID:1 flags:0 error:&err], "too-many-fragments-rejected");
         OK(err != nil && err.code == M1PipelineErrorFragmentationFailed, "too-many-frag-code");

@@ -18,7 +18,7 @@ extern NSString * const M1PipelineErrorDomain;
 typedef NS_ENUM(NSInteger, M1PipelineErrorCode) {
     M1PipelineErrorEmptyPayload = 1,       // 编码器给了空载荷
     M1PipelineErrorSinkFailed,             // datagram 投递失败（队列满/连接断）
-    M1PipelineErrorFragmentationFailed,    // 分片失败（超 255 片等）
+    M1PipelineErrorFragmentationFailed,    // 分片失败（超 65535 片等）
     M1PipelineErrorNotStarted,             // 管线未 start 就请求编码
     M1PipelineErrorCaptureFailed,          // SCK 会话建立/启动失败
     M1PipelineErrorDegenerateMode,         // 退化 mode（1x1），按事故教训拒绝采集

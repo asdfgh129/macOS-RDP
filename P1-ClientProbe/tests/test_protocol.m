@@ -120,11 +120,12 @@ int main(void) {
         P1FrameHeader h = MakeHeader(4128835, 100, 0, 1, P1FrameFlagKeyframe | P1FrameFlagHasParamSets);
         h.payloadLen = 900;
         NSData *packed = P1PackFrameHeader(h);
-        ExpectInt((long)packed.length, 16, "header-size-16");
+        // v2：帧头 18B（fragIdx/fragCount 各 16 位）
+        ExpectInt((long)packed.length, 18, "header-size-18");
 
         const uint8_t *hb2 = packed.bytes;
         Expect(hb2[0] == 0x4D && hb2[1] == 0x52, "header-magic-bytes");
-        ExpectInt(hb2[2], 1, "header-version-byte");
+        ExpectInt(hb2[2], P1FrameHeaderVersion, "header-version-byte");
         ExpectInt(hb2[3], P1FrameFlagKeyframe | P1FrameFlagHasParamSets, "header-flags-byte");
         // displayID 大端：4128835 = 0x3F0043（取自 2026-11-17 真机 create 日志）
         Expect(hb2[4] == 0x00 && hb2[5] == 0x3F && hb2[6] == 0x00 && hb2[7] == 0x43,
@@ -196,6 +197,40 @@ int main(void) {
         Expect(!ra.needsKeyframe, "reassemble-no-keyframe-needed");
         ExpectInt((long)ra.droppedFrames, 0, "reassemble-no-drops");
 
+        // 大帧往返：v1 的 255 片上限在这里会直接拒发。用 400 片（≈460KB，超过
+        // 3440×1440 关键帧的典型体积）验证分片→重组逐字节一致。
+        {
+            NSUInteger bigLen = P1FrameMaxPayload * 400 - 137;   // 不足整片，覆盖末片短载荷
+            NSMutableData *big = [NSMutableData dataWithLength:bigLen];
+            uint8_t *bp = big.mutableBytes;
+            for (NSUInteger i = 0; i < bigLen; i++) bp[i] = (uint8_t)(i * 31 + 7);
+
+            P1FrameHeader bh = MakeHeader(7, 4242, 0, 1, P1FrameFlagKeyframe | P1FrameFlagHasParamSets);
+            err = nil;
+            NSArray<NSData *> *shards = P1FragmentPayload(big, bh, &err);
+            Expect(shards.count == 400 && err == nil, "big-frame-400-shards");
+
+            P1FrameHeader firstHC = {0};
+            P1UnpackFrameHeader(shards.firstObject, &firstHC, NULL);
+            P1FrameHeader lastHC = {0};
+            P1UnpackFrameHeader(shards.lastObject, &lastHC, NULL);
+            ExpectInt(firstHC.fragCount, 400, "big-frame-count-field");
+            ExpectInt(lastHC.fragIdx, 399, "big-frame-last-index");
+
+            P1FrameReassembler *bigRA = [[P1FrameReassembler alloc] init];
+            NSData *bigWhole = nil;
+            for (NSData *sh in shards) {
+                P1FrameHeader fh = {0};
+                if (!P1UnpackFrameHeader(sh, &fh, NULL)) continue;
+                NSData *body = [sh subdataWithRange:NSMakeRange(P1FrameHeaderSize,
+                                                               sh.length - P1FrameHeaderSize)];
+                NSData *done = [bigRA acceptHeader:fh payload:body error:NULL];
+                if (done) bigWhole = done;
+            }
+            Expect(bigWhole != nil && [bigWhole isEqualToData:big], "big-frame-reassemble-equals");
+            ExpectInt((long)bigRA.droppedFrames, 0, "big-frame-no-drops");
+        }
+
         // frameSeq 缺口 → 需要关键帧
         P1FrameReassembler *gap = [[P1FrameReassembler alloc] init];
         NSData *chunk = [@"AAAA" dataUsingEncoding:NSUTF8StringEncoding];
@@ -241,8 +276,21 @@ int main(void) {
         Expect([lieRA acceptHeader:lie payload:chunk error:&err] == nil &&
                err.code == P1ProtocolErrorBadHeader, "reject-payloadlen-mismatch");
 
-        // 分片过多（>255）
-        NSMutableData *huge = [NSMutableData dataWithLength:1200 * 256];
+        // 256 片在过去（v1，fragCount 为 uint8）是要报错的，v2 起合法：
+        // 3440×1440 的关键帧本来就会超过 255 片，这正是 v2 要解决的事。
+        NSMutableData *over255 = [NSMutableData dataWithLength:P1FrameMaxPayload * 256];
+        err = nil;
+        NSArray *many = P1FragmentPayload(over255, proto, &err);
+        Expect(many.count == 256 && err == nil, "fragment-256-shards-allowed");
+        {
+            P1FrameHeader last = {0};
+            P1UnpackFrameHeader(many.lastObject, &last, NULL);
+            ExpectInt(last.fragCount, 256, "fragment-256-count-field");
+            ExpectInt(last.fragIdx, 255, "fragment-256-last-index");
+        }
+
+        // 分片真正过多：超过 fragCount 的 16 位上限（65535）
+        NSMutableData *huge = [NSMutableData dataWithLength:P1FrameMaxPayload * 65536];
         err = nil;
         Expect(P1FragmentPayload(huge, proto, &err) == nil &&
                err.code == P1ProtocolErrorPayloadTooLarge, "fragment-too-many");

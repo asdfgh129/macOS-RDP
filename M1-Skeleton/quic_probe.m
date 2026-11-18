@@ -22,7 +22,8 @@
 #import "M1FrameSender.h"
 #import "ProtocolCodec.h"
 
-static const uint8_t kFragSeenWords = 256 / 8;   // fragIdx 0..255 → 32B 位图
+// 位图按帧的 fragCount 动态分配：v2 起 fragIdx 是 uint16（最多 65535），
+// 固定 32B 位图会在 >255 片的帧上越界写。
 
 #pragma mark - 收端统计
 
@@ -38,7 +39,7 @@ static const uint8_t kFragSeenWords = 256 / 8;   // fragIdx 0..255 → 32B 位�
 @property (nonatomic, assign) NSUInteger payloadMismatch;
 @property (nonatomic, assign) NSUInteger reordered;
 @property (nonatomic, assign) NSUInteger maxFrameSeqSeen;
-@property (nonatomic, assign) uint32_t lastKey;
+@property (nonatomic, assign) uint64_t lastKey;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSMutableData *> *fragSeen;
 @property (nonatomic, strong) NSMutableSet<NSNumber *> *completedSeq;
 @property (nonatomic, assign) BOOL sawReady;
@@ -73,7 +74,8 @@ static const uint8_t kFragSeenWords = 256 / 8;   // fragIdx 0..255 → 32B 位�
         if (h.frameSeq > self.maxFrameSeqSeen) self.maxFrameSeqSeen = h.frameSeq;
 
         // 乱序：本片 key 小于上一片的 key（同一字节流里不该出现）
-        uint32_t key = h.frameSeq * 1000 + h.fragIdx;
+        // fragIdx 现在是 uint16，不能再用 frameSeq*1000 拼 key（会撞车）。
+        uint64_t key = ((uint64_t)h.frameSeq << 17) | (uint64_t)h.fragIdx;
         if (key < self.lastKey) self.reordered += 1;
         self.lastKey = key;
 
@@ -82,9 +84,10 @@ static const uint8_t kFragSeenWords = 256 / 8;   // fragIdx 0..255 → 32B 位�
         self.fragCountOf[seq] = @(h.fragCount);
         NSMutableData *bitmap = self.fragSeen[seq];
         if (!bitmap) {
-            bitmap = [NSMutableData dataWithLength:kFragSeenWords];
+            bitmap = [NSMutableData dataWithLength:(NSUInteger)((h.fragCount + 7) / 8)];
             self.fragSeen[seq] = bitmap;
         }
+        if (h.fragIdx / 8 >= bitmap.length) return;   // 防御：位图与 fragCount 不一致
         uint8_t *bits = bitmap.mutableBytes;
         uint8_t mask = (uint8_t)(1u << (h.fragIdx % 8));
         if (bits[h.fragIdx / 8] & mask) {

@@ -69,18 +69,24 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 - 修饰键采用**状态同步**而非逐事件转发：Client 维护状态机，变化时发 `kind:"flags"` 全量；重连后必发一次全量复位。
 - Host 注入速率限制：单会话 ≤ 1000 event/s，超限丢弃 move 类（保留 down/up/key）。
 
-## 4. 帧通道二进制头（16 字节，大端）
+## 4. 帧通道二进制头（v2：18 字节，大端）
 
 | 偏移 | 字段 | 宽度 | 说明 |
 |---|---|---|---|
 | 0 | magic `MR` | 2 | 0x4D52 |
-| 2 | version | 1 | 当前 1 |
+| 2 | version | 1 | 当前 **2**（与控制通道 JSON 的 `v` 相互独立） |
 | 3 | flags | 1 | bit0=keyframe, bit1=帧末分片, bit2=含 SPS/PPS |
-| 4 | displayID | 4 | 对应虚拟屏 |
+| 4 | displayID | 4 | 对应虚拟屏（`CGDirectDisplayID` 是 32 位，实测可达 0x78CD0400，不能压成 16 位） |
 | 8 | frameSeq | 4 | 单调递增，重组与丢帧判据 |
-| 12 | fragIdx | 1 | 分片序号 |
-| 13 | fragCount | 1 | 总分片数（≤255） |
-| 14 | payloadLen | 2 | 本分片载荷字节数（≤1150，见下方 D-01 说明） |
+| 12 | fragIdx | 2 | 分片序号 |
+| 14 | fragCount | 2 | 总分片数（≤65535，单帧 ≈75MB） |
+| 16 | payloadLen | 2 | 本分片载荷字节数（≤1150，见下方 D-01 说明） |
+
+**v1 → v2 变更（2026-11-18）**：`fragIdx/fragCount` 由 1 字节扩为 2 字节，帧头 16B→18B。
+原因是 v1 的单帧上限 255×1150 B ≈ 286 KB，而 3440×1440 的关键帧会超过它，
+`P1FragmentPayload` 直接拒发 ⇒ 整帧发不出去 ⇒ 接收端只能等下一个关键帧（实测首帧 4069 ms）。
+v1 帧头一律按 `BadVersion` 拒绝，不做兼容回退（双端始终同版本构建）。
+`payloadLen` 上限仍是 1150，分片预算不变：18+1150=1168 < 1497 协商下限。
 
 载荷：AVCC（长度前缀 NALU）；关键帧分片带 SPS/PPS（flags bit2）。pts 不随帧传——实时流以到达时间渲染，延迟统计走控制通道 `heartbeat.ts` 回环。
 

@@ -14,7 +14,7 @@ static double NowMs(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-// 连续多少帧因超 255 片失败后，升级为一次明确告警（而不是每帧刷同一条错误）。
+// 连续多少帧因超分片上限失败后，升级为一次明确告警（而不是每帧刷同一条错误）。
 static const NSUInteger kM1FragFailureAlertThreshold = 3;
 
 #pragma mark - 配置
@@ -249,7 +249,8 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
     if (![_sender sendFrame:frame displayID:(uint32_t)_displayID error:&err]) {
         atomic_fetch_add(&_sendFailures, 1);
 
-        // 单帧超 255 片（1150B×255 ≈ 293KB）是协议硬上限，重试同一路径永远失败。
+        // 单帧超 65535 片（1150B×65535 ≈ 75MB）是协议硬上限，重试同一路径永远失败。
+        // v2 之前这里是 255 片/286KB，3440×1440 的关键帧就会打穿（见 RESULTS-BY-OS §5.8）。
         // 这里累计连续失败次数并在超阈值时上报告警，避免上层以为「只是丢了一帧」。
         if (err.code == M1PipelineErrorFragmentationFailed) {
             _consecutiveFragFailures += 1;
@@ -258,9 +259,9 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
                                              code:M1PipelineErrorFragmentationFailed
                                          userInfo:@{NSLocalizedDescriptionKey:
                     [NSString stringWithFormat:
-                     @"连续 %d 帧超过 255 片上限（单帧 >~293KB）。"
-                     @"当前 %dx%d 码率过高或分辨率超出协议 v1 支持范围；"
-                     @"请降分辨率/码率，或按 PROTOCOL 记录扩展 fragCount。",
+                     @"连续 %d 帧超过 65535 片上限（单帧 >~75MB）。"
+                     @"当前 %dx%d 码率异常，更可能是编码器输出了损坏的超大帧；"
+                     @"请检查采集/编码侧，而不是链路。",
                      (int)_consecutiveFragFailures,
                      self.pixelWidth, self.pixelHeight]}]);
             }

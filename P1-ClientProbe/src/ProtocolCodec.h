@@ -2,9 +2,9 @@
 //  ProtocolCodec.h
 //  P1-ClientProbe
 //
-//  控制协议 v1 编解码（对应 docs/PROTOCOL.md §1 §3 §4）：
+//  控制协议 v1 / 帧头 v2 编解码（对应 docs/PROTOCOL.md §1 §3 §4）：
 //    - 控制通道：4 字节大端长度前缀 + UTF-8 JSON，流式解析（支持粘包/拆包）
-//    - 帧通道：16 字节大端帧头 pack/unpack、分片切分、按 frameSeq 重组与丢帧判据
+//    - 帧通道：18 字节大端帧头 pack/unpack、分片切分、按 frameSeq 重组与丢帧判据
 //
 //  纯函数 + 纯内存状态机，不依赖 WindowServer / 网络，任何机器可跑单测。
 //
@@ -31,9 +31,15 @@ extern const NSUInteger P1ControlMaxFrameBytes;
 
 // 帧通道常量（PROTOCOL.md §4）
 extern const uint16_t P1FrameMagic;        // 0x4D52 'MR'
-extern const uint8_t  P1ProtocolVersion;   // 1
-extern const NSUInteger P1FrameHeaderSize; // 16
-extern const NSUInteger P1FrameMaxPayload; // 1150（QUIC datagram 头空间安全值）
+extern const uint8_t  P1ProtocolVersion;      // 1（控制通道 JSON 的 v 字段）
+// 帧头版本。v2 把 fragIdx/fragCount 从 uint8 扩到 uint16：
+//   v1 单帧上限 255×1150≈286KB，3440×1440 的关键帧就会打穿（整帧发不出去）。
+//   帧头因此从 16B 变 18B；P1FrameMaxPayload 不变，18+1150=1168 仍在 1497 协商下限内。
+extern const uint8_t  P1FrameHeaderVersion;   // 2
+extern const NSUInteger P1FrameHeaderSize;    // 18
+extern const NSUInteger P1FrameMaxPayload;    // 1150（QUIC datagram 头空间安全值）
+// 单帧分片数硬上限 65535（受 fragCount 位宽约束），≈75MB。
+extern const uint32_t P1FrameMaxFragments;
 
 typedef NS_OPTIONS(uint8_t, P1FrameFlags) {
     P1FrameFlagKeyframe      = 1 << 0,  // bit0
@@ -45,8 +51,8 @@ typedef struct {
     uint8_t  flags;
     uint32_t displayID;
     uint32_t frameSeq;
-    uint8_t  fragIdx;
-    uint8_t  fragCount;
+    uint16_t fragIdx;
+    uint16_t fragCount;
     uint16_t payloadLen;
 } P1FrameHeader;
 
@@ -76,7 +82,7 @@ NSData *P1PackFrameHeader(P1FrameHeader header);
 BOOL P1UnpackFrameHeader(NSData *data, P1FrameHeader *out, NSError * _Nullable * _Nullable error);
 
 // 把一帧编码数据切成若干分片，每片已带好 16 字节头并返回完整可发送的 NSData。
-// 分片载荷上限 P1FrameMaxPayload，片段数上限 255。
+// 分片载荷上限 P1FrameMaxPayload，片段数上限 P1FrameMaxFragments。
 NSArray<NSData *> * _Nullable P1FragmentPayload(NSData *payload,
                                                 P1FrameHeader proto,
                                                 NSError * _Nullable * _Nullable error);

@@ -214,7 +214,7 @@
 
 ### 4.3 控制协议（草案）
 
-JSON 信令 + 二进制帧头（细则以 `docs/PROTOCOL.md` 为准）。信令消息：`hello/capabilities`、`pair-request/pair-confirm`、`session-start{specs[]}`、`session-update{specs[]}`、`input{type,payload,displayID}`、`keyframe-request{displayID}`、`heartbeat`、`bye{reason}`。帧头（16 字节）：`magic | version | flags(keyframe/帧末分片/含SPS-PPS) | displayID | frameSeq | fragIdx | fragCount | payloadLen`。**pts 不随帧传输**（实时流按到达时间渲染，延迟统计走 `heartbeat.ts` 回环），与本文早前写的「帧头含 pts」冲突处已按 PROTOCOL 修正。协议版本号从 1 起，双端协商取小。
+JSON 信令 + 二进制帧头（细则以 `docs/PROTOCOL.md` 为准）。信令消息：`hello/capabilities`、`pair-request/pair-confirm`、`session-start{specs[]}`、`session-update{specs[]}`、`input{type,payload,displayID}`、`keyframe-request{displayID}`、`heartbeat`、`bye{reason}`。帧头（v2，18 字节）：`magic | version | flags(keyframe/帧末分片/含SPS-PPS) | displayID | frameSeq | fragIdx(u16) | fragCount(u16) | payloadLen`。**pts 不随帧传输**（实时流按到达时间渲染，延迟统计走 `heartbeat.ts` 回环），与本文早前写的「帧头含 pts」冲突处已按 PROTOCOL 修正。协议版本号从 1 起，双端协商取小。
 
 ---
 
