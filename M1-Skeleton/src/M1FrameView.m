@@ -287,12 +287,23 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
     [self addTrackingArea:self.trackingArea];
 }
 
+// 调试用：M1_INPUT_DEBUG=1 时把每个到达视图的鼠标事件打出来。
+// 「驱动了真光标但主机一条都没收到」时，先看这一层有没有事件，能立刻把
+// 「系统没派发」和「派发了但被后半段丢掉」分开。
 - (void)mouseEntered:(NSEvent *)event {
+    if (getenv("M1_INPUT_DEBUG")) {
+        printf("[view] mouseEntered win=(%.0f,%.0f)\n", event.locationInWindow.x, event.locationInWindow.y);
+    }
     [self.window makeFirstResponder:self];
     [self emitMouse:event button:@"left" action:@"move"];
 }
 
 - (void)mouseMoved:(NSEvent *)event {
+    if (getenv("M1_INPUT_DEBUG")) {
+        printf("[view] mouseMoved win=(%.0f,%.0f) ts=%.3f dragging=%d\n",
+               event.locationInWindow.x, event.locationInWindow.y,
+               event.timestamp, (int)self.dragging);
+    }
     if (self.dragging) return;   // 拖动由 mouseDragged 负责，避免重复事件
     // 同一份 NSEvent 会被投两次：一次按 hit-test 命中视图，一次按 tracking area
     // 派给 owner（本视图既是命中视图又是 owner，且开了 NSTrackingMouseMoved）。

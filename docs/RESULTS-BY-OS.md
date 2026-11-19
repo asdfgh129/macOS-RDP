@@ -645,6 +645,29 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 `locked / asleep / onConsole / loginDone / activeDisplays / ax`，
 锁屏**或**显示器睡眠都返回 exit 1；`verify_m1b.sh` 跳过时会把这一行原样打出来。
 
+#### 5.9.2 真光标驱动：卡在「窗口必须是前台」，不是代码问题
+
+拿到辅助功能授权后（`AX=1`），`cursor_move move` 真的能产生系统级 `mouseMoved`——
+用同窗口尺寸的最小接收器（`mouselog`）实测：3 次移动 → 3 次 `mouseMoved`，
+坐标与驱动点一一对应。链路本身是通的。
+
+但在 `verify_m1b.sh` 的循环里始终拿不到 3 条，逐层排下去挖出三个问题：
+
+| # | 现象 | 真因 |
+|---|---|---|
+| 1 | 驱动到「屏幕中心」，视图收到 8 个 `mouseMoved`，主机 0 条 | 窗口内容里视频是 letterbox 的，**屏幕中心落在黑边上**；`normalizedPointForEvent` 按设计丢弃黑边事件。改成客户端首帧后打印 `[anchors]`（画面中心 ±200 的全局坐标），驱动端照着走 |
+| 2 | 断言里的「中心」还拿全局像素比 | 主机收到的是归一化坐标，`x` 应为 `pw*0.5`、`y` 应为 `ph*0.5`，与驱动点在屏幕上的位置无关 |
+| 3 | 窗口 `visible=1 key=1 active=1 occluded=0`，仍收不到 move | **WindowServer 只把 `mouseMoved` 投给前台应用**。脚本跑的时候实测 `frontmost=Google Chrome`；偶然收到的那几条，`locationInWindow=(1619,238)`，在 900 宽的窗口坐标里根本不成立——那是人手在动鼠标 |
+
+过程中还排掉一个反直觉的尝试：把窗口设成 `NSFloatingWindowLevel` 想避免被遮挡，
+结果**一条 `mouseMoved` 都收不到**（`mouseEntered` 仍然正常），已撤回。
+
+结论：`physical` 驱动**需要客户端窗口成为前台、且人不碰鼠标**的一段窗口期；
+这属于测试环境约束，不是产品缺陷（真实使用里客户端窗口本来就是前台的）。
+`M1B_KEEP_FRONT=1` 可以每 300ms 重抢前台，但会打断正在用的应用，默认关闭。
+自动化的验收判据仍以 `synth` 驱动为准（已验证全链路与坐标），
+真鼠标那一跳留到双机验收现场确认。
+
 #### 遗留
 
 - 上屏走 `CIContext → IOSurface`，离屏实测 **10.4 ms/帧（3440×1440）**、**1.1 ms（640×360）**。

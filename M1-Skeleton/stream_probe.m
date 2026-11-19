@@ -454,7 +454,7 @@ static void PrintUsage(void) {
         "                    [--display ID] [--fps N] [--out JSON]\n"
         "  stream_probe --client --port N --fingerprint HEX [--duration-ms N]\n"
         "                    [--outdir DIR] [--save-frames N] [--out JSON]\n"
-        "                    [--window [WxH]] [--input-synth \"X,Y;X,Y;...\"]\n"
+        "                    [--window [WxH]] [--keep-front] [--input-synth \"X,Y;X,Y;...\"]\n"
         "  --input-synth: 进程内合成鼠标移动（内容坐标，左上原点），\n"
         "                 用于驱动端没有辅助功能授权、无法投递系统事件时。\n");
 }
@@ -484,6 +484,8 @@ int main(int argc, char **argv) {
         double windowW = 1280, windowH = 720;
         NSString *injectMode = nil;   // nil / record / real
         NSString *synthSpec = nil;    // "X,Y;X,Y" 内容坐标（左上原点）
+        BOOL windowTop = NO;
+        BOOL keepFront = NO;
 
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--host")) hostMode = YES;
@@ -514,6 +516,17 @@ int main(int argc, char **argv) {
                 injectMode = [NSString stringWithUTF8String:argv[++i]];
             else if (!strcmp(argv[i], "--input-synth") && i + 1 < argc)
                 synthSpec = [NSString stringWithUTF8String:argv[++i]];
+            else if (!strcmp(argv[i], "--keep-front")) {
+                // 自动化验证用：WindowServer 只把 mouseMoved 投给「前台应用」，
+                // 窗口 visible/key/active 全 1 也可能被别的 App 抢回前台
+                // （实测脚本跑的时候 frontmost=Chrome，一条 move 都收不到）。
+                keepFront = YES;
+            }
+            else if (!strcmp(argv[i], "--window-top")) {
+                // 自动化验证用：把客户端窗口抬到浮动层，避免测试期间被别的
+                // 应用窗口盖住——窗口一旦被遮，WindowServer 就不投递 mouseMoved。
+                windowTop = YES;
+            }
             else if (!strcmp(argv[i], "--window")) {
                 windowMode = YES;
                 // 可选 --window 1600x900；不给就 1280x720。
@@ -766,6 +779,7 @@ int main(int argc, char **argv) {
             frameView = [[M1FrameView alloc] initWithFrame:content];
             frameWindow.contentView = frameView;
             [frameWindow center];
+            if (windowTop) frameWindow.level = NSFloatingWindowLevel;
             [frameWindow makeKeyAndOrderFront:nil];
             [[NSNotificationCenter defaultCenter]
                 addObserverForName:NSWindowWillCloseNotification
@@ -786,8 +800,29 @@ int main(int argc, char **argv) {
         [client prepareReceiver];
         if (frameView) {
             __weak M1FrameView *weakView = frameView;
+            __block BOOL printedAnchors = NO;
             client.onPixelBuffer = ^(CVPixelBufferRef pb, uint32_t seq) {
                 [weakView presentPixelBuffer:pb];
+                // 首帧到了才有 videoSize，才能算「画面中心」的全局坐标。
+                // 驱动端不能拿「屏幕中心」当「画面中心」：窗口内容里视频是按比例
+                // letterbox 的，屏幕中心很可能落在黑边上，而黑边按设计不产生输入
+                // （踩过：真光标驱动 4 次，视图收到 8 个 mouseMoved，主机 0 条）。
+                if (printedAnchors || weakView.videoSize.width <= 0) return;
+                printedAnchors = YES;
+                CGRect vr = weakView.videoRect;              // 视图坐标
+                NSPoint c = NSMakePoint(NSMidX(vr), NSMidY(vr));
+                NSScreen *scr = frameWindow.screen ?: NSScreen.mainScreen;
+                CGFloat topY = NSMaxY(scr.frame);
+                NSPoint win = [weakView convertPoint:c toView:nil];
+                NSPoint sCenter = [frameWindow convertPointToScreen:win];
+                NSPoint winL = [weakView convertPoint:NSMakePoint(NSMidX(vr) - 200, NSMidY(vr)) toView:nil];
+                NSPoint winR = [weakView convertPoint:NSMakePoint(NSMidX(vr) + 200, NSMidY(vr)) toView:nil];
+                NSPoint sL = [frameWindow convertPointToScreen:winL];
+                NSPoint sR = [frameWindow convertPointToScreen:winR];
+                printf("  [anchors] center=(%.0f,%.0f) left=(%.0f,%.0f) right=(%.0f,%.0f) "
+                       "videoW=%.0f\n",
+                       sCenter.x, topY - sCenter.y, sL.x, topY - sL.y,
+                       sR.x, topY - sR.y, vr.size.width);
             };
         }
 
@@ -878,11 +913,42 @@ int main(int argc, char **argv) {
                 [NSApp activateIgnoringOtherApps:YES];
                 [frameWindow makeKeyAndOrderFront:nil];
             });
+            if (keepFront) {
+                // 每 300ms 重抢一次前台。注意别动 window.level：实测把窗口设成
+                // NSFloatingWindowLevel 之后反而一条 mouseMoved 都收不到。
+                dispatch_source_t tick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                                dispatch_get_main_queue());
+                dispatch_source_set_timer(tick, dispatch_time(DISPATCH_TIME_NOW, 0),
+                                          300ull * NSEC_PER_MSEC, 30ull * NSEC_PER_MSEC);
+                dispatch_source_set_event_handler(tick, ^{
+                    if (![NSApp isActive]) [NSApp activateIgnoringOtherApps:YES];
+                    if (!frameWindow.isKeyWindow) [frameWindow makeKeyAndOrderFront:nil];
+                });
+                dispatch_resume(tick);
+            }
             // 定位「窗口收不到事件」时要看的三件事：窗口是否可见、是否被遮住、是不是 key。
             for (NSNumber *delayMs in @[@800, @2500]) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                              (int64_t)delayMs.integerValue * NSEC_PER_MSEC),
                                dispatch_get_main_queue(), ^{
+                    if (windowTop) {
+                        // 持续保持前台：实测有别的应用会把激活抢回去，一旦本进程
+                        // 不是 active，WindowServer 就不往这个窗口投 mouseMoved
+                        // （窗口看起来仍是 visible/key，只有 active 变了）。
+                        static dispatch_source_t ticker;
+                        if (!ticker) {
+                            ticker = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                            dispatch_get_main_queue());
+                            dispatch_source_set_timer(ticker,
+                                dispatch_time(DISPATCH_TIME_NOW, 0), 500ull * NSEC_PER_MSEC,
+                                50ull * NSEC_PER_MSEC);
+                            dispatch_source_set_event_handler(ticker, ^{
+                                [NSApp activateIgnoringOtherApps:YES];
+                                [frameWindow makeKeyAndOrderFront:nil];
+                            });
+                            dispatch_resume(ticker);
+                        }
+                    }
                     NSRect f = frameWindow.frame;
                     printf("  [窗口 +%dms] visible=%d key=%d active=%d occluded=%d "
                            "frame=(%.0f,%.0f %.0fx%.0f) screen=%dx%d\n",
