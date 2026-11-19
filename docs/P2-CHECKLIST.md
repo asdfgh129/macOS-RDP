@@ -127,6 +127,9 @@ cd P2-Dual
 # 跨网段/NAT：把防火墙映射后的对外端点告诉程序（本轮实际参数）
 P2_ADVERTISE=112.5.32.34:46600 P2_WAIT_MS=60000 ./p2.sh preflight host
 P2_ADVERTISE=112.5.32.34:46600 P2_WAIT_MS=60000 ./p2.sh host
+
+# 无人值守：一直等 client 接入，不因超时退出（每 10s 打印一次已等多久）
+P2_ADVERTISE=112.5.32.34:46600 P2_PORT=46600 P2_WAIT_MS=0 ./p2.sh host
 ```
 
 `preflight` 逐行看，必须 `ok=1`：

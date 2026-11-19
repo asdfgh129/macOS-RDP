@@ -206,6 +206,20 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 }
 
 - (BOOL)waitForStreamingTimeoutMs:(uint32_t)timeoutMs {
+    // timeoutMs == 0 → 无限等待，直到对端接入（自动化联调时 host 常无人值守）。
+    // 用 10s 切片等待而不是 DISPATCH_TIME_FOREVER，只为能定期打印「还活着」，
+    // 否则长时间没日志会被误判成进程卡死。
+    if (timeoutMs == 0) {
+        uint64_t waitedS = 0;
+        while (dispatch_semaphore_wait(self.streamingSem,
+                   dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0) {
+            waitedS += 10;
+            printf("  [%s] 仍在等待对端…已等 %llus（--wait-ms 0 = 无限等待，Ctrl-C 结束）\n",
+                   self.isHost ? "host" : "client", waitedS);
+            fflush(stdout);
+        }
+        return self.streaming && self.error == nil;
+    }
     if (dispatch_semaphore_wait(self.streamingSem,
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMs * NSEC_PER_MSEC)) != 0) {
         return NO;
@@ -548,7 +562,7 @@ static void PrintUsage(void) {
         "  stream_probe --host [--port N] [--port-file PATH] [--duration-ms N]\n"
         "                    [--display ID] [--fps N] [--out JSON]\n"
         "                    [--advertise HOST[:PORT]]   # 跨网段/NAT：防火墙映射后的对外端点\n"
-        "                    [--wait-ms N]               # host 等客户端 / client 等 STREAMING（默认 15000）\n"
+        "                    [--wait-ms N]               # host 等客户端 / client 等 STREAMING（默认 15000；0 = 一直等）\n"
         "  stream_probe --preflight host|client [--inject real] [--advertise HOST[:PORT]]\n"
         "                                                        # 本机能力自检\n"
         "  stream_probe --client --connect IP --port N --fingerprint HEX [--duration-ms N]\n"
@@ -771,7 +785,7 @@ int main(int argc, char **argv) {
 
             printf("等待客户端接入…\n");
             if (![host waitForStreamingTimeoutMs:waitMs]) {
-                printf("✗ 15s 内未进入 STREAMING: %s\n",
+                printf("✗ %us 内未进入 STREAMING: %s\n", waitMs / 1000, (const char *)
                        host.error.localizedDescription.UTF8String ?: "无客户端");
                 return 4;
             }
@@ -1060,7 +1074,7 @@ int main(int argc, char **argv) {
         }
         printf("握手完成 %.1f ms\n", client.handshakeMs);
         if (![client waitForStreamingTimeoutMs:waitMs]) {
-            printf("✗ 15s 内未进入 STREAMING: %s\n",
+            printf("✗ %us 内未进入 STREAMING: %s\n", waitMs / 1000, (const char *)
                    client.error.localizedDescription.UTF8String ?: "unknown");
             return 4;
         }

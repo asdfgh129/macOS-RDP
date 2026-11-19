@@ -24,7 +24,8 @@
 #   P2_FPS=20           目标帧率
 #   P2_INJECT=real      host 的注入方式：real（真注入，需辅助功能授权）/ record
 #   P2_WINDOW=1280x720  client 窗口尺寸
-#   P2_WAIT_MS=15000    等客户端/等 STREAMING 的超时；跨网段建议 60000
+#   P2_WAIT_MS=15000    等客户端/等 STREAMING 的超时；跨网段建议 60000，
+#                         设 0 表示一直等（host 无人值守，直到 client 接入）
 #   P2_HANDSHAKE_MS=12000 客户端握手超时；跨网段建议 30000
 #   P2_OUT=<dir>        输出目录，默认 P2-Dual/out/<时间戳>
 #
@@ -99,7 +100,13 @@ host)
   say "host：采集 ${SECS}s，端口 ${PORT}，注入 ${INJECT}"
   say "输出：$OUT"
   # 屏睡会让 SCK 直接没有帧，联调期间必须挡住。
-  caffeinate -d -u -t $((SECS + 120)) &
+  # P2_WAIT_MS=0 是无限等待，此时 caffeinate 必须给足（否则等一会儿屏睡了就没帧）。
+  if [ "${WAIT_MS:-0}" -gt 0 ] 2>/dev/null; then
+    CAF_SECS=$(( SECS + WAIT_MS / 1000 + 300 ))
+  else
+    CAF_SECS=86400
+  fi
+  caffeinate -d -u -t "$CAF_SECS" &
   CAF=$!
   trap 'kill $CAF 2>/dev/null' EXIT INT TERM
   adv_arg=""
