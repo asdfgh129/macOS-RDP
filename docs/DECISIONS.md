@@ -839,6 +839,9 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.24 | 远程 SSH 接入**不引入第三方软件**，用系统自带 sshd：开「远程登录」+ `authorized_keys` + 一条 **TCP 映射**（建议外部 46601 → 192.168.10.23:22）。§1.1 的 UDP 46600 规则对 SSH 无效，这是「UDP 通了 SSH 连不上」的根因。加固只写 `/etc/ssh/sshd_config.d/200-p2-automation.conf`，`harden` 在 `authorized_keys` 为空时拒绝执行 | `P2-Dual/enable_ssh.sh` / `docs/SSH-SETUP.md` |
 | C-17.25 | SSH 会话不在 Aqua 会话，`stream_probe` 的 SCShareableContent/CGEventPost 依赖 WindowServer；远程驱动 host 必须用 `launchctl asuser 501 sudo -u bemin` 包一层（`P2-Dual/gui-run.sh`）。TCC 授权弹窗无法从 SSH 应答，首次仍需在 GUI/屏幕共享里点掉 | `P2-Dual/gui-run.sh` / `docs/SSH-SETUP.md` §6 |
 | C-17.26 | `--wait-ms 0`（`P2_WAIT_MS=0`）表示**无限等待**对端接入，host 可无人值守；实现用 10s 切片等待，每片打印「仍在等待对端…已等 Ns」，避免长时间无日志被误判为卡死。此时 `p2.sh` 把 `caffeinate` 提到 86400s，否则等一会儿屏睡就没帧 | `stream_probe` / `P2-Dual/p2.sh` |
+| C-17.27 | 单客户端模型必须能**重新接入**：入站连接失败/取消时由子对象把父对象 `acceptedConnection` 置 nil（`parentListener` 弱引用 + `rearmParentListener`）。否则第一次握手失败后，后续所有重试都被 `nw_connection_cancel` 掉，表现为 host「一直在等、client 一直连不上」 | `src/M1QuicTransport.m` |
+| C-17.28 | 连接失败日志必须带 domain+code+系统描述（`M1DescribeNWError`，含 tls 域）并与入站对端地址一起打印；只有 `-9858` 这种裸码无法定位是 TLS、MTU 还是被 RST | `src/M1QuicTransport.m` / `stream_probe.m` |
+| C-17.29 | `p2.sh host` 启动前检查端口占用：p2.sh 被杀不会带走 `stream_probe` 子进程，残留进程会让下一次启动报 `监听失败：48` | `P2-Dual/p2.sh` |
 
 ### 代价与边界
 

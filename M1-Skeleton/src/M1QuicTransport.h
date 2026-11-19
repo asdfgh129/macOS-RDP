@@ -106,6 +106,11 @@ typedef NS_ENUM(NSInteger, M1QuicState) {
 @property (nonatomic, readonly) NSUInteger maxDatagramPayload;
 // 服务端：接受入站连接后产生的连接对象（客户端角色对象自身持有连接）。
 @property (nonatomic, readonly, nullable) M1QuicTransport *acceptedConnection;
+// 入站连接的对端 "IP:port"（仅 accepted 连接有值），用于日志确认是谁连进来。
+@property (nonatomic, readonly, copy, nullable) NSString *peerDescription;
+// 入站连接指回监听对象，连接失败/取消时由子对象把父对象的 acceptedConnection 置 nil，
+// 否则单客户端模型会把后续所有重连都丢掉（无人值守 host 必须能接重试）。
+@property (nonatomic, weak, nullable) M1QuicTransport *parentListener;
 
 // 服务端 TLS 指纹（对端证书 SHA-256，小写 hex）。配对层用它做 TOFU。
 @property (nonatomic, readonly, nullable) NSString *peerCertificateSHA256;

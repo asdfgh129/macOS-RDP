@@ -96,6 +96,14 @@ preflight)
 host)
   need_bin
   mkdir -p "$OUT"
+  # 上次的 host 子进程可能活着而父 shell 已退出（p2.sh 被杀不会带走 stream_probe），
+  # 结果就是 EADDRINUSE 48。启动前先看一眼，给出可复制的清理命令。
+  if lsof -nP -iUDP:"$PORT" >/dev/null 2>&1; then
+    say "端口 $PORT 已被占用，可能是上次遗留的 host 进程："
+    lsof -nP -iUDP:"$PORT" | tail -n +2 | sed 's/^/  /'
+    say "清理：pkill -f 'stream_probe --host'  然后重跑"
+    exit 2
+  fi
   do_preflight host ""
   say "host：采集 ${SECS}s，端口 ${PORT}，注入 ${INJECT}"
   say "输出：$OUT"

@@ -211,14 +211,26 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     // 否则长时间没日志会被误判成进程卡死。
     if (timeoutMs == 0) {
         uint64_t waitedS = 0;
-        while (dispatch_semaphore_wait(self.streamingSem,
-                   dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) != 0) {
+        for (;;) {
+            if (dispatch_semaphore_wait(self.streamingSem,
+                    dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) == 0) {
+                if (self.streaming && self.error == nil) return YES;
+                // 单次尝试失败不该让无人值守的 host 直接退出：打印原因、清掉错误、
+                // 回到监听状态继续等下一次接入（附带的连接是新的 generation）。
+                if (self.error) {
+                    printf("  [%s] 本次尝试失败：%s（继续等待重试）\n",
+                           self.isHost ? "host" : "client",
+                           self.error.localizedDescription.UTF8String ?: "unknown");
+                    fflush(stdout);
+                    self.error = nil;
+                }
+                continue;
+            }
             waitedS += 10;
             printf("  [%s] 仍在等待对端…已等 %llus（--wait-ms 0 = 无限等待，Ctrl-C 结束）\n",
                    self.isHost ? "host" : "client", waitedS);
             fflush(stdout);
         }
-        return self.streaming && self.error == nil;
     }
     if (dispatch_semaphore_wait(self.streamingSem,
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMs * NSEC_PER_MSEC)) != 0) {
@@ -255,7 +267,10 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 - (void)quicTransport:(M1QuicTransport *)transport
    didAcceptConnection:(M1QuicTransport *)connection {
-    printf("  [host] 已接受连接\n");
+    // 打上对端地址：跨网段时这行能直接看出包是从公网 client 来的，还是内网误连。
+    const char *peer = connection.peerDescription.UTF8String;
+    printf("  [host] 已接受连接%s%s\n", peer ? " from " : "", peer ?: "");
+    fflush(stdout);
 }
 
 - (void)quicTransport:(M1QuicTransport *)transport didFailWithError:(NSError *)error {

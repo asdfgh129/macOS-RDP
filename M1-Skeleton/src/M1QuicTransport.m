@@ -41,6 +41,19 @@ static NSString *M1DescribeNWError(nw_error_t e) {
     return [NSString stringWithFormat:@"%@/%d", dom, code];
 }
 
+static NSString *M1DescribeEndpoint(nw_connection_t conn) {
+    if (!conn) return nil;
+    nw_endpoint_t ep = nw_connection_copy_endpoint(conn);
+    if (!ep) return nil;
+    const char *host = nw_endpoint_get_hostname(ep);
+    uint16_t port = nw_endpoint_get_port(ep);
+    NSString *desc = [NSString stringWithFormat:@"%s:%u", host ?: "?", (unsigned)port];
+#if !OS_OBJECT_USE_OBJC
+    nw_release(ep);
+#endif
+    return desc;
+}
+
 #pragma mark - 身份与指纹
 
 // 本进程专用的临时钥匙串。
@@ -63,13 +76,15 @@ static void M1DestroyTempKeychain(void) {
     }
 }
 
+static const char *kM1TempKeychainPass = "m1rdp-ephemeral";
+
 static SecKeychainRef M1TempKeychain(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSString *path = [NSTemporaryDirectory()
             stringByAppendingPathComponent:
                 [NSString stringWithFormat:@"m1rdp-identity-%d.keychain", getpid()]];
-        const char *pw = "m1rdp-ephemeral";
+        const char *pw = kM1TempKeychainPass;
         // PID 可能被复用：上次异常退出（kill -9 / 崩溃，atexit 不执行）会留下同名文件，
         // 此时 SecKeychainCreate 直接报「已存在」，身份就会被无谓地拒绝。先清掉残留
         // ——文件名含本进程 PID，只可能是已死进程留下的。
@@ -83,10 +98,19 @@ static SecKeychainRef M1TempKeychain(void) {
             gM1TempKeychain = NULL;
             return;
         }
-        SecKeychainUnlock(gM1TempKeychain, (UInt32)strlen(pw), pw, true);
+        SecKeychainUnlock(gM1TempKeychain, (UInt32)strlen(pw), pw, false);
         atexit(M1DestroyTempKeychain);
     });
     return gM1TempKeychain;
+}
+
+// 旧式临时钥匙串会按空闲时间自动上锁。签名发生在 TLS 握手内部，锁上后 securityd
+// 会弹 SecurityAgent 并永久阻塞，所以在每次连接开始前静默续解一次（NEG-05）。
+static void M1UnlockTempKeychain(void) {
+    SecKeychainRef kc = M1TempKeychain();
+    if (kc) {
+        SecKeychainUnlock(kc, (UInt32)strlen(kM1TempKeychainPass), kM1TempKeychainPass, false);
+    }
 }
 
 static SecIdentityRef M1CopyIdentity(NSString *path, NSString *password,
@@ -254,6 +278,8 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
 @property (nonatomic, readwrite) uint16_t listenPort;
 @property (nonatomic, readwrite) NSUInteger maxDatagramPayload;
 @property (nonatomic, readwrite, nullable) M1QuicTransport *acceptedConnection;
+// 入站连接的对端描述；parentListener 在头文件里已是可写属性，不在此重复声明。
+@property (nonatomic, readwrite, copy, nullable) NSString *peerDescription;
 @property (nonatomic, readwrite, nullable) NSString *peerCertificateSHA256;
 
 @property (nonatomic, strong) dispatch_queue_t queue;
@@ -499,6 +525,9 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
                                                                              verifyPeer:strong.verifyPeer];
             child.delegate = strong.delegate;   // 上层只跟 listener 对象打交道
             strong.acceptedConnection = child;
+            child.parentListener = strong;
+            child.peerDescription = M1DescribeEndpoint(conn);
+            M1QLOG("inbound connection from %s", child.peerDescription.UTF8String ?: "?");
             [child beginConnection];
             if ([strong.delegate respondsToSelector:@selector(quicTransport:didAcceptConnection:)]) {
                 [strong.delegate quicTransport:strong didAcceptConnection:child];
@@ -569,6 +598,7 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
 
 // 给已有 nw_connection_t 装 handler 并 start（客户端 / 入站连接共用）。
 - (void)beginConnection {
+    M1UnlockTempKeychain();
     nw_connection_set_queue(self.conn, self.queue);
     __weak typeof(self) weakSelf = self;
     NSUInteger gen = self.connGeneration;   // 被看门狗作废的连接，其回调一律忽略
@@ -623,6 +653,7 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
 - (void)transitionFailed:(NSError *)error {
     self.failError = error;
     self.state = M1QuicStateFailed;
+    [self rearmParentListener];
     [self.readyCond lock];
     [self.readyCond broadcast];
     [self.readyCond unlock];
@@ -631,7 +662,18 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
         }
 }
 
+// 入站连接结束后清掉父对象的 acceptedConnection，允许新的客户端重连。
+// 单客户端模型原本只认第一条连接：第一次握手失败后，后续所有重试都会被直接 cancel。
+- (void)rearmParentListener {
+    M1QuicTransport *parent = self.parentListener;
+    if (parent && parent.acceptedConnection == self) {
+        parent.acceptedConnection = nil;
+        M1QLOG("accepted connection 结束，重新允许接入");
+    }
+}
+
 - (void)cancel {
+    [self rearmParentListener];
     if (self.listener) {
         nw_listener_cancel(self.listener);
         self.listener = nil;
