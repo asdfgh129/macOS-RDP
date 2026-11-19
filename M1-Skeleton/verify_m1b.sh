@@ -39,7 +39,9 @@ say() { printf '%s\n' "$*"; }
 is_unlocked() {
   local _i
   for _i in 1 2 3; do
-    ./cursor_move locked >/dev/null 2>&1 || return 1
+    # state 把「锁屏」和「显示器睡了」合并成一个判据（两者对验证一样致命），
+    # 并且能打印细项，跳过时不再只写一句含糊的「屏幕锁定」。
+    ./cursor_move state >/dev/null 2>&1 || return 1
     sleep 0.3
   done
   return 0
@@ -205,7 +207,7 @@ fi
 for a in $(seq 1 "$ATTEMPTS"); do
   say "=== 第 $a/$ATTEMPTS 轮 ==="
   if ! is_unlocked; then
-    say "  屏幕锁定，跳过本轮（解锁后就绪）"
+    say "  会话不可用，跳过本轮：$(./cursor_move state 2>/dev/null)"
     sleep 3
     continue
   fi

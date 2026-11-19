@@ -12,6 +12,8 @@
 //    ./cursor_move move X Y        把光标移到全局坐标 (X, Y) 并发一个 mouseMoved
 //    ./cursor_move locked          锁屏 → exit 1；解锁 → exit 0
 //    ./cursor_move ax              有辅助功能授权 → exit 0（合成事件能投递）
+//    ./cursor_move state           细项：locked/asleep/onConsole/activeDisplays/ax；
+//                                  锁屏或显示器睡眠都返回 exit 1
 //
 
 #import <Foundation/Foundation.h>
@@ -34,6 +36,26 @@ int main(int argc, char **argv) {
             }
             printf("%s\n", locked ? "locked" : "unlocked");
             return locked ? 1 : 0;
+        }
+        if (argc >= 2 && !strcmp(argv[1], "state")) {
+            // 「锁屏」和「显示器睡了」是两个不同状态，但对验证一样致命：
+            // SCK 拿不到 display、窗口收不到输入。此前只读 CGSSessionScreenIsLocked
+            // 一个 flag，屏保态/睡眠态分不清，容易被质疑成「判断错了」。
+            BOOL locked = YES, onConsole = NO, loginDone = NO;
+            CFDictionaryRef d = CGSessionCopyCurrentDictionary();
+            if (d) {
+                NSDictionary *dict = (__bridge NSDictionary *)d;
+                locked    = [dict[@"CGSSessionScreenIsLocked"] boolValue];
+                onConsole = [dict[@"kCGSSessionOnConsoleKey"] boolValue];
+                loginDone = [dict[@"kCGSessionLoginDoneKey"] boolValue];
+                CFRelease(d);
+            }
+            uint32_t n = 0;
+            CGGetActiveDisplayList(0, NULL, &n);
+            printf("locked=%d asleep=%d onConsole=%d loginDone=%d activeDisplays=%u ax=%d\n",
+                   (int)locked, (int)CGDisplayIsAsleep(CGMainDisplayID()),
+                   (int)onConsole, (int)loginDone, n, (int)AXIsProcessTrusted());
+            return (locked || CGDisplayIsAsleep(CGMainDisplayID())) ? 1 : 0;
         }
         if (argc >= 2 && !strcmp(argv[1], "ax")) {
             // 合成事件（CGEventPost）能不能投递，全看这条：没有辅助功能授权时
