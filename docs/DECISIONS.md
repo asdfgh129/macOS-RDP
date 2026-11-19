@@ -829,6 +829,9 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.14 | 端到端驱动分流：`cursor_move ax` 判定 `AXIsProcessTrusted`，有授权用真光标（`physical`），没有则客户端用 `--input-synth` 进程内投 `NSEvent`（`synth`）。无授权时光标位移动得动但 `mouseMoved` 一条都不到，只看光标会误判成客户端没采集 | `verify_m1b.sh` / `stream_probe` |
 | C-17.15 | 同一 `NSEvent` 会因「hit-test 视图 + tracking area owner 同体」被投两次，按**时间戳 + 窗口内坐标**去重，避免每次移动发 2 条上行 | `M1FrameView mouseMoved:` |
 | C-17.16 | 第三种驱动 `--manual SECS`：代码只发「现在动鼠标」的信号（响 3 声 + 窗口标题倒计时 + `[manual]` 横幅），由真人操作。理由：`physical` 需要「窗口前台且人不碰鼠标」的窗口期、`synth` 缺 OS 投递一跳，而这一跳只有真鼠标能覆盖。判据放宽为「横向跨度 ≥ 画面宽 10%」，不判落点。实测人的反应延迟约 7 s ⇒ 未收到任何事件时每 5 s 再提醒一次 | `stream_probe --manual` / `verify_m1b.sh M1B_DRIVER=manual` |
+| C-17.17 | 服务端监听必须显式指定端口（`nw_listener_create_with_port`）：`nw_listener_create(params)` 会忽略 init 传入的 port，实测 `--port 46600` 实际监听 61174。单机靠 `--port-file` 传端口不暴露，跨机（防火墙、人工抄写）必须固定 | `M1QuicTransport start` |
+| C-17.18 | 跨机联调以 `--inject real` 为准，判据包含「主机光标位移 > 0」（`cursorMovedPx`）：`inputReceived` 只证明收到了事件，不证明 CGEventPost 真的生效（无 AX 授权时会静默失败） | `stream_probe` host 汇总 / `P2-Dual/p2.sh summary` |
+| C-17.19 | glass-to-glass 不在没有测量手段时下结论。现有打点只覆盖「采集→编码→发出」与「收到→解码→上屏」，缺显示扫描与单程时延；三条候选测量路线见 `docs/P2-CHECKLIST.md` §7 | P2 延迟验收 |
 
 ### 代价与边界
 

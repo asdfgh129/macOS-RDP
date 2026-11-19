@@ -138,6 +138,9 @@ protocol 注入协调器、Swift 调 ObjC 纯函数/类），会话序列端到�
    （守卫 `loginDone=0` → preflight → 自动 `bsexec` 重入 → 建屏/禁屏/采集/恢复）。M2 拿到机器按
    `docs/DECISIONS.md` D-11 的五步流程跑即可；
 4. P2 双机 QUIC 互通 + glass-to-glass 打点，关闭 A-02 后冻结协议 v1。
+   **双机操作单见 `../docs/P2-CHECKLIST.md`，脚本是 `../P2-Dual/p2.sh`**
+   （`preflight | host | client | summary`）。客户端侧用 `--connect <IP>` 指定对端，
+   服务端端口已固定（`nw_listener_create` 会忽略端口，已改用 `nw_listener_create_with_port`）。
 
 ## 按 OS 记录
 

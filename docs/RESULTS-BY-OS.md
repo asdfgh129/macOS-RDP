@@ -713,6 +713,48 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 - `keyUp` 不单独发（协议 `key` 无 down/up 位），客户端不支持长按修饰键逐次上报，
   只有 `flags` 全量同步；真机验收要确认 macOS 的 key repeat 行为符合预期。
 
+### 5.10 P2 预演：走真实网卡（en0）的跨进程联调（2026-11-19 上午）
+
+双机联调前先在本机用**局域网地址**跑一遍，把「回环特有的假设」提前排掉。
+结论：能跑通，并挖出两个只在跨机会暴露的问题。
+
+新增能力：
+
+- `stream_probe --connect IP`：客户端对端地址原本写死 `127.0.0.1`，跨机无法使用。
+- `stream_probe --preflight host|client`：本机能力自检（AX / 屏幕录制 / 锁屏 / 屏睡 /
+  active 显示器 / 局域网 IP / 帧头版本）。放在 `stream_probe` 里而不是单独工具，
+  是因为屏幕录制与辅助功能授权按**这个二进制**的 code requirement 记。
+- host 启动后打印「给客户端的三项」：IP / 端口 / 证书指纹。
+- `P2-Dual/p2.sh`：`preflight | host | client | summary` 四个子命令，见
+  `docs/P2-CHECKLIST.md`。
+
+挖出的两个真问题：
+
+| # | 现象 | 真因 |
+|---|---|---|
+| 1 | `--port 46600` 启动，实际监听 **61174**，客户端连不上 | `nw_listener_create(params)` **完全忽略** init 传入的端口，每次随机分配。单机靠 `--port-file` 传递端口还能糊过去，跨机必须固定端口（防火墙规则、人工抄写都要它）。改用 `nw_listener_create_with_port` |
+| 2 | 收尾打印时 `*** Collection was mutated while being enumerated` 崩进程 | `controlArrivals` 由收包队列追加、主线程枚举打印。单机慢，收尾时正好没有心跳；跨机握手 18 ms、收尾瞬间还有心跳/bye 进来就撞上。改为 `@synchronized` + 快照 |
+
+实测（本机走 `192.168.10.23`，host `--inject record`）：
+
+| 指标 | 值 |
+|---|---|
+| 握手 | 18.1 ms |
+| 采集/编码/发出 | 273 / 272 / 272 |
+| 客户端收齐/解出 | 272 / 272（丢 0，解码失败 0） |
+| 客户端上屏 | 266 帧（跳过 0 不可见），渲染 12.9 ms / 峰值 74.3 ms |
+| 首帧 | 主机 239 ms / 客户端 475 ms |
+| 控制通道最大间隔 | 1004 ms（1 s 心跳） |
+
+再跑一轮 `--inject real`（客户端用 `--input-synth` 造 3 个点）：
+客户端采集 10 → 上行 10，主机**注入成功 10 次**、`inputInjectFails=0`、
+光标位移 **768 px** —— 真注入路径（`CGEventPost`）在跨机条件下成立。
+
+仍未闭合：真正的两台机器（对端 TCC 授权、网线/AP、单程时延）、
+以及 glass-to-glass（需要相机或硬件打点，见 P2 清单 §7）。
+
+**A-02 状态不变**：仍开放。本轮只证明跨机可跑通与指标可采集。
+
 ---
 
 ## 6. 状态汇总
@@ -742,6 +784,7 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 - v0.11-draft 2026-11-18 17:10：**新增 §5.5 QUIC datagram 帧通道实测（M1-A 第 1/2 步）**。400 帧/1200 分片/1.22MB 环回零丢失零重复零乱序，协商上限 1497B，9.6Mbps。两条硬结论：① 瞬时突发 1200 片丢 43.6%（整帧级），发送必须按帧节奏投递；② 指纹不符只 `complete(false)` 会吊在 preparing（20s 无结论），必须主动 cancel（D-13 C-13.3）。待查：偶发 6–11s 握手离群。
 - v0.12-draft 2026-11-18 18:55：**新增 §5.6 控制通道端到端 + 两个结论更正**。控制通道 8 态在真实 QUIC 连接上跑通（`--self` 5/5、两进程 host/client 通过、148 单测全过、握手 13.5–19.3ms）。三处更正：① **§5.5 的「6–11s 离群疑为 QUIC Initial 退避」作废**——真因是 p12 私钥的 keychain ACL 触发 securityd 授权阻塞，`SecKeyCreateSignature` 卡在 `mach_msg`，服务端发不出 `CertificateVerify`，客户端永停 `preparing` 且无错误码（NEG-02）；② **「QUIC stream 模式不可用」作废**——复核握手 64.6/80.4ms 正常，此前失败同因（NEG-01），D-14 改按「一个连接一条流」立论；③ 「证书材料随机损坏」假象撤回。修复：临时钥匙串 + ACL 信任当前进程 + 进程内单次导入。
 - v0.13-draft 2026-11-18 19:10：**新增 NEG-04 授权弹窗复发根因与清理**。NEG-02 修完之后弹窗仍在，原因是 ① 仓库里 `quic_probe`/`pipeline_probe`/`pipeline_kiosk_probe`/`driver_probe` 四份二进制是修复前编的，仍走登录钥匙串旧路径；② `M1CopyIdentity` 在临时钥匙串创建失败时静默回退到登录钥匙串。修法：全部重建、删除回退分支（失败即报错）、临时钥匙串先 unlink 防 PID 复用残留、新增 `cleanup_stale_identities.sh`，并清掉登录钥匙串里 30 张残留测试证书。验证：`--self` 5/5（12.4–14.7ms）、`quic_probe` 默认 500 帧退出码 0、148 断言全过，且跑完后 `SecurityAgent` 不再出现。
+- v0.21-draft 2026-11-19 10:4x：**新增 §5.10 P2 预演（真实网卡 en0）**。为今晚双机联调补 `--connect`（客户端地址原本写死 `127.0.0.1`）、`--preflight host|client`（AX/屏幕录制/锁屏/屏睡/active 屏/局域网 IP/帧头版本自查）、host 打印「IP+端口+指纹」三项，以及 `P2-Dual/p2.sh`（preflight/host/client/summary）与 `docs/P2-CHECKLIST.md`。挖出两个只在跨机会暴露的问题：① `nw_listener_create(params)` 忽略 init 传入端口（`--port 46600` 实际监听 61174），改 `nw_listener_create_with_port`；② `controlArrivals` 收包队列追加、主线程枚举导致 `mutated while being enumerated` 崩溃，改 `@synchronized` + 快照。实测 LAN 环回：握手 18.1 ms、272/272 解出、上屏 266 帧、首帧 475 ms、控制间隔 1004 ms；`--inject real` 注入成功 10 次、光标位移 768 px。A-02 仍开放。
 - v0.20-draft 2026-11-19 10:0x：**新增 §5.9.3 手动驱动，真鼠标那一跳闭环**。真光标(`physical`)受「窗口必须前台、人不碰鼠标」限制、`synth` 又少 OS 投递一跳，补第三条路：`--manual SECS` 只发信号（响 3 声 + 窗口标题倒计时 + `[manual]` 横幅），由真人动鼠标；没人动时每 5s 再响两声（实测反应延迟 7s）。`verify_m1b.sh` 加 `M1B_DRIVER=manual`，判据改为「横向跨度 ≥ 画面宽 10%」而非落点。第 1 轮 PASS：上屏 329 帧、采集 152→上行 152 条、主机收到 153 条（mouse 150）、横向跨度 2563px（75%），证明「真实鼠标 → 客户端 → 主机」全链成立。
 - v0.19-draft 2026-11-19 09:0x：**§5.9.1 端到端判据通过，并更正 v0.18 的归因**。v0.18 把「端到端跑不动」全记在会话自动锁定上，实测有一半是脚本自己的 bug：`verify_m1b.sh` 把 `cursor_move locked` 的退出码判反（0=解锁被当锁定），三轮全是空转。修正后真正的阻塞浮现为**辅助功能授权**：`AXIsProcessTrusted=0` 时 `CGWarpMouseCursorPosition` 能改光标位置但不产生 `mouseMoved`，`CGEventPost` 的合成事件被丢弃（最小 AppKit 接收器复现：active/key/visible 全 1、光标在动、`mouseEntered` 1 次、`mouseMoved` 0 次）。据此把驱动分流为 `physical`/`synth`（新增 `--input-synth` 进程内投递），`synth` 下第 1 轮即 PASS：29 帧上屏、单帧 8.0 ms、三次移动 x=1720/955.6/2484.4、y 恒 720，与 letterbox 换算一致。另修掉同一 `NSEvent` 被投递两次（hit-test + tracking area owner 同体）导致上行事件翻倍的问题。单测 193 项仍全过。
 - v0.18-draft 2026-11-18 23:1x：**§5.9 补齐端到端实测与三个真问题**。上屏从 `createCGImage`（每帧 GPU→CPU 回读 19.8 MB，实测 0.5–0.9 s/帧）改为 `render:toCVPixelBuffer:` 渲染到 IOSurface 再直接当 `layer.contents`（零拷贝），离屏 3440×1440 **10.4 ms/帧**。发现窗口不可见时 `layer.contents` 赋值会被 CA 阻塞（943–3233 ms 的假性能数字由此而来），改为 `occlusionState` 不可见则跳过并计 `framesSkippedOccluded`。发现 CLI 应用拿不到 key window，tracking area 改用 `NSTrackingActiveAlways` + `acceptsMouseMovedEvents`（此前 `inputEmitted` 恒为 0）。端到端仍被「会话反复自动锁定」挡住：窗口 `visible=1 key=0 active=0 occluded=1`，登录窗在最上层；已把 `verify_m1b.sh` 改为多轮短尝试，若单机无法稳定解锁则并入双机验收。

@@ -37,6 +37,12 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreImage/CoreImage.h>
 #import <ImageIO/ImageIO.h>
+#import <ApplicationServices/ApplicationServices.h>
+#import <ifaddrs.h>
+#import <net/if.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import "ProtocolCodec.h"
 #import "M1QuicTransport.h"
 #import "M1ControlLink.h"
 #import "M1ControlChannel.h"
@@ -273,8 +279,12 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
         }
     }
     self.lastControlArrivalMs = now;
-    if (self.streamStartMs > 0 && self.controlArrivals.count < 256) {
-        [self.controlArrivals addObject:@(round(now - self.streamStartMs))];
+    // 收包在传输队列、打印在主线程：不加锁会撞上「枚举中修改」直接崩进程
+    // （双机跑得快，收尾打印时正好还有心跳/bye 在进来，已实测崩过一次）。
+    @synchronized (self.controlArrivals) {
+        if (self.streamStartMs > 0 && self.controlArrivals.count < 256) {
+            [self.controlArrivals addObject:@(round(now - self.streamStartMs))];
+        }
     }
     [self.channel feedBytes:message];
 }
@@ -443,8 +453,69 @@ static void PrintFlowStats(StreamNode *n, const char *tag) {
            (unsigned long)n.link.retransmits, (unsigned long)n.link.duplicatesSeen,
            (unsigned long)n.link.heldOutOfOrder, (unsigned long)n.link.acksReceived);
     NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    for (NSNumber *v in n.controlArrivals) [parts addObject:v.stringValue];
+    NSArray<NSNumber *> *arrivals;
+    @synchronized (n.controlArrivals) { arrivals = [n.controlArrivals copy]; }
+    for (NSNumber *v in arrivals) [parts addObject:v.stringValue];
     printf("  %s 控制到达(ms): %s\n", tag, [parts componentsJoinedByString:@","].UTF8String);
+}
+
+// ---- P2 双机对接：本机能力自检 ----
+// 为什么放在 stream_probe 里而不是单独写个工具：屏幕录制与辅助功能授权是按
+// 「可执行文件的 code requirement」记的，换一个二进制查出来的结果不代表本二进制
+// （已踩过：同一份源码重建后 AX 从 1 变 0）。所以必须由真正干活的那个进程自查。
+
+// 本机可对接的 IPv4（排除回环与 169.254 自分配地址）。
+static NSArray<NSString *> *P2LANAddresses(void) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    struct ifaddrs *head = NULL;
+    if (getifaddrs(&head) != 0) return out;
+    for (struct ifaddrs *p = head; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        if (!(p->ifa_flags & IFF_UP) || (p->ifa_flags & IFF_LOOPBACK)) continue;
+        char buf[INET_ADDRSTRLEN] = {0};
+        struct sockaddr_in *sin = (struct sockaddr_in *)p->ifa_addr;
+        if (!inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) continue;
+        NSString *ip = [NSString stringWithUTF8String:buf];
+        if ([ip hasPrefix:@"169.254."]) continue;   // 自分配地址，跨机基本连不通
+        [out addObject:[NSString stringWithFormat:@"%@(%s)", ip, p->ifa_name]];
+    }
+    freeifaddrs(head);
+    return out;
+}
+
+// 返回 0 = 就绪。输出 `[preflight] k=v` 行，脚本只认最后那行 ok=。
+static int P2RunPreflight(NSString *role, BOOL needAX) {
+    BOOL ax = AXIsProcessTrusted();
+    BOOL capture = CGPreflightScreenCaptureAccess();
+    uint32_t activeCount = 0;
+    CGGetActiveDisplayList(0, NULL, &activeCount);
+
+    CFDictionaryRef sess = CGSessionCopyCurrentDictionary();
+    NSDictionary *sd = (__bridge_transfer NSDictionary *)sess;
+    BOOL locked = [sd[@"CGSSessionScreenIsLocked"] boolValue];
+    BOOL onConsole = sd.count > 0 && [sd[@"kCGSSessionOnConsoleKey"] boolValue];
+    BOOL asleep = CGDisplayIsAsleep(CGMainDisplayID());
+
+    NSMutableArray<NSString *> *fails = [NSMutableArray array];
+    if (!onConsole) [fails addObject:@"不在控制台 GUI 会话（SSH 里跑不了采集/上屏）"];
+    if (locked)     [fails addObject:@"屏幕已锁定：SCK 拿不到 display，窗口也收不到输入"];
+    if (asleep)     [fails addObject:@"显示器已睡眠：先 caffeinate -d -u"];
+    if (activeCount == 0) [fails addObject:@"没有 active 显示器"];
+    if ([role isEqualToString:@"host"]) {
+        if (!capture) [fails addObject:@"缺屏幕录制授权（系统设置→隐私与安全性→屏幕录制）"];
+        if (needAX && !ax) [fails addObject:@"缺辅助功能授权（--inject real 需要）"];
+    }
+
+    printf("[preflight] role=%s\n", role.UTF8String);
+    printf("[preflight] ax=%d capture=%d locked=%d asleep=%d onConsole=%d active=%u\n",
+           (int)ax, (int)capture, (int)locked, (int)asleep, (int)onConsole, activeCount);
+    printf("[preflight] proto frameHeaderVersion=%u headerSize=%lu maxPayload=%lu\n",
+           (unsigned)P1FrameHeaderVersion, (unsigned long)P1FrameHeaderSize,
+           (unsigned long)P1FrameMaxPayload);
+    for (NSString *ip in P2LANAddresses()) printf("[preflight] ip=%s\n", ip.UTF8String);
+    for (NSString *f in fails) printf("[preflight] fail=%s\n", f.UTF8String);
+    printf("[preflight] ok=%d\n", fails.count == 0 ? 1 : 0);
+    return fails.count == 0 ? 0 : 1;
 }
 
 static void PrintUsage(void) {
@@ -452,7 +523,8 @@ static void PrintUsage(void) {
         "用法:\n"
         "  stream_probe --host [--port N] [--port-file PATH] [--duration-ms N]\n"
         "                    [--display ID] [--fps N] [--out JSON]\n"
-        "  stream_probe --client --port N --fingerprint HEX [--duration-ms N]\n"
+        "  stream_probe --preflight host|client [--inject real]   # 本机能力自检\n"
+        "  stream_probe --client --connect IP --port N --fingerprint HEX [--duration-ms N]\n"
         "                    [--outdir DIR] [--save-frames N] [--out JSON]\n"
         "                    [--window [WxH]] [--keep-front] [--input-synth \"X,Y;X,Y;...\"]\n"
         "                    [--manual SECS]\n"
@@ -537,6 +609,8 @@ int main(int argc, char **argv) {
         BOOL windowTop = NO;
         BOOL keepFront = NO;
         int manualSecs = 0;           // >0：不造事件，改为提示真人动鼠标 SECS 秒
+        NSString *connectHost = @"127.0.0.1";   // 双机时改成对端的局域网地址
+        NSString *preflightRole = nil;          // host / client：只做本机能力自检后退出
 
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--host")) hostMode = YES;
@@ -569,6 +643,12 @@ int main(int argc, char **argv) {
                 synthSpec = [NSString stringWithUTF8String:argv[++i]];
             else if (!strcmp(argv[i], "--manual") && i + 1 < argc)
                 manualSecs = atoi(argv[++i]);
+            else if (!strcmp(argv[i], "--connect") && i + 1 < argc)
+                connectHost = [NSString stringWithUTF8String:argv[++i]];
+            else if (!strcmp(argv[i], "--preflight")) {
+                preflightRole = (i + 1 < argc && argv[i + 1][0] != '-')
+                              ? [NSString stringWithUTF8String:argv[++i]] : @"host";
+            }
             else if (!strcmp(argv[i], "--keep-front")) {
                 // 自动化验证用：WindowServer 只把 mouseMoved 投给「前台应用」，
                 // 窗口 visible/key/active 全 1 也可能被别的 App 抢回前台
@@ -591,6 +671,9 @@ int main(int argc, char **argv) {
                 }
             }
             else { PrintUsage(); return 1; }
+        }
+        if (preflightRole) {
+            return P2RunPreflight(preflightRole, [injectMode isEqualToString:@"real"]);
         }
         if (!hostMode && !clientMode) { PrintUsage(); return 1; }
 
@@ -622,6 +705,20 @@ int main(int argc, char **argv) {
             }
             printf("host 监听端口 %u\n", host.port);
             printf("  证书指纹 %s\n", localFp.UTF8String);
+            // 双机对接要人工把这三项抄到另一台机器上，单独打一块免得漏。
+            printf("\n===== 给客户端的三项 =====\n");
+            NSArray<NSString *> *ips = P2LANAddresses();
+            printf("  IP   : %s\n", ips.count ? ips.firstObject.UTF8String
+                                              : "（没有局域网 IPv4，只有回环）");
+            if (ips.count > 1) {
+                printf("  其他 : ");
+                for (NSUInteger k = 1; k < ips.count; k++)
+                    printf("%s ", ips[k].UTF8String);
+                printf("\n");
+            }
+            printf("  端口 : %u\n", host.port);
+            printf("  指纹 : %s\n", localFp.UTF8String);
+            printf("=========================\n\n");
 
             if (portFile.length > 0) {
                 NSString *payload = [NSString stringWithFormat:@"%u\n%@\n", host.port, localFp];
@@ -665,6 +762,13 @@ int main(int argc, char **argv) {
             M1RecordingEventSink *recorder = nil;
             M1InputInjector *injector = nil;
             __block NSUInteger injectFails = 0;
+            __block NSUInteger injectOK = 0;
+            // 真注入时用光标位移证明「主机真的被动了」，不是只收到了计划。
+            CGPoint cursorStart = CGPointZero, cursorEnd = CGPointZero;
+            {
+                CGEventRef c = CGEventCreate(NULL);
+                if (c) { cursorStart = CGEventGetLocation(c); CFRelease(c); }
+            }
             if (injectMode.length > 0) {
                 id<M1EventSink> sink = nil;
                 if ([injectMode isEqualToString:@"real"]) {
@@ -687,6 +791,7 @@ int main(int argc, char **argv) {
                 host.onInputEvent = ^(NSDictionary *event) {
                     NSError *injErr = nil;
                     if (![injector injectEvent:event error:&injErr]) injectFails += 1;
+                    else injectOK += 1;
                 };
                 printf("  输入注入 %s，目标 rect=(%.0f,%.0f %.0fx%.0f)\n",
                        injectMode.UTF8String, targetRect.origin.x, targetRect.origin.y,
@@ -735,6 +840,12 @@ int main(int argc, char **argv) {
                        (unsigned long)hs.inputEventsRejected,
                        (unsigned long)injectFails,
                        (unsigned long)recorder.postCount);
+                CGEventRef c1 = CGEventCreate(NULL);
+                if (c1) { cursorEnd = CGEventGetLocation(c1); CFRelease(c1); }
+                printf("  注入成功 %lu 次；光标 (%.0f,%.0f) → (%.0f,%.0f)，位移 %.0f px\n",
+                       (unsigned long)injectOK,
+                       cursorStart.x, cursorStart.y, cursorEnd.x, cursorEnd.y,
+                       hypot(cursorEnd.x - cursorStart.x, cursorEnd.y - cursorStart.y));
                 NSArray<NSDictionary *> *plans = recorder.plans;
                 NSUInteger show = MIN(plans.count, (NSUInteger)6);
                 for (NSUInteger i = 0; i < show; i++) {
@@ -776,6 +887,10 @@ int main(int argc, char **argv) {
             json[@"payloadBytes"] = @(ps.payloadBytesSent);
             json[@"keyframes"] = @(ps.keyframes);
             json[@"sendFailures"] = @(ps.sendFailures);
+            json[@"encodeFailures"] = @(ps.encodeFailures);
+            json[@"framesDroppedBeforeEncoder"] = @(ps.framesDroppedBeforeEncoder);
+            json[@"firstFrameLatencyMs"] = @(round(ps.firstFrameLatencyMs));
+            json[@"payloadBytes"] = @(ps.payloadBytesSent);
             json[@"controlDatagrams"] = @(host.controlDatagrams);
             json[@"frameDatagrams"] = @(host.frameDatagrams);
             json[@"maxControlGapMs"] = @(round(host.maxControlGapMs));
@@ -785,6 +900,11 @@ int main(int argc, char **argv) {
                 json[@"inputDropped"] = @(host.session.inputEventsDropped);
                 json[@"inputRejected"] = @(host.session.inputEventsRejected);
                 json[@"inputInjectFails"] = @(injectFails);
+                json[@"inputInjected"] = @(injectOK);
+                json[@"cursorStart"] = @[ @(round(cursorStart.x)), @(round(cursorStart.y)) ];
+                json[@"cursorEnd"] = @[ @(round(cursorEnd.x)), @(round(cursorEnd.y)) ];
+                json[@"cursorMovedPx"] = @(round(hypot(cursorEnd.x - cursorStart.x,
+                                                       cursorEnd.y - cursorStart.y)));
                 json[@"inputPlans"] = recorder.plans ?: @[];
             }
             if (outPath.length > 0) {
@@ -889,7 +1009,8 @@ int main(int argc, char **argv) {
         }
 
         NSError *err = nil;
-        if (![client startAsClientTo:@"127.0.0.1" port:port timeout:12000 error:&err]) {
+        printf("连接 %s:%u\n", connectHost.UTF8String, port);
+        if (![client startAsClientTo:connectHost port:port timeout:12000 error:&err]) {
             printf("✗ 握手失败: %s\n", err.localizedDescription.UTF8String);
             return 3;
         }
@@ -1102,6 +1223,7 @@ int main(int argc, char **argv) {
         json[@"decodedWidth"] = @(client.decodedWidth);
         json[@"decodedHeight"] = @(client.decodedHeight);
         json[@"decodeFps"] = @(round(decodeFps * 10) / 10.0);
+        json[@"lastDecodeLatencyMs"] = @(round(rs.lastDecodeLatencyMs * 10) / 10.0);
         json[@"firstFrameLatencyMs"] = @(round(firstFrameLatency));
         json[@"decoderPrewarmMs"] = @(round(rs.decoderPrewarmMs));
         json[@"decoderCreateMs"] = @(round(rs.decoderCreateMs));
@@ -1109,7 +1231,9 @@ int main(int argc, char **argv) {
         json[@"frameDatagrams"] = @(client.frameDatagrams);
         json[@"maxControlGapMs"] = @(round(client.maxControlGapMs));
         json[@"maxGapAtOffsetMs"] = @(round(client.maxGapAtOffsetMs));
-        json[@"controlArrivals"] = client.controlArrivals;
+        @synchronized (client.controlArrivals) {
+            json[@"controlArrivals"] = [client.controlArrivals copy];
+        }
         json[@"savedPNGs"] = @(client.savedPaths.count);
         if (frameView) {
             json[@"windowed"] = @YES;

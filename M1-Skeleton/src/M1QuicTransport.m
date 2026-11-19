@@ -442,7 +442,12 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
     }
 
     if (self.isListener) {
-        nw_listener_t l = nw_listener_create(params);
+        // 必须显式指定端口：nw_listener_create(params) 会完全忽略 init 里传的 port，
+        // 每次分到随机端口（实测 --port 46600 实际监听 61174）。单机环回靠 port-file
+        // 传端口还能糊过去，跨机就不行——防火墙规则和人工抄写都要求端口固定。
+        char portStr[8];
+        snprintf(portStr, sizeof(portStr), "%u", (unsigned)self.port);
+        nw_listener_t l = nw_listener_create_with_port(portStr, params);
         if (!l) {
             [self transitionFailed:M1QuicErr(M1QuicErrorListenerFailed, @"nw_listener_create 失败")];
             return;
