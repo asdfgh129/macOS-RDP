@@ -37,6 +37,7 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
 @property (nonatomic, assign) BOOL sleepHeld;
 @property (nonatomic, assign) BOOL physicalDisabled;
 @property (nonatomic, assign) BOOL virtualCreated;
+@property (nonatomic, copy, readwrite) NSArray<NSNumber *> *createdDisplayIDs;
 @end
 
 @implementation M1SessionCoordinator
@@ -47,6 +48,7 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
         _driver = driver;
         _phase = M1HostSessionIdle;
         _takeover = [[M1TakeoverDetector alloc] init];
+        _locksScreenOnEnd = YES;
     }
     return self;
 }
@@ -93,10 +95,14 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
         return NO;
     }
     self.virtualCreated = YES;
+    self.createdDisplayIDs = [_driver createdDisplayIDs];
     _phase = M1HostSessionDisplaysReady;
 
     // step 3 禁物理屏 + C-09 隔离校验
     NSArray *keep = [_driver createdDisplayIDs];
+    if (self.extraKeepDisplayIDs.count > 0) {
+        keep = [keep arrayByAddingObjectsFromArray:self.extraKeepDisplayIDs];
+    }
     if (![_driver snapshotAndDisablePhysicalExcept:keep error:&stepErr]) {
         [self recoverBestEffort];
         _phase = M1HostSessionFailed;
@@ -105,7 +111,8 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
         return NO;
     }
     self.physicalDisabled = YES;
-    if (![_driver verifyIsolationError:&stepErr]) {
+    // keep 了额外物理屏（诊断模式）就不可能满足 C-09，跳过但保持 phase 语义。
+    if (self.extraKeepDisplayIDs.count == 0 && ![_driver verifyIsolationError:&stepErr]) {
         [self recoverBestEffort];
         _phase = M1HostSessionFailed;
         if (error) *error = M1SessErr(M1SessionErrorStepFailed,
@@ -142,6 +149,11 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
         if (error) *error = M1SessErr(M1SessionErrorRecoveryFailed,
             M1HostSessionPhaseName(_phase), @"恢复物理屏/销毁虚拟屏失败");
         return NO;
+    }
+    if (!self.locksScreenOnEnd) {
+        _phase = M1HostSessionLocked;
+        [_takeover reset];
+        return YES;
     }
     // D-06 step 2：恢复后真锁屏
     NSError *lockErr = nil;

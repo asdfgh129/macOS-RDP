@@ -37,6 +37,7 @@ typedef NS_ENUM(NSInteger, M1ControlSessionErrorCode) {
     M1ControlSessionErrorVersion,            // 协议版本无交集
     M1ControlSessionErrorPairingCode,        // 配对码不匹配
     M1ControlSessionErrorSend,               // 控制消息发不出去
+    M1ControlSessionErrorRateLimited,        // 关键帧请求 300ms 限流
 };
 
 typedef NS_ENUM(NSInteger, M1ControlRole) {
@@ -68,6 +69,19 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 - (void)controlSessionDidReachStreaming:(M1ControlSession *)session;
 - (void)controlSession:(M1ControlSession *)session didChangeState:(P1SessionState)state;
 - (void)controlSession:(M1ControlSession *)session didFailWithError:(NSError *)error;
+
+// Host 侧：session-start 到达后、回 session-ready 之前调用，用来准备真实显示
+// （D-04 建虚拟屏 / 禁物理屏）。返回的每一项至少含 displayID/w/h，
+// 会原样放进 session-ready；返回 nil 表示准备失败（回 session-error 并结束会话），
+// 未实现或返回空数组则沿用 M1-A 的合成占位（displayID=1000+i, synthetic:YES）。
+// 回调在控制收包队列上，可能耗时数秒（建屏/禁屏），调用方需自行保证 UI 不被阻塞。
+- (NSArray<NSDictionary *> * _Nullable)controlSession:(M1ControlSession *)session
+                        prepareDisplaysForSessionStart:(NSDictionary *)message
+                                              error:(NSError * _Nullable * _Nullable)error;
+
+// Host 侧：收到 Client 的 keyframe-request，应立刻让编码器产出 IDR。
+//   回调在控制收包队列上；不能阻塞（码流线程可能正在等这个决定）。
+- (void)controlSessionDidRequestKeyframe:(M1ControlSession *)session;
 
 // Host 侧：收到客户端输入事件。
 //   · 只在 STREAMING 态回调（PROTOCOL §3.1）；
@@ -111,6 +125,16 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 @property (nonatomic, readonly) NSUInteger inputEventsReceived;  // Host 已接受并回调
 @property (nonatomic, readonly) NSUInteger inputEventsDropped;   // 限速丢弃 / 非 STREAMING
 @property (nonatomic, readonly) NSUInteger inputEventsRejected;  // 校验失败（畸形事件）
+
+#pragma mark - 关键帧请求（PROTOCOL §3）
+
+// Client：帧通道判定缺口后请求 Host 立即产 IDR。
+//   限流 300ms/次（Host 产 IDR 也要时间，连环请求只会互相踩）；
+//   非 STREAMING 返回 NO（INVALID_STATE），限流返回 NO（RATE_LIMITED）。
+- (BOOL)requestKeyframeWithError:(NSError * _Nullable * _Nullable)error;
+
+@property (nonatomic, readonly) NSUInteger keyframeRequestsSent;      // Client 实际发出
+@property (nonatomic, readonly) NSUInteger keyframeRequestsReceived;  // Host 收到并回调
 
 @end
 

@@ -46,6 +46,9 @@ static NSString *M1ArchName(void) {
     atomic_uint_fast64_t _inputReceived;
     atomic_uint_fast64_t _inputDropped;
     atomic_uint_fast64_t _inputRejected;
+    atomic_uint_fast64_t _kfRequestsSent;
+    atomic_uint_fast64_t _kfRequestsReceived;
+    _Atomic double _lastKfRequestMs;
 }
 @property (nonatomic, strong) M1ControlChannel *channel;
 @property (nonatomic, strong) M1ControlSessionConfig *config;
@@ -82,6 +85,9 @@ static NSString *M1ArchName(void) {
         atomic_init(&_inputReceived, 0);
         atomic_init(&_inputDropped, 0);
         atomic_init(&_inputRejected, 0);
+        atomic_init(&_kfRequestsSent, 0);
+        atomic_init(&_kfRequestsReceived, 0);
+        atomic_store(&_lastKfRequestMs, 0.0);
         _inputLimiter = [[P1InputRateLimiter alloc] initWithEventsPerSecond:P1InputMaxEventsPerSecond];
         channel.delegate = self;
     }
@@ -185,12 +191,14 @@ static NSString *M1ArchName(void) {
     else if ([type isEqualToString:@"session-ready"]) [self handleSessionReady:message];
     else if ([type isEqualToString:@"heartbeat"])     [self handleHeartbeat:message];
     else if ([type isEqualToString:@"input"])         [self handleInput:message];
+    else if ([type isEqualToString:@"keyframe-request"]) [self handleKeyframeRequest:message];
+    else if ([type isEqualToString:@"keyframe-sent"])    { /* Host 的确认，统计不依赖它 */ }
     else if ([type isEqualToString:@"bye"] || [type isEqualToString:@"session-error"]) {
         self.closed = YES;
         [self stopHeartbeat];
         [self advance:type];
     }
-    // 其余类型（keyframe-*）属帧通道阶段，这里静默忽略。
+    // 其余未知类型静默忽略，避免对端新增消息把老版本判死。
 }
 
 - (void)controlChannel:(M1ControlChannel *)channel didFailWithError:(NSError *)error {
@@ -317,17 +325,37 @@ static NSString *M1ArchName(void) {
     }
     if (![self advance:@"session-start"]) return;
 
-    // ★ M1-A：不建真屏，按请求规格合成占位 display 并显式标注 synthetic。
-    //   M1-B 接 VDManager 后这里换成真实 displayID。
-    NSMutableArray *displays = [NSMutableArray array];
-    for (NSUInteger i = 0; i < specs.count; i++) {
-        NSDictionary *s = [specs[i] isKindOfClass:[NSDictionary class]] ? specs[i] : @{};
-        [displays addObject:@{
-            @"displayID": @(1000 + i),
-            @"w": s[@"w"] ?: @0,
-            @"h": s[@"h"] ?: @0,
-            @"synthetic": @YES,
-        }];
+    // 真实显示由 Host 的委托准备（建虚拟屏 → 禁物理屏）；没接委托时退回
+    // M1-A 的合成占位（带 synthetic:true，客户端据此知道不能当真实显示用）。
+    NSArray<NSDictionary *> *displays = nil;
+    if ([self.delegate respondsToSelector:
+            @selector(controlSession:prepareDisplaysForSessionStart:error:)]) {
+        NSError *prepErr = nil;
+        displays = [self.delegate controlSession:self
+                    prepareDisplaysForSessionStart:msg
+                                          error:&prepErr];
+        if (!displays) {
+            NSError *err = prepErr ?: M1SessErr(M1ControlSessionErrorProtocol,
+                @"Host 未能准备显示");
+            [self sendPayload:@{ @"type": @"session-error", @"code": @"CREATE_FAILED",
+                                 @"detail": err.localizedDescription ?: @"",
+                                 @"recoverable": @YES }];
+            [self failWith:err];
+            return;
+        }
+    }
+    if (displays.count == 0) {
+        NSMutableArray *synthetic = [NSMutableArray array];
+        for (NSUInteger i = 0; i < specs.count; i++) {
+            NSDictionary *s = [specs[i] isKindOfClass:[NSDictionary class]] ? specs[i] : @{};
+            [synthetic addObject:@{
+                @"displayID": @(1000 + i),
+                @"w": s[@"w"] ?: @0,
+                @"h": s[@"h"] ?: @0,
+                @"synthetic": @YES,
+            }];
+        }
+        displays = synthetic;
     }
     NSString *sid = [[NSUUID UUID] UUIDString];
     self.sessionID = sid;
@@ -427,6 +455,53 @@ static NSString *M1ArchName(void) {
     atomic_fetch_add(&_inputReceived, 1);
     if ([self.delegate respondsToSelector:@selector(controlSession:didReceiveInputEvent:)]) {
         [self.delegate controlSession:self didReceiveInputEvent:event];
+    }
+}
+
+#pragma mark - 关键帧请求
+
+- (NSUInteger)keyframeRequestsSent { return (NSUInteger)atomic_load(&_kfRequestsSent); }
+- (NSUInteger)keyframeRequestsReceived { return (NSUInteger)atomic_load(&_kfRequestsReceived); }
+
+- (BOOL)requestKeyframeWithError:(NSError **)error {
+    if (error) *error = nil;
+    if (self.role != M1ControlRoleClient) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorProtocol,
+            @"只有 Client 发送 keyframe-request");
+        return NO;
+    }
+    if (self.closed || self.stateMachine.state != P1SessionStateStreaming) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorInvalidState,
+            @"会话未处于 STREAMING，关键帧请求未发送");
+        return NO;
+    }
+    double now = [[NSDate date] timeIntervalSince1970] * 1000.0;
+    double last = atomic_load(&_lastKfRequestMs);
+    if (now - last < 300.0 && last > 0) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorRateLimited,
+            @"关键帧请求限流（300ms）");
+        return NO;
+    }
+    NSNumber *displayID = self.remoteDisplays.firstObject[@"displayID"];
+    NSMutableDictionary *payload = [@{ @"type": @"keyframe-request",
+                                       @"reason": @"loss" } mutableCopy];
+    if ([displayID isKindOfClass:[NSNumber class]]) payload[@"displayID"] = displayID;
+    if (![self sendPayload:payload]) return NO;
+    atomic_store(&_lastKfRequestMs, now);
+    atomic_fetch_add(&_kfRequestsSent, 1);
+    return YES;
+}
+
+- (void)handleKeyframeRequest:(NSDictionary *)msg {
+    if (self.role != M1ControlRoleHost) {
+        [self failWith:M1SessErr(M1ControlSessionErrorProtocol,
+            @"Host 不应收到 keyframe-request")];
+        return;
+    }
+    if (self.closed || self.stateMachine.state != P1SessionStateStreaming) return;
+    atomic_fetch_add(&_kfRequestsReceived, 1);
+    if ([self.delegate respondsToSelector:@selector(controlSessionDidRequestKeyframe:)]) {
+        [self.delegate controlSessionDidRequestKeyframe:self];
     }
 }
 

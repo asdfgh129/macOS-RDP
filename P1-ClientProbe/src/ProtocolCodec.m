@@ -251,102 +251,300 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     return out;
 }
 
+@interface P1ReassembledFrame ()
+@property (nonatomic, readwrite) uint32_t displayID;
+@property (nonatomic, readwrite) uint32_t frameSeq;
+@property (nonatomic, readwrite) BOOL keyframe;
+@property (nonatomic, readwrite) BOOL carriesParamSets;
+@property (nonatomic, readwrite, copy) NSData *payload;
+@end
+
+@implementation P1ReassembledFrame
+@end
+
+// 正在累积的一帧：slots[i] 为 NSNull 或该分片的载荷。
+@interface P1PartialFrame : NSObject
+@property (nonatomic, assign) uint32_t displayID;
+@property (nonatomic, assign) uint32_t frameSeq;
+@property (nonatomic, assign) uint16_t fragCount;
+@property (nonatomic, assign) BOOL keyframe;
+@property (nonatomic, assign) BOOL carriesParamSets;
+@property (nonatomic, assign) double lastProgressMs;   // 最近一次收到新分片的时刻
+@property (nonatomic, assign) NSUInteger receivedCount;
+@property (nonatomic, assign) NSUInteger totalBytes;
+@property (nonatomic, strong) NSMutableArray *slots;
+@end
+
+@implementation P1PartialFrame
+@end
+
 @implementation P1FrameReassembler {
-    NSMutableData *_acc;
-    BOOL _active;
-    uint32_t _curSeq;
-    uint32_t _curDisplay;
-    uint16_t _expectIdx;
-    BOOL _completedAny;
+    NSMutableDictionary<NSNumber *, P1PartialFrame *> *_partials;
+    NSMutableDictionary<NSNumber *, P1ReassembledFrame *> *_ready;
+    BOOL _haveNext;
+    uint32_t _nextSeq;             // 下一个应交出的 frameSeq
+    BOOL _needsKeyframe;
+    NSUInteger _droppedFrames;
+    NSUInteger _fragmentsDiscarded;
+    uint32_t _lastCompletedSeq;
+    BOOL _haveDisplay;
+    uint32_t _activeDisplay;
+    double _gapSinceMs;            // 首次观察到「nextSeq 缺失但已有更晚帧」的时刻
 }
 
 - (instancetype)init {
     if ((self = [super init])) {
-        _acc = [NSMutableData data];
-        _needsKeyframe = NO;
-        _droppedFrames = 0;
-        _lastCompletedSeq = 0;
+        _frameDeadlineMs = 120.0;
+        _maxFramesInFlight = 4;
+        [self reset];
     }
     return self;
 }
 
 - (void)reset {
-    // 新会话：帧状态与统计一起清零，避免上一会话的缺口/关键帧请求泄漏到新会话。
-    [_acc setLength:0];
-    _active = NO;
-    _expectIdx = 0;
-    _needsKeyframe = NO;
-    _completedAny = NO;
+    // 新会话：帧状态与统计一起清零。首帧必须是关键帧——中途加入的 P 帧无参考帧，
+    // 交给解码器只会报错，不如直接等 Host 的 IDR。
+    _partials = [NSMutableDictionary dictionary];
+    _ready = [NSMutableDictionary dictionary];
+    _haveNext = NO;
+    _nextSeq = 0;
+    _needsKeyframe = YES;
     _droppedFrames = 0;
+    _fragmentsDiscarded = 0;
     _lastCompletedSeq = 0;
+    _haveDisplay = NO;
+    _activeDisplay = 0;
+    _gapSinceMs = 0;
 }
 
-- (void)dropCurrentFrame {
-    [_acc setLength:0];
-    _active = NO;
-    _expectIdx = 0;
-    _droppedFrames++;
+#pragma mark 内部
+
+- (void)dropPartial:(P1PartialFrame *)p countAsFrame:(BOOL)countAsFrame {
+    if (countAsFrame) _droppedFrames++;
+    _fragmentsDiscarded += p.receivedCount;
+    [_partials removeObjectForKey:@(p.frameSeq)];
 }
 
-- (NSData *)acceptHeader:(P1FrameHeader)header payload:(NSData *)payload error:(NSError **)error {
+// 判丢之后的统一收尾：已经无法按序解码，全部在途/待交帧作废，只等关键帧。
+- (void)declareLoss {
+    for (P1PartialFrame *p in _partials.allValues) {
+        _droppedFrames++;
+        _fragmentsDiscarded += p.receivedCount;
+    }
+    _droppedFrames += _ready.count;
+    [_partials removeAllObjects];
+    [_ready removeAllObjects];
+    _needsKeyframe = YES;
+    _haveNext = NO;
+    _gapSinceMs = 0;
+}
+
+// 关键帧到达：先清掉关键帧之前的残留（它们已无参考价值），再以该帧为新的顺序起点。
+- (void)restartAtKeyframeSeq:(uint32_t)seq {
+    NSUInteger lost = 0;
+    for (P1PartialFrame *p in _partials.allValues) {
+        _fragmentsDiscarded += p.receivedCount;
+        lost++;
+    }
+    lost += _ready.count;
+    _droppedFrames += lost;
+    [_partials removeAllObjects];
+    [_ready removeAllObjects];
+    _haveNext = YES;
+    _nextSeq = seq;
+    _needsKeyframe = NO;
+    _gapSinceMs = 0;
+}
+
+// 帧期限判据是「停止推进」而不是「总耗时」：大帧（WAN 上的 IDR）可以合法地
+// 持续收上几百毫秒，只要不断有新分片进来；真正缺片后 120ms 内没有新分片即判丢。
+- (void)evictExpiredAt:(double)nowMs {
+    NSMutableArray<P1PartialFrame *> *dead = [NSMutableArray array];
+    for (P1PartialFrame *p in _partials.allValues) {
+        if (nowMs - p.lastProgressMs > self.frameDeadlineMs) [dead addObject:p];
+    }
+    if (dead.count == 0) return;
+    for (P1PartialFrame *p in dead) [self dropPartial:p countAsFrame:YES];
+    [self declareLoss];
+}
+
+// nextSeq 完全没有分片、但更晚的帧已经在途/就绪 ⇒ 给一个期限，到期即判丢。
+// nextSeq 自己还有分片时走上面的「停止推进」判据，避免把慢速大帧误杀。
+- (void)checkGapDeadlineAt:(double)nowMs {
+    if (!_haveNext) { _gapSinceMs = 0; return; }
+    if (_partials[@(_nextSeq)] != nil) { _gapSinceMs = 0; return; }
+    BOOL gap = NO;
+    for (NSNumber *k in _ready) {
+        if (k.unsignedIntValue > _nextSeq) { gap = YES; break; }
+    }
+    if (!gap) {
+        for (NSNumber *k in _partials) {
+            if (k.unsignedIntValue > _nextSeq) { gap = YES; break; }
+        }
+    }
+    if (!gap) { _gapSinceMs = 0; return; }
+    if (_gapSinceMs == 0) { _gapSinceMs = nowMs; return; }
+    if (nowMs - _gapSinceMs < self.frameDeadlineMs) return;
+    _droppedFrames++;   // _nextSeq 一个分片都没收到
+    [self declareLoss];
+}
+
+- (void)drainInto:(NSMutableArray<P1ReassembledFrame *> *)out {
+    while (_haveNext) {
+        P1ReassembledFrame *f = _ready[@(_nextSeq)];
+        if (!f) break;
+        [_ready removeObjectForKey:@(_nextSeq)];
+        [out addObject:f];
+        _lastCompletedSeq = _nextSeq;
+        _nextSeq++;
+    }
+}
+
+#pragma mark 入口
+
+- (NSArray<P1ReassembledFrame *> *)acceptHeader:(P1FrameHeader)header
+                                        payload:(NSData *)payload
+                                          error:(NSError **)error {
+    return [self acceptHeader:header payload:payload
+                        nowMs:CFAbsoluteTimeGetCurrent() * 1000.0
+                        error:error];
+}
+
+- (NSArray<P1ReassembledFrame *> *)acceptHeader:(P1FrameHeader)header
+                                        payload:(NSData *)payload
+                                          nowMs:(double)nowMs
+                                          error:(NSError **)error {
     if (error) *error = nil;
     if (header.fragCount == 0 || header.fragIdx >= header.fragCount) {
         if (error) *error = P1Err(P1ProtocolErrorBadHeader, @"fragIdx out of range");
-        return nil;
+        return @[];
     }
     if (payload.length != header.payloadLen) {
         if (error) *error = P1Err(P1ProtocolErrorBadHeader, @"payloadLen mismatches payload");
-        return nil;
+        return @[];
+    }
+    if (self.maxFramesInFlight < 1) self.maxFramesInFlight = 1;
+
+    NSMutableArray<P1ReassembledFrame *> *delivered = [NSMutableArray array];
+    [self evictExpiredAt:nowMs];
+
+    // 单屏会话：别的 displayID 的分片不属于本重组器。
+    if (!_haveDisplay) {
+        _haveDisplay = YES;
+        _activeDisplay = header.displayID;
+    } else if (header.displayID != _activeDisplay) {
+        _fragmentsDiscarded++;
+        [self checkGapDeadlineAt:nowMs];
+        return delivered;
     }
 
-    BOOL startsFrame = (header.fragIdx == 0);
+    BOOL isKey = (header.flags & P1FrameFlagKeyframe) != 0;
 
-    // 粘在旧帧中途却来了新帧/新屏 ⇒ 丢弃旧帧
-    if (_active && (header.displayID != _curDisplay || header.frameSeq != _curSeq)) {
-        [self dropCurrentFrame];
-        _needsKeyframe = YES;
+    // 缺口期间只接受关键帧（参考链已断，P 帧解不出可用画面）。
+    if (_needsKeyframe && !isKey) {
+        _fragmentsDiscarded++;
+        [self checkGapDeadlineAt:nowMs];
+        return delivered;
     }
 
-    if (!_active) {
-        if (!startsFrame) {
-            // 中间分片先到（前面的丢了）⇒ 丢弃，等关键帧
-            _droppedFrames++;
-            _needsKeyframe = YES;
-            return nil;
+    uint32_t seq = header.frameSeq;
+    if (_haveNext && seq < _nextSeq) {          // 已交付帧的迟到分片
+        _fragmentsDiscarded++;
+        [self checkGapDeadlineAt:nowMs];
+        return delivered;
+    }
+    if (_ready[@(seq)] != nil) {                // 已收齐待交付帧的重复分片
+        _fragmentsDiscarded++;
+        [self checkGapDeadlineAt:nowMs];
+        return delivered;
+    }
+    if (_haveNext && seq > _nextSeq + (uint32_t)self.maxFramesInFlight) {
+        _fragmentsDiscarded++;                  // 超前太远，拒绝为它开盘
+        [self checkGapDeadlineAt:nowMs];
+        return delivered;
+    }
+
+    P1PartialFrame *p = _partials[@(seq)];
+    if (!p) {
+        if (_partials.count >= self.maxFramesInFlight) {
+            _fragmentsDiscarded++;
+            [self checkGapDeadlineAt:nowMs];
+            return delivered;
         }
-        // frameSeq 缺口检测
-        if (_completedAny && header.frameSeq != _lastCompletedSeq + 1) {
-            _droppedFrames++;
-            if (!(header.flags & P1FrameFlagKeyframe)) _needsKeyframe = YES;
+        p = [[P1PartialFrame alloc] init];
+        p.displayID = header.displayID;
+        p.frameSeq = seq;
+        p.fragCount = header.fragCount;
+        p.lastProgressMs = nowMs;
+        p.slots = [NSMutableArray arrayWithCapacity:header.fragCount];
+        for (uint16_t i = 0; i < header.fragCount; i++) [p.slots addObject:[NSNull null]];
+        _partials[@(seq)] = p;
+    } else if (p.fragCount != header.fragCount) {
+        if (header.fragIdx != 0) {              // 分片数不一致且不是首片：作废
+            [self dropPartial:p countAsFrame:YES];
+            [self declareLoss];
+            [self checkGapDeadlineAt:nowMs];
+            return delivered;
         }
-        _active = YES;
-        _curSeq = header.frameSeq;
-        _curDisplay = header.displayID;
-        _expectIdx = 0;
-        [_acc setLength:0];
+        p.fragCount = header.fragCount;
+        p.lastProgressMs = nowMs;
+        p.receivedCount = 0;
+        p.totalBytes = 0;
+        p.slots = [NSMutableArray arrayWithCapacity:header.fragCount];
+        for (uint16_t i = 0; i < header.fragCount; i++) [p.slots addObject:[NSNull null]];
     }
 
-    if (header.fragIdx != _expectIdx) {
-        // 分片错位：整帧作废
-        [self dropCurrentFrame];
-        _needsKeyframe = YES;
-        return nil;
+    if (p.slots[header.fragIdx] != [NSNull null]) {   // 重复分片
+        _fragmentsDiscarded++;
+        [self checkGapDeadlineAt:nowMs];
+        return delivered;
+    }
+    p.slots[header.fragIdx] = [payload copy];
+    p.receivedCount++;
+    p.totalBytes += payload.length;
+    p.lastProgressMs = nowMs;
+    if (isKey) p.keyframe = YES;
+    if (header.flags & P1FrameFlagHasParamSets) p.carriesParamSets = YES;
+
+    if (p.receivedCount < p.fragCount) {
+        [self checkGapDeadlineAt:nowMs];
+        return delivered;
     }
 
-    [_acc appendData:payload];
-    _expectIdx++;
+    // 整帧收齐
+    NSMutableData *whole = [NSMutableData dataWithCapacity:p.totalBytes];
+    for (NSData *d in p.slots) [whole appendData:d];
+    P1ReassembledFrame *frame = [[P1ReassembledFrame alloc] init];
+    frame.displayID = p.displayID;
+    frame.frameSeq = p.frameSeq;
+    frame.keyframe = p.keyframe;
+    frame.carriesParamSets = p.carriesParamSets;
+    frame.payload = whole;
+    [_partials removeObjectForKey:@(seq)];
 
-    BOOL isLast = (header.flags & P1FrameFlagLastFragment) || (header.fragIdx + 1 == header.fragCount);
-    if (!isLast) return nil;
-
-    NSData *whole = [_acc copy];
-    _lastCompletedSeq = header.frameSeq;
-    _completedAny = YES;
-    _active = NO;
-    _expectIdx = 0;
-    [_acc setLength:0];
-    if (header.flags & P1FrameFlagKeyframe) _needsKeyframe = NO;
-    return whole;
+    if (_needsKeyframe && !frame.keyframe) {
+        _droppedFrames++;
+        _fragmentsDiscarded += p.receivedCount;
+        [self checkGapDeadlineAt:nowMs];
+        return delivered;
+    }
+    if (_needsKeyframe && frame.keyframe) {
+        [self restartAtKeyframeSeq:frame.frameSeq];
+    }
+    if (!_haveNext) {
+        _haveNext = YES;
+        _nextSeq = frame.frameSeq;
+    }
+    if (frame.frameSeq < _nextSeq) {            // 迟到整帧
+        _droppedFrames++;
+        _fragmentsDiscarded += p.receivedCount;
+        [self checkGapDeadlineAt:nowMs];
+        return delivered;
+    }
+    _ready[@(frame.frameSeq)] = frame;
+    [self drainInto:delivered];
+    [self checkGapDeadlineAt:nowMs];
+    return delivered;
 }
 
 @end

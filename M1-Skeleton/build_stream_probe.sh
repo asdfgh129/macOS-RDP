@@ -13,6 +13,8 @@ cd "$(dirname "$0")"
 SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 CLANG="$(xcrun --sdk macosx --find clang)"
 P1SRC="../P1-ClientProbe/src"
+P0SRC="../P0-TahoeProbe/src"
+V01SRC="../P0V-DisplayIsolation/src"
 SRC="src"
 
 bash ./gen_quic_identity.sh .state rdp-identity rdpdev >/dev/null
@@ -33,6 +35,15 @@ SOURCES=(
   "$SRC/M1FrameView.m"
   "$SRC/M1InputLogic.m"
   "$SRC/M1InputInjector.m"
+  # 独占会话（P2.2）：建虚拟屏 / 禁物理屏 / 守护恢复
+  "$SRC/M1DriverLogic.m"
+  "$SRC/M1Takeover.m"
+  "$SRC/M1ScreenLock.m"
+  "$SRC/M1SessionCoordinator.m"
+  "$SRC/M1RDPDriver.m"
+  "$P0SRC/ProbeUtil.m"
+  "$P0SRC/VDManager.m"
+  "$V01SRC/P0VDisplayControl.m"
   "$P1SRC/ProtocolCodec.m"
   "$P1SRC/P1SessionState.m"
   "$P1SRC/P1InputCodec.m"
@@ -44,7 +55,7 @@ for f in "${SOURCES[@]}"; do
 done
 
 "$CLANG" -fobjc-arc -fmodules -O2 -g -mmacosx-version-min=13.0 \
-  -isysroot "$SDKROOT" -I "$SRC" -I "$P1SRC" \
+  -isysroot "$SDKROOT" -I "$SRC" -I "$P1SRC" -I "$P0SRC" -I "$V01SRC" \
   -Wall -Wno-unused-parameter -Wno-deprecated-declarations \
   "${SOURCES[@]}" \
   -framework AppKit \
@@ -52,6 +63,7 @@ done
   -framework CoreGraphics -framework CoreMedia -framework CoreVideo \
   -framework ScreenCaptureKit -framework VideoToolbox \
   -framework CoreImage -framework ImageIO -framework ApplicationServices \
+  -framework IOKit -framework IOSurface \
   -o ./stream_probe
 
 # 固定签名标识：屏幕录制 TCC 授权按 identifier 记录，重编后不必重新授权。

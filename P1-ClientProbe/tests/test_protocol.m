@@ -180,7 +180,7 @@ int main(void) {
         Expect(err == nil, "fragment-no-error");
 
         P1FrameReassembler *ra = [[P1FrameReassembler alloc] init];
-        NSData *whole = nil;
+        NSMutableData *whole = [NSMutableData data];
         int lastFlagCount = 0;
         for (NSData *f in frags) {
             P1FrameHeader fh = {0};
@@ -189,91 +189,164 @@ int main(void) {
             ExpectInt(fh.fragCount, 3, "fragment-count-field");
             if (fh.flags & P1FrameFlagLastFragment) lastFlagCount++;
             NSData *bodyData = [f subdataWithRange:NSMakeRange(P1FrameHeaderSize, f.length - P1FrameHeaderSize)];
-            NSData *done = [ra acceptHeader:fh payload:bodyData error:&err];
-            if (done) whole = done;
+            NSArray<P1ReassembledFrame *> *done = [ra acceptHeader:fh payload:bodyData error:&err];
+            for (P1ReassembledFrame *fr in done) [whole appendData:fr.payload];
         }
         ExpectInt(lastFlagCount, 1, "fragment-only-last-flagged");
-        Expect(whole != nil && [whole isEqualToData:payload], "reassemble-equals-original");
+        Expect(whole.length > 0 && [whole isEqualToData:payload], "reassemble-equals-original");
         Expect(!ra.needsKeyframe, "reassemble-no-keyframe-needed");
         ExpectInt((long)ra.droppedFrames, 0, "reassemble-no-drops");
 
-        // 大帧往返：v1 的 255 片上限在这里会直接拒发。用 400 片（≈460KB，超过
-        // 3440×1440 关键帧的典型体积）验证分片→重组逐字节一致。
+        // 同一帧的分片倒序到达：v3 起必须能收齐，不再整帧作废。
         {
-            NSUInteger bigLen = P1FrameMaxPayload * 400 - 137;   // 不足整片，覆盖末片短载荷
-            NSMutableData *big = [NSMutableData dataWithLength:bigLen];
-            uint8_t *bp = big.mutableBytes;
-            for (NSUInteger i = 0; i < bigLen; i++) bp[i] = (uint8_t)(i * 31 + 7);
-
-            P1FrameHeader bh = MakeHeader(7, 4242, 0, 1, P1FrameFlagKeyframe | P1FrameFlagHasParamSets);
-            err = nil;
-            NSArray<NSData *> *shards = P1FragmentPayload(big, bh, &err);
-            Expect(shards.count == 400 && err == nil, "big-frame-400-shards");
-
-            P1FrameHeader firstHC = {0};
-            P1UnpackFrameHeader(shards.firstObject, &firstHC, NULL);
-            P1FrameHeader lastHC = {0};
-            P1UnpackFrameHeader(shards.lastObject, &lastHC, NULL);
-            ExpectInt(firstHC.fragCount, 400, "big-frame-count-field");
-            ExpectInt(lastHC.fragIdx, 399, "big-frame-last-index");
-
-            P1FrameReassembler *bigRA = [[P1FrameReassembler alloc] init];
-            NSData *bigWhole = nil;
-            for (NSData *sh in shards) {
+            P1FrameReassembler *ooo = [[P1FrameReassembler alloc] init];
+            NSMutableData *all = [NSMutableData data];
+            for (NSData *f in [frags reverseObjectEnumerator]) {
                 P1FrameHeader fh = {0};
-                if (!P1UnpackFrameHeader(sh, &fh, NULL)) continue;
-                NSData *body = [sh subdataWithRange:NSMakeRange(P1FrameHeaderSize,
-                                                               sh.length - P1FrameHeaderSize)];
-                NSData *done = [bigRA acceptHeader:fh payload:body error:NULL];
-                if (done) bigWhole = done;
+                P1UnpackFrameHeader(f, &fh, NULL);
+                NSData *bodyData = [f subdataWithRange:NSMakeRange(P1FrameHeaderSize,
+                                                                   f.length - P1FrameHeaderSize)];
+                for (P1ReassembledFrame *fr in [ooo acceptHeader:fh payload:bodyData error:NULL]) {
+                    [all appendData:fr.payload];
+                }
             }
-            Expect(bigWhole != nil && [bigWhole isEqualToData:big], "big-frame-reassemble-equals");
+            Expect([all isEqualToData:payload], "ooo-within-frame-reassembles");
+            Expect(!ooo.needsKeyframe, "ooo-within-frame-no-keyframe");
+        }
+
+        // 大帧往返：v1 的 255 片上限在这里会直接拒发。用 400 片（≈460KB，超过
+        // 255 片的旧上限），验证 v2 的 16 位分片号端到端可用。
+        {
+            NSMutableData *big = [NSMutableData dataWithLength:400 * P1FrameMaxPayload];
+            NSError *bigErr = nil;
+            NSArray<NSData *> *bigFrags = P1FragmentPayload(big, proto, &bigErr);
+            Expect(bigFrags != nil && bigErr == nil, "big-frame-fragment-ok");
+            P1FrameReassembler *bigRA = [[P1FrameReassembler alloc] init];
+            NSMutableData *bigWhole = [NSMutableData data];
+            for (NSData *f in bigFrags) {
+                P1FrameHeader fh = {0};
+                if (!P1UnpackFrameHeader(f, &fh, NULL)) continue;
+                NSData *body = [f subdataWithRange:NSMakeRange(P1FrameHeaderSize,
+                                                               f.length - P1FrameHeaderSize)];
+                for (P1ReassembledFrame *fr in [bigRA acceptHeader:fh payload:body error:NULL]) {
+                    [bigWhole appendData:fr.payload];
+                }
+            }
+            Expect([bigWhole isEqualToData:big], "big-frame-reassemble-equals");
             ExpectInt((long)bigRA.droppedFrames, 0, "big-frame-no-drops");
         }
 
-        // frameSeq 缺口 → 需要关键帧
-        P1FrameReassembler *gap = [[P1FrameReassembler alloc] init];
-        NSData *chunk = [@"AAAA" dataUsingEncoding:NSUTF8StringEncoding];
-        P1FrameHeader s1 = MakeHeader(9, 1, 0, 1, P1FrameFlagKeyframe);
-        s1.payloadLen = (uint16_t)chunk.length;
-        Expect([gap acceptHeader:s1 payload:chunk error:&err] != nil, "gap-seq1-complete");
+        // 跨帧乱序：seq0(key) → seq2 → seq1，必须按 0,1,2 顺序交付。
+        {
+            P1FrameReassembler *ro = [[P1FrameReassembler alloc] init];
+            NSData *f0 = [@"frame-0-" dataUsingEncoding:NSUTF8StringEncoding];
+            NSData *f1 = [@"frame-1-" dataUsingEncoding:NSUTF8StringEncoding];
+            NSData *f2 = [@"frame-2-" dataUsingEncoding:NSUTF8StringEncoding];
+            P1FrameHeader h0 = MakeHeader(9, 0, 0, 1, P1FrameFlagKeyframe);
+            P1FrameHeader h1 = MakeHeader(9, 1, 0, 1, 0);
+            P1FrameHeader h2 = MakeHeader(9, 2, 0, 1, 0);
+            h0.payloadLen = (uint16_t)f0.length;
+            h1.payloadLen = (uint16_t)f1.length;
+            h2.payloadLen = (uint16_t)f2.length;
+            NSArray *d0 = [ro acceptHeader:h0 payload:f0 nowMs:1000 error:NULL];
+            NSArray *d2 = [ro acceptHeader:h2 payload:f2 nowMs:1010 error:NULL];
+            Expect(d0.count == 1, "reorder-seq0-delivered");
+            Expect(d2.count == 0, "reorder-seq2-held");
+            Expect(!ro.needsKeyframe, "reorder-not-lost-before-deadline");
+            NSArray<P1ReassembledFrame *> *d1 = [ro acceptHeader:h1 payload:f1 nowMs:1020 error:NULL];
+            Expect(d1.count == 2, "reorder-release-two-in-order");
+            if (d1.count == 2) {
+                Expect(d1[0].frameSeq == 1 && [d1[0].payload isEqualToData:f1], "reorder-seq1-first");
+                Expect(d1[1].frameSeq == 2 && [d1[1].payload isEqualToData:f2], "reorder-seq2-second");
+            }
+            ExpectInt((long)ro.droppedFrames, 0, "reorder-no-drops");
+        }
 
-        P1FrameHeader s3 = MakeHeader(9, 3, 0, 1, 0);   // 缺 seq 2
-        s3.payloadLen = (uint16_t)chunk.length;
-        Expect([gap acceptHeader:s3 payload:chunk error:&err] != nil, "gap-seq3-still-delivers");
-        Expect(gap.needsKeyframe, "gap-detects-and-wants-keyframe");
-        ExpectInt((long)gap.droppedFrames, 1, "gap-drop-count");
+        // 真丢帧：seq1 一直不来，超过帧期限（120ms）后才判丢并要关键帧。
+        {
+            P1FrameReassembler *gap = [[P1FrameReassembler alloc] init];
+            NSData *chunk = [@"AAAA" dataUsingEncoding:NSUTF8StringEncoding];
+            P1FrameHeader s0 = MakeHeader(9, 0, 0, 1, P1FrameFlagKeyframe);
+            P1FrameHeader s2 = MakeHeader(9, 2, 0, 1, 0);
+            P1FrameHeader s3 = MakeHeader(9, 3, 0, 1, 0);
+            s0.payloadLen = s2.payloadLen = s3.payloadLen = (uint16_t)chunk.length;
+            Expect([gap acceptHeader:s0 payload:chunk nowMs:1000 error:&err].count == 1,
+                   "gap-seq0-keyframe-delivered");
+            Expect([gap acceptHeader:s2 payload:chunk nowMs:1010 error:&err].count == 0,
+                   "gap-seq2-held-not-delivered");
+            Expect(!gap.needsKeyframe, "gap-within-deadline-no-keyframe");
+            Expect([gap acceptHeader:s3 payload:chunk nowMs:1200 error:&err].count == 0,
+                   "gap-after-deadline-nothing-delivered");
+            Expect(gap.needsKeyframe, "gap-after-deadline-wants-keyframe");
+            Expect(gap.droppedFrames >= 3, "gap-counts-lost-and-dependent-frames");
 
-        P1FrameHeader s4 = MakeHeader(9, 4, 0, 1, P1FrameFlagKeyframe);
-        s4.payloadLen = (uint16_t)chunk.length;
-        [gap acceptHeader:s4 payload:chunk error:&err];
-        Expect(!gap.needsKeyframe, "gap-keyframe-clears-flag");
+            P1FrameHeader s5k = MakeHeader(9, 5, 0, 1, P1FrameFlagKeyframe);
+            s5k.payloadLen = (uint16_t)chunk.length;
+            NSArray<P1ReassembledFrame *> *kf =
+                [gap acceptHeader:s5k payload:chunk nowMs:1210 error:&err];
+            Expect(kf.count == 1 && kf[0].keyframe, "gap-keyframe-delivered-after-loss");
+            Expect(!gap.needsKeyframe, "gap-keyframe-clears-flag");
+        }
 
-        // 中间分片先到（前缀分片丢失）
-        P1FrameReassembler *ooo = [[P1FrameReassembler alloc] init];
-        P1FrameHeader mid = MakeHeader(9, 10, 1, 3, 0);
-        mid.payloadLen = (uint16_t)chunk.length;
-        Expect([ooo acceptHeader:mid payload:chunk error:&err] == nil, "ooo-mid-frag-dropped");
-        Expect(ooo.needsKeyframe, "ooo-wants-keyframe");
+        // 缺口期间的非关键帧一律丢弃，不能喂给解码器。
+        {
+            P1FrameReassembler *pf = [[P1FrameReassembler alloc] init];
+            NSData *chunk = [@"BBBB" dataUsingEncoding:NSUTF8StringEncoding];
+            P1FrameHeader p = MakeHeader(9, 1, 0, 1, 0);
+            p.payloadLen = (uint16_t)chunk.length;
+            Expect([pf acceptHeader:p payload:chunk error:&err].count == 0,
+                   "p-frame-before-keyframe-discarded");
+            Expect(pf.needsKeyframe, "first-frame-must-be-keyframe");
+        }
 
-        // 两块屏交错：进入另一块屏必须丢弃并要关键帧
-        P1FrameReassembler *mix = [[P1FrameReassembler alloc] init];
-        P1FrameHeader a0 = MakeHeader(100, 1, 0, 2, P1FrameFlagKeyframe);
-        a0.payloadLen = (uint16_t)chunk.length;
-        [mix acceptHeader:a0 payload:chunk error:&err];          // 屏 A 第 0 片
-        P1FrameHeader b0 = MakeHeader(200, 1, 0, 1, 0);          // 屏 B 插进来
-        b0.payloadLen = (uint16_t)chunk.length;
-        NSData *bDone = [mix acceptHeader:b0 payload:chunk error:&err];
-        Expect(bDone != nil, "mix-b-frame-completes");
-        Expect(mix.needsKeyframe, "mix-requests-keyframe");
-        Expect(mix.droppedFrames >= 1, "mix-drops-a-frame");
+        // 首帧从中间分片开始（前缀分片丢了）：v3 起允许等待其余分片，但非关键帧仍不交付。
+        {
+            P1FrameReassembler *mid = [[P1FrameReassembler alloc] init];
+            NSData *chunk = [@"CCCC" dataUsingEncoding:NSUTF8StringEncoding];
+            P1FrameHeader m1 = MakeHeader(9, 0, 1, 3, P1FrameFlagKeyframe);
+            m1.payloadLen = (uint16_t)chunk.length;
+            Expect([mid acceptHeader:m1 payload:chunk error:&err].count == 0,
+                   "mid-frag-held");
+            Expect(mid.needsKeyframe, "mid-frag-still-needs-keyframe");
+        }
+
+        // 同一帧重复分片只计一次。
+        {
+            P1FrameReassembler *dup = [[P1FrameReassembler alloc] init];
+            NSData *chunk = [@"DDDD" dataUsingEncoding:NSUTF8StringEncoding];
+            P1FrameHeader h0 = MakeHeader(9, 0, 0, 2, P1FrameFlagKeyframe);
+            P1FrameHeader h1 = MakeHeader(9, 0, 1, 2, P1FrameFlagKeyframe);
+            h0.payloadLen = h1.payloadLen = (uint16_t)chunk.length;
+            [dup acceptHeader:h0 payload:chunk error:NULL];
+            [dup acceptHeader:h0 payload:chunk error:NULL];
+            NSArray<P1ReassembledFrame *> *done = [dup acceptHeader:h1 payload:chunk error:NULL];
+            Expect(done.count == 1, "duplicate-fragment-delivers-once");
+            Expect(dup.fragmentsDiscarded >= 1, "duplicate-fragment-counted");
+        }
+
+        // 单屏会话：别的 displayID 的分片忽略，不打断本屏。
+        {
+            P1FrameReassembler *mix = [[P1FrameReassembler alloc] init];
+            NSData *chunk = [@"EEEE" dataUsingEncoding:NSUTF8StringEncoding];
+            P1FrameHeader a0 = MakeHeader(100, 1, 0, 2, P1FrameFlagKeyframe);
+            P1FrameHeader a1 = MakeHeader(100, 1, 1, 2, P1FrameFlagKeyframe);
+            P1FrameHeader b0 = MakeHeader(200, 7, 0, 1, P1FrameFlagKeyframe);
+            a0.payloadLen = a1.payloadLen = b0.payloadLen = (uint16_t)chunk.length;
+            Expect([mix acceptHeader:a0 payload:chunk error:&err].count == 0, "mix-a0-held");
+            Expect([mix acceptHeader:b0 payload:chunk error:&err].count == 0, "mix-other-display-ignored");
+            NSArray<P1ReassembledFrame *> *aDone = [mix acceptHeader:a1 payload:chunk error:&err];
+            Expect(aDone.count == 1 && aDone[0].displayID == 100, "mix-a-frame-completes");
+            Expect(!mix.needsKeyframe, "mix-no-keyframe-needed");
+            Expect(mix.fragmentsDiscarded >= 1, "mix-ignored-fragment-counted");
+        }
 
         // payloadLen 与实参不符必须拒绝
+        NSData *chunk = [@"ZZZZ" dataUsingEncoding:NSUTF8StringEncoding];
         P1FrameHeader lie = MakeHeader(7, 1, 0, 1, 0);
         lie.payloadLen = 999;
         err = nil;
         P1FrameReassembler *lieRA = [[P1FrameReassembler alloc] init];
-        Expect([lieRA acceptHeader:lie payload:chunk error:&err] == nil &&
+        Expect([lieRA acceptHeader:lie payload:chunk error:&err].count == 0 &&
                err.code == P1ProtocolErrorBadHeader, "reject-payloadlen-mismatch");
 
         // 256 片在过去（v1，fragCount 为 uint8）是要报错的，v2 起合法：
@@ -295,9 +368,15 @@ int main(void) {
         Expect(P1FragmentPayload(huge, proto, &err) == nil &&
                err.code == P1ProtocolErrorPayloadTooLarge, "fragment-too-many");
 
-        // reset 清状态
-        [gap reset];
-        Expect(!gap.needsKeyframe && gap.droppedFrames == 0, "reset-clears-state");
+        // reset 清状态：统计归零，并重新要求首关键帧
+        P1FrameReassembler *resetRA = [[P1FrameReassembler alloc] init];
+        NSData *rc = [@"RRRR" dataUsingEncoding:NSUTF8StringEncoding];
+        P1FrameHeader rh = MakeHeader(9, 0, 0, 1, P1FrameFlagKeyframe);
+        rh.payloadLen = (uint16_t)rc.length;
+        [resetRA acceptHeader:rh payload:rc error:NULL];
+        [resetRA reset];
+        Expect(resetRA.needsKeyframe && resetRA.droppedFrames == 0 &&
+               resetRA.fragmentsDiscarded == 0, "reset-clears-state");
 
         printf(gFail ? "\n%d FAILED\n" : "\nALL PASS\n", gFail);
     }

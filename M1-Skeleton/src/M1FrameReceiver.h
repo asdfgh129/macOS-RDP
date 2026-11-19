@@ -24,11 +24,13 @@ NS_ASSUME_NONNULL_BEGIN
 @interface M1FrameReceiverStats : NSObject
 @property (nonatomic, readonly) uint64_t datagramsReceived;
 @property (nonatomic, readonly) uint64_t malformedDatagrams;
-@property (nonatomic, readonly) uint64_t framesCompleted;    // 重组收齐的帧
+@property (nonatomic, readonly) uint64_t framesCompleted;    // 重组收齐并按序交付的帧
 @property (nonatomic, readonly) uint64_t framesDecoded;      // 成功解出画面
-@property (nonatomic, readonly) uint64_t framesDropped;      // 缺口/等关键帧而丢弃
+@property (nonatomic, readonly) uint64_t framesDropped;      // 帧级：期限判丢 + 无参数集/解码前置失败
+@property (nonatomic, readonly) uint64_t fragmentsDiscarded; // 随丢帧/重复/迟到一起丢弃的分片数
 @property (nonatomic, readonly) uint64_t decodeFailures;
-@property (nonatomic, readonly) uint64_t keyframeRequests;
+@property (nonatomic, readonly) uint64_t keyframeRequests;   // 请求关键帧的「次数」（缺口 episode）
+@property (nonatomic, readonly) double awaitingKeyframeMs;   // 处于等关键帧状态的总时长
 @property (nonatomic, readonly) double lastDecodeLatencyMs;
 // VTDecompressionSessionCreate 的实际耗时（建一次记一次，末次值）。
 // 预热生效后应落在几十 ms；首次且未预热时实测 260~1110ms。

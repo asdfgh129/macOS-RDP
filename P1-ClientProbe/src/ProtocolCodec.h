@@ -87,16 +87,37 @@ NSArray<NSData *> * _Nullable P1FragmentPayload(NSData *payload,
                                                 P1FrameHeader proto,
                                                 NSError * _Nullable * _Nullable error);
 
-// 分片重组：按 displayID + frameSeq 累积，检测 seq 缺口并置 needsKeyframe。
+// 重组完成、可按序解码的一帧。
+@interface P1ReassembledFrame : NSObject
+@property (nonatomic, readonly) uint32_t displayID;
+@property (nonatomic, readonly) uint32_t frameSeq;
+@property (nonatomic, readonly) BOOL keyframe;
+@property (nonatomic, readonly) BOOL carriesParamSets;
+@property (nonatomic, readonly, copy) NSData *payload;
+@end
+
+// 分片重组 v3：按 displayID + frameSeq 位图累积，容忍乱序与重复；
+// 一个帧自首片到达起超过 frameDeadlineMs 仍未收齐即判丢（其后帧一并作废），
+// 置 needsKeyframe 并只接受关键帧重启。收齐的帧按 frameSeq 顺序交付。
 @interface P1FrameReassembler : NSObject
 
-// 交入一个分片（header 与 payload 已分开解析）。整帧收齐返回完整载荷，否则 nil。
-- (nullable NSData *)acceptHeader:(P1FrameHeader)header
-                          payload:(NSData *)payload
-                            error:(NSError * _Nullable * _Nullable)error;
+// 交入一个分片（header 与 payload 已分开解析）。
+// 返回本次可以按序交付的帧（通常 0 或 1 帧，积压解除时可能多帧）；从不超过 maxFramesInFlight。
+- (NSArray<P1ReassembledFrame *> *)acceptHeader:(P1FrameHeader)header
+                                        payload:(NSData *)payload
+                                          error:(NSError * _Nullable * _Nullable)error;
 
-@property (nonatomic, readonly) BOOL needsKeyframe;   // 需要向 Host 请求关键帧
-@property (nonatomic, readonly) NSUInteger droppedFrames;  // 因缺口/错位丢弃的帧数
+// 显式时间版本，单测用来拨动帧期限。
+- (NSArray<P1ReassembledFrame *> *)acceptHeader:(P1FrameHeader)header
+                                        payload:(NSData *)payload
+                                          nowMs:(double)nowMs
+                                          error:(NSError * _Nullable * _Nullable)error;
+
+@property (nonatomic) double frameDeadlineMs;      // 默认 120ms
+@property (nonatomic) NSUInteger maxFramesInFlight; // 默认 4，同时也是 seq 超前窗口
+@property (nonatomic, readonly) BOOL needsKeyframe;        // 需要向 Host 请求关键帧
+@property (nonatomic, readonly) NSUInteger droppedFrames;  // 已判定丢弃的整帧数
+@property (nonatomic, readonly) NSUInteger fragmentsDiscarded; // 随之丢弃的分片数（含重复/迟到）
 @property (nonatomic, readonly) uint32_t lastCompletedSeq;
 - (void)reset;
 

@@ -160,7 +160,7 @@ summary)
   H="${2:-}"; C="${3:-}"
   [ -n "$H" ] && [ -n "$C" ] || die "用法: ./p2.sh summary <host.json> <client.json>"
   python3 - "$H" "$C" <<'PY'
-import json, sys
+import json, os, sys
 
 def load(p):
     try:
@@ -177,6 +177,8 @@ rows = [
     ("主机编码前丢弃/发送失败", "%s / %s" % (h.get("framesDroppedBeforeEncoder"), h.get("sendFailures"))),
     ("客户端收齐/解出",    "%s / %s" % (c.get("framesCompleted"), c.get("framesDecoded"))),
     ("客户端丢帧/解码失败", "%s / %s" % (c.get("framesDropped"), c.get("decodeFailures"))),
+    ("客户端分片丢弃/等待关键帧", "%s 片 / %s ms" % (c.get("fragmentsDiscarded"), c.get("awaitingKeyframeMs"))),
+    ("关键帧请求 发出/主机收到", "%s / %s" % (c.get("keyframeRequestsSent"), h.get("keyframeRequestsReceived"))),
     ("客户端上屏",        "%s 帧（跳过 %s 不可见）" % (c.get("framesRendered"), c.get("renderSkippedOccluded"))),
     ("首帧延迟",          "主机 %s ms / 客户端 %s ms" % (h.get("firstFrameLatencyMs"), c.get("firstFrameLatencyMs"))),
     ("解码/渲染 单帧",     "%s ms / %s ms" % (c.get("lastDecodeLatencyMs", "?"), c.get("lastRenderMs"))),
@@ -197,7 +199,12 @@ dropped, decoded = c.get("framesDropped", 0), c.get("framesDecoded", 1)
 fails = []
 if not c.get("streaming"): fails.append("客户端未处于 STREAMING")
 if decoded <= 0: fails.append("客户端一帧都没解出来")
-elif sent and decoded / max(sent, 1) < 0.95: fails.append(f"解码/发出 = {decoded}/{sent} < 0.95")
+else:
+    # 阈值按实测丢片率分层（docs/P2-CHECKLIST.md §4）：无 FEC 时 IDR 存活率随分片数
+    # 指数衰减，1% 分片丢包下 720p IDR（≈360 片）存活率仅 ≈2.7%，高阈值不成立。
+    min_ratio = float(os.environ.get("P2_MIN_DECODE_RATIO", "0.95"))
+    if sent and decoded / max(sent, 1) < min_ratio:
+        fails.append(f"解码/发出 = {decoded}/{sent} < {min_ratio:g}")
 if h.get("sendFailures", 0): fails.append(f"主机发送失败 {h['sendFailures']} 次")
 if h.get("malformed") or c.get("malformed"): fails.append("有畸形分片")
 if (c.get("maxControlGapMs") or 0) > 3000: fails.append("控制通道间隔 > 3s（心跳被挤）")

@@ -81,6 +81,13 @@ NSString *M1HostSessionPhaseName(M1HostSessionPhase phase);
 @property (nonatomic, readonly) M1HostSessionPhase phase;
 @property (nonatomic, strong, readonly) NSArray<NSNumber *> *specsSummary;
 @property (nonatomic, strong, readonly) M1TakeoverDetector *takeover;
+@property (nonatomic, copy, readonly) NSArray<NSNumber *> *createdDisplayIDs;
+
+// 诊断模式：额外保留的物理屏（例如主屏不黑）。非空时跳过 C-09 隔离校验——
+// 该模式只用于「看得见地验证建屏与采集」，不是产品路径（产品必须零物理屏）。
+@property (nonatomic, copy, nullable) NSArray<NSNumber *> *extraKeepDisplayIDs;
+// 断开时是否锁屏（D-06 要求锁）。探针做连续测量时置 NO，避免锁屏打断远程操作。
+@property (nonatomic, assign) BOOL locksScreenOnEnd;
 
 - (instancetype)initWithDriver:(id<M1SessionDriver>)driver;
 

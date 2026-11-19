@@ -85,7 +85,7 @@ static double M1EncNowMs(void) {
     _Atomic double _maxEncodeCallMs;
     _Atomic double _sessionCreateMs;
     BOOL _running;
-    BOOL _forceNextKeyframe;   // 下一帧强制 IDR（帧级选项，用完即复位）
+    atomic_bool _forceNextKeyframe;   // 下一帧强制 IDR（帧级选项，用完即复位；跨线程请求）
 }
 // C 回调转进来的入口，仅在 VT 内部队列执行。
 - (void)handleStatus:(OSStatus)status sampleBuffer:(CMSampleBufferRef)sampleBuffer;
@@ -163,6 +163,7 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
         atomic_store(&_lastEncodeCallMs, 0.0);
         atomic_store(&_maxEncodeCallMs, 0.0);
         atomic_store(&_sessionCreateMs, 0.0);
+        atomic_init(&_forceNextKeyframe, false);
         _running = NO;
     }
     return self;
@@ -256,8 +257,10 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
     CMTime pts = CMTimeMakeWithSeconds(ptsMs / 1000.0, 1000);
 
     // 关键帧请求是「帧级选项」，不是会话属性：只在本次 EncodeFrame 生效。
+    // 请求来自控制收包队列，这里用 exchange 取走，避免漏帧/重复置位。
+    BOOL forceKeyframe = atomic_exchange(&_forceNextKeyframe, false);
     CFDictionaryRef frameProps = NULL;
-    if (_forceNextKeyframe) {
+    if (forceKeyframe) {
         const void *keys[] = { kVTEncodeFrameOptionKey_ForceKeyFrame };
         const void *vals[] = { kCFBooleanTrue };
         frameProps = CFDictionaryCreate(kCFAllocatorDefault, keys, vals, 1,
@@ -269,7 +272,6 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
     OSStatus st = VTCompressionSessionEncodeFrame(_session, pixelBuffer, pts,
                                                  kCMTimeInvalid, frameProps, NULL, NULL);
     if (frameProps) CFRelease(frameProps);
-    if (_forceNextKeyframe) _forceNextKeyframe = NO;
 
     double callMs = (CACurrentMediaTime() - t0) * 1000.0;
     atomic_store(&_lastEncodeCallMs, callMs);
@@ -291,7 +293,7 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
 - (void)requestKeyframe {
     if (!_session) return;
     // 标记下一帧为 IDR；实际通过 EncodeFrame 的 frameProperties 传递。
-    _forceNextKeyframe = YES;
+    atomic_store(&_forceNextKeyframe, true);
 }
 
 - (void)stop {

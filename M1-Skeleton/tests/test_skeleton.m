@@ -501,8 +501,9 @@ static void TestFrameSender(void) {
             if (!P1UnpackFrameHeader(dgram, &h, NULL)) { unpackAll = NO; continue; }
             if (dgram.length < P1FrameHeaderSize + h.payloadLen) { unpackAll = NO; continue; }
             NSData *body = [dgram subdataWithRange:NSMakeRange(P1FrameHeaderSize, h.payloadLen)];
-            NSData *full = [rx acceptHeader:h payload:body error:NULL];
-            if (full) [recovered addObject:full];
+            for (P1ReassembledFrame *fr in [rx acceptHeader:h payload:body error:NULL]) {
+                [recovered addObject:fr.payload];
+            }
         }
         OK(unpackAll, "roundtrip-unpack-ok");
         OK(recovered.count == originals.count, "roundtrip-frame-count");
@@ -515,23 +516,34 @@ static void TestFrameSender(void) {
         OK(rx.lastCompletedSeq == 5, "roundtrip-last-seq");
     }
 
-    // --- 缺口检测：丢掉中间一帧后接收端应请求关键帧 ---
+    // --- 缺口检测：丢掉中间一帧，超过帧期限后接收端应请求关键帧 ---
     {
         M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
         M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
-        for (int i = 0; i < 3; i++) {
-            [tx sendPayload:MakePayload(64, (uint8_t)i) displayID:1 flags:0 error:NULL];
+        for (int i = 0; i < 4; i++) {
+            P1FrameFlags fl = (i == 0) ? P1FrameFlagKeyframe : 0;
+            [tx sendPayload:MakePayload(64, (uint8_t)i) displayID:1 flags:fl error:NULL];
         }
         P1FrameReassembler *rx = [[P1FrameReassembler alloc] init];
-        NSArray<NSNumber *> *keep = @[@0, @2];   // 故意跳过 seq=1
+        NSArray<NSNumber *> *keep = @[@0, @2, @3];   // 故意跳过 seq=1
+        double t = 1000;
         for (NSNumber *idx in keep) {
             NSData *dgram = sink.datagrams[idx.unsignedIntegerValue];
             P1FrameHeader h = {0};
             P1UnpackFrameHeader(dgram, &h, NULL);
             NSData *body = [dgram subdataWithRange:NSMakeRange(P1FrameHeaderSize, h.payloadLen)];
-            [rx acceptHeader:h payload:body error:NULL];
+            [rx acceptHeader:h payload:body nowMs:t error:NULL];
+            t += 10;
         }
+        OK(!rx.needsKeyframe, "gap-held-within-deadline");
+        // 再喂一个更晚的分片，触发期限判丢（此时距首次观察到缺口已 >120ms）
+        NSData *dgram = sink.datagrams.lastObject;
+        P1FrameHeader h = {0};
+        P1UnpackFrameHeader(dgram, &h, NULL);
+        NSData *body = [dgram subdataWithRange:NSMakeRange(P1FrameHeaderSize, h.payloadLen)];
+        [rx acceptHeader:h payload:body nowMs:t + 200 error:NULL];
         OK(rx.needsKeyframe, "gap-detected-needs-keyframe");
+        OK(rx.droppedFrames >= 1, "gap-counts-lost-frame");
     }
 }
 
@@ -606,12 +618,16 @@ static void TestControlChannel(void) {
 @interface M1TestSessionWatcher : NSObject <M1ControlSessionDelegate>
 @property (nonatomic, strong, nullable) NSError *error;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *inputs;
+@property (nonatomic) NSUInteger keyframeRequests;
 @end
 
 @implementation M1TestSessionWatcher
 - (instancetype)init {
     if ((self = [super init])) _inputs = [NSMutableArray array];
     return self;
+}
+- (void)controlSessionDidRequestKeyframe:(M1ControlSession *)session {
+    _keyframeRequests++;
 }
 - (void)controlSession:(M1ControlSession *)session didFailWithError:(NSError *)error {
     if (!self.error) self.error = error;
@@ -810,6 +826,54 @@ static void TestControlSessionInput(void) {
     OK(preErr.code == M1ControlSessionErrorInvalidState, "in-pre-streaming-error-code");
 }
 
+#pragma mark - 控制会话（关键帧请求）
+
+// 帧通道丢帧后最关键的一条线：Client 的请求必须真的过线，Host 必须被回调；
+// 同时 300ms 限流要生效（连环丢包不该把控制通道刷满）。
+static void TestControlSessionKeyframe(void) {
+    printf("=== control session (keyframe request) ===\n");
+    NSDictionary *r = RunPair(nil, nil, FP(@"ab"), FP(@"cd"));
+    M1ControlSession *client = r[@"client"];
+    M1ControlSession *host = r[@"host"];
+    M1TestSessionWatcher *hw = r[@"hostWatcher"];
+    NSMutableArray<NSArray *> *pending = r[@"pending"];
+    OK(client.reachedStreaming && host.reachedStreaming, "kf-both-streaming");
+
+    NSError *err = nil;
+    OK([client requestKeyframeWithError:&err], "kf-send-first");
+    Pump(pending);
+    OK(hw.keyframeRequests == 1, "kf-host-callback");
+    OK(host.keyframeRequestsReceived == 1, "kf-host-count");
+    OK(client.keyframeRequestsSent == 1, "kf-client-sent-count");
+
+    // 300ms 内的第二次必须被限流，且不再上线
+    err = nil;
+    OK(![client requestKeyframeWithError:&err] &&
+       err.code == M1ControlSessionErrorRateLimited, "kf-rate-limited");
+    Pump(pending);
+    OK(hw.keyframeRequests == 1, "kf-rate-limit-not-delivered");
+    OK(client.keyframeRequestsSent == 1, "kf-rate-limit-not-counted");
+
+    usleep(320 * 1000);
+    OK([client requestKeyframeWithError:&err], "kf-send-after-window");
+    Pump(pending);
+    OK(hw.keyframeRequests == 2, "kf-second-delivered");
+
+    // Host 不能发、非 STREAMING 不能发
+    OK(![host requestKeyframeWithError:&err] &&
+       err.code == M1ControlSessionErrorProtocol, "kf-host-cannot-send");
+
+    M1MemoryMessageSink *deadSink = [M1MemoryMessageSink new];
+    M1ControlChannel *deadCh = [[M1ControlChannel alloc] initWithSink:deadSink];
+    M1ControlSessionConfig *cfg = [M1ControlSessionConfig new];
+    cfg.role = M1ControlRoleClient;
+    cfg.heartbeatIntervalMs = 0;
+    M1ControlSession *lone = [[M1ControlSession alloc] initWithChannel:deadCh config:cfg];
+    err = nil;
+    OK(![lone requestKeyframeWithError:&err] &&
+       err.code == M1ControlSessionErrorInvalidState, "kf-pre-streaming-rejected");
+}
+
 int main(void) {
     @autoreleasepool {
         TestPairing();
@@ -822,6 +886,7 @@ int main(void) {
         TestControlSessionOverPipe();
         TestControlSessionPairingCode();
         TestControlSessionInput();
+        TestControlSessionKeyframe();
         printf("\n=== %d passed, %d failed ===\n", gPass, gFail);
         printf("%s\n", gFail == 0 ? "ALL PASS" : "FAILURES");
         return gFail == 0 ? 0 : 1;

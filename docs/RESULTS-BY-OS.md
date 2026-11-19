@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.30-draft |
+| 版本 | v0.31-draft |
 | 日期 | 2026-11-19 |
 | 原则 | **结论绑定具体 OS build 与机器，禁止跨版本外推**。同一判据在 Sequoia 与 Tahoe 分别记录，未测就写未测。 |
 | 上位文档 | `docs/DESIGN.md` §8、`docs/DECISIONS.md` |
@@ -907,6 +907,35 @@ CPE 的入站规则从 TCP 改成 UDP 后，**首次跨公网端到端跑通**�
 
 ---
 
+### 5.14 P2.1 重组容错 + P2.2 虚拟屏会话（2026-11-19 22:2x–22:5x，Sequoia 本机环回）
+
+只测 **Sequoia 15.5 / 24F74 / Macmini8,1（本机 host+client 环回）**；Tahoe 26.5.2 未跑本轮新代码。
+
+**P2.1 落地**
+- `P1FrameReassembler` 重写为 v3：按帧 bitmap 累积、容忍乱序/重复、以「120ms 无进展」判帧丢失（不是总年龄）、在飞帧上限 4、失序后从关键帧重启；单测覆盖帧内乱序、跨帧乱序、缺片超时、P 帧先到、重复片、换屏、请求限速。
+- 指标改为帧口径：`framesDropped`（帧）、`fragmentsDiscarded`（片）、`awaitingKeyframeMs`、`keyframeRequestsSent/Received`。
+- `keyframe-request` C→H 打通到编码器：客户端在等关键帧时 1s 重试（会话层仍 300ms 限速），主机 900ms 合并窗口后 `requestKeyframe`（`kVTEncodeFrameOptionKey_ForceKeyFrame`）。首次实现漏了 `host.onKeyframeRequest`，主机收 22 次请求但 key 仍是周期值；补上后同条件 key 从 4 升到 22。
+
+**丢片矩阵（720p15，本机 `--sim-loss`，16s）**
+
+| 分片丢包 | 解码/发出 | keyframeRequests | awaitingKeyframeMs | 备注 |
+|---|---|---|---|---|
+| 0% | 83/83 = 1.00 | 1 | 51 | 捕获静态屏 ≈7.5fps |
+| 0.1% | 107/112 = 0.955 | 2 | 212 | 通过 |
+| 1% | 15/112 = 0.13 | 14 | 12648 | IDR ≈360 片，存活率 ≈2.7% |
+| 5% | 0/117 | 15 | 14975 | IDR 存活率 ≈1e-8，不可达 |
+
+- 结论：v3 解决的是「乱序/重复不误杀」；**丢片仍然只能请求关键帧**，因为 H.264 参考链断了。无 FEC 时 `--sim-loss 5` 的 0.95 判据不成立，计划判据已改为 0%/0.1% 分层，1% 以上列入 P2.1-FEC。
+- 1% 下请求确实生效（主机 key=14，周期基线 8），但每次 IDR 传输约 2s，重试过快只会互相打断；1s 重试 + 900ms 合并是当前折中。
+
+**P2.2 虚拟屏会话（`--exclusive --keep-main` 安全冒烟）**
+- 本机首跑卡住 10s+：新虚拟屏复用了残留槽位 `4128835`，处于镜像态，`M1RDPDriver` 却硬编码 Tahoe 的 `conservativeFirst:YES`，保守路径要等 mode 提交后才解除镜像 → 死锁。改为按 `P0OSPolicy()` 分流（Sequoia 直建目标分辨率、`promoteToTarget` 仅保守路径调用）。
+- 修后：`虚拟屏就绪 ids=4128835`、`phase=Streaming`、采集 1280×720；client 31/31 解出、0 丢、首帧 445ms、控制间隔 1005ms、`PASS`；会话结束主机打印「已恢复物理屏并销毁虚拟屏」，状态序列完整到 `CLOSED`。
+- 控制间隔门禁改为只统计 `STREAMING` 之后：建虚拟屏在 session-start 内同步耗时 ≈10s，此前被误判 10490ms 超限。建链期 10s 静默本身是真实现象，产品化时应提前心跳或异步建屏。
+- 静态虚拟屏按变化送帧，2.7–4.2fps 不能当作性能结论。**未测**：全禁物理屏（去掉 `--keep-main`）在两种 OS 上的端到端、Tahoe host 跑本轮代码。
+
+---
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe |
@@ -921,6 +950,7 @@ CPE 的入站规则从 TCP 改成 UDP 后，**首次跨公网端到端跑通**�
 
 ## 7. 变更记录
 
+- v0.31-draft 2026-11-19 22:5x：**P2.1/P2.2 首轮落地（Sequoia 本机）**。重组器 v3（位图+帧期限+乱序容错）、帧级指标、keyframe-request 全链路（客户端 1s 重试、主机 900ms 合并）；720p 丢片矩阵 0%=1.00、0.1%=0.955、1%=0.13、5%=0。P2.2 修掉 Sequoia 上误用 Tahoe 保守建屏导致的残留槽位镜像死锁，`--exclusive --keep-main` 冒烟 PASS（虚拟屏 4128835、31/31、恢复成功）；控制间隔门禁改为仅统计 STREAMING 之后。详见 §5.14。
 - v0.1-draft 2026-11-18：首次建立按 OS 分离的结论表；把 Sequoia 与 Tahoe 的 V-01/V-03/V-04 结论拆开，明确禁止跨版本外推。
 - v0.2-draft 2026-11-18：补入 Tahoe V-02（锁屏态虚拟屏 `active=false`，不成立）、V-04a（通过）、V-04b（判据污染，未确认）、V-04d（不成立）；补入替代采集路径对照结果（`CGDisplayCreateImage`/`CGWindowListCreateImage` 稳定可用）。
 - v0.3-draft 2026-11-18 10:40：**重要更正**。发现 v0.2 的 V-02 结论是假阴性——探针 `waitUntilUsable` 提前退出 + 脚本 `awk $3` 取错 ID，捕获从未执行。用户补充「锁屏 2-3 秒后屏睡」后重测：① 屏睡导致 SCK 无帧，caffeinate 先于 lock 可保持屏亮、SCK 恢复 50 帧；② 锁屏态虚拟屏实际 `active=1`（两种状态均是）；③ 截图显示虚拟屏上只有锁屏壁纸、无登录框。撤回「Path A 在 Tahoe 不成立」，改记「Path A 未验证」；V-04d 不成立理由从「不能建 active 屏」更正为「登录 UI 未迁移到虚拟屏」。

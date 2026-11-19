@@ -61,8 +61,10 @@ static BOOL M1SplitAVCC(NSData *payload,
 @property (nonatomic, assign) uint64_t framesCompleted;
 @property (nonatomic, assign) uint64_t framesDecoded;
 @property (nonatomic, assign) uint64_t framesDropped;
+@property (nonatomic, assign) uint64_t fragmentsDiscarded;
 @property (nonatomic, assign) uint64_t decodeFailures;
 @property (nonatomic, assign) uint64_t keyframeRequests;
+@property (nonatomic, assign) double awaitingKeyframeMs;
 @property (nonatomic, assign) double lastDecodeLatencyMs;
 @property (nonatomic, assign) double decoderCreateMs;
 @property (nonatomic, assign) double decoderPrewarmMs;
@@ -80,17 +82,22 @@ static BOOL M1SplitAVCC(NSData *payload,
     int32_t _videoWidth;
     int32_t _videoHeight;
     BOOL _awaitingKeyframe;
+    double _awaitingSinceMs;
+    double _lastKeyframeRequestMs;
     atomic_uint_fast64_t _datagramsReceived;
     atomic_uint_fast64_t _malformed;
     atomic_uint_fast64_t _framesCompleted;
     atomic_uint_fast64_t _framesDecoded;
     atomic_uint_fast64_t _framesDropped;
+    atomic_uint_fast64_t _fragmentsDiscarded;
     atomic_uint_fast64_t _decodeFailures;
     atomic_uint_fast64_t _keyframeRequests;
+    _Atomic double _awaitingKeyframeMs;
     _Atomic double _lastDecodeLatencyMs;
     _Atomic double _decoderCreateMs;
 }
 - (void)handleDecodedImage:(CVImageBufferRef)image status:(OSStatus)status;
+- (void)absorbReassembledFrame:(P1ReassembledFrame *)frame;
 @end
 
 #pragma mark - 解码回调
@@ -151,14 +158,20 @@ static double gPrewarmMs = -1;
         _onFrame = [onFrame copy];
         _onNeedKeyframe = [onNeedKeyframe copy];
         _reassembler = [[P1FrameReassembler alloc] init];
-        _awaitingKeyframe = YES;    // 首个关键帧之前不解码
+        // 初始不在「等关键帧」状态：重组器本身只交付关键帧，这里从 NO 起步，
+        // 第一个数据包就能触发一次 keyframe-request（客户端常在中途接入）。
+        _awaitingKeyframe = NO;
+        _awaitingSinceMs = 0;
+        _lastKeyframeRequestMs = 0;
         atomic_init(&_datagramsReceived, 0);
         atomic_init(&_malformed, 0);
         atomic_init(&_framesCompleted, 0);
         atomic_init(&_framesDecoded, 0);
         atomic_init(&_framesDropped, 0);
+        atomic_init(&_fragmentsDiscarded, 0);
         atomic_init(&_decodeFailures, 0);
         atomic_init(&_keyframeRequests, 0);
+        atomic_init(&_awaitingKeyframeMs, 0.0);
         atomic_store(&_lastDecodeLatencyMs, 0.0);
         atomic_store(&_decoderCreateMs, 0.0);
     }
@@ -175,7 +188,7 @@ static double gPrewarmMs = -1;
 
     if (datagram.length < P1FrameHeaderSize) {
         atomic_fetch_add(&_malformed, 1);
-        if (error) *error = M1RxErr(M1PipelineErrorDecodeFailed, @"datagram 短于 16B 帧头");
+        if (error) *error = M1RxErr(M1PipelineErrorDecodeFailed, @"datagram 短于 18B 帧头");
         return NO;
     }
 
@@ -195,32 +208,42 @@ static double gPrewarmMs = -1;
     }
 
     NSData *body = [datagram subdataWithRange:NSMakeRange(P1FrameHeaderSize, h.payloadLen)];
-    NSData *full = [_reassembler acceptHeader:h payload:body error:NULL];
+    NSArray<P1ReassembledFrame *> *frames = [_reassembler acceptHeader:h payload:body error:NULL];
+    atomic_store(&_framesDropped, (uint64_t)_reassembler.droppedFrames);
+    atomic_store(&_fragmentsDiscarded, (uint64_t)_reassembler.fragmentsDiscarded);
 
-    // 缺口出现：丢帧并请求关键帧。
+    // 等待关键帧期间按 1s 重试：WAN 上 IDR 有几百个分片、传输本身就要
+    // 一两秒，重试过快只会不断打断在途 IDR。
     if (_reassembler.needsKeyframe) {
-        if (!_awaitingKeyframe) {
+        double now = M1RxNowMs();
+        BOOL first = !_awaitingKeyframe;
+        if (first) {
             _awaitingKeyframe = YES;
+            _awaitingSinceMs = now;
+        }
+        if (first || now - _lastKeyframeRequestMs > 1000.0) {
+            _lastKeyframeRequestMs = now;
             atomic_fetch_add(&_keyframeRequests, 1);
             if (_onNeedKeyframe) _onNeedKeyframe();
         }
-        if (!full) {
-            atomic_fetch_add(&_framesDropped, 1);
-            return YES;
-        }
     }
 
-    if (!full) return YES;   // 中间分片，等后续
+    for (P1ReassembledFrame *frame in frames) {
+        [self absorbReassembledFrame:frame];
+    }
+    return YES;
+}
 
+- (void)absorbReassembledFrame:(P1ReassembledFrame *)frame {
     atomic_fetch_add(&_framesCompleted, 1);
 
     // 拆 AVCC：参数集建 formatDescription，slice 留待解码。
     NSMutableData *frameData = [NSMutableData data];
     NSMutableArray<NSData *> *paramSets = [NSMutableArray array];
-    if (!M1SplitAVCC(full, frameData, paramSets)) {
+    if (!M1SplitAVCC(frame.payload, frameData, paramSets)) {
         atomic_fetch_add(&_malformed, 1);
-        if (error) *error = M1RxErr(M1PipelineErrorDecodeFailed, @"AVCC 拆解失败");
-        return NO;
+        atomic_fetch_add(&_framesDropped, 1);
+        return;
     }
 
     if (paramSets.count >= 2) {
@@ -230,18 +253,21 @@ static double gPrewarmMs = -1;
     if (!_formatDesc) {
         // 还没有参数集（非关键帧先到），等下一个关键帧。
         atomic_fetch_add(&_framesDropped, 1);
-        return YES;
+        return;
     }
 
-    BOOL isKey = (h.flags & P1FrameFlagKeyframe) != 0;
-    if (_awaitingKeyframe && !isKey) {
+    if (frame.keyframe) {
+        if (_awaitingKeyframe) {
+            _awaitingKeyframe = NO;
+            atomic_store(&_awaitingKeyframeMs,
+                         atomic_load(&_awaitingKeyframeMs) + (M1RxNowMs() - _awaitingSinceMs));
+        }
+    } else if (_awaitingKeyframe) {
         atomic_fetch_add(&_framesDropped, 1);
-        return YES;
+        return;
     }
-    if (isKey) _awaitingKeyframe = NO;
 
-    [self decodeFrameData:frameData frameSeq:h.frameSeq];
-    return YES;
+    [self decodeFrameData:frameData frameSeq:frame.frameSeq];
 }
 
 - (void)rebuildFormatDescriptionWithParamSets:(NSArray<NSData *> *)paramSets {
@@ -368,9 +394,15 @@ static double gPrewarmMs = -1;
         _formatDesc = NULL;
     }
     [_reassembler reset];
-    _awaitingKeyframe = YES;
+    _awaitingKeyframe = NO;
+    _awaitingSinceMs = 0;
+    _lastKeyframeRequestMs = 0;
     _videoWidth = 0;
     _videoHeight = 0;
+    atomic_store(&_framesDropped, 0);
+    atomic_store(&_fragmentsDiscarded, 0);
+    atomic_store(&_keyframeRequests, 0);
+    atomic_store(&_awaitingKeyframeMs, 0.0);
 }
 
 - (void)dealloc {
@@ -389,8 +421,12 @@ static double gPrewarmMs = -1;
     s.framesCompleted = atomic_load(&_framesCompleted);
     s.framesDecoded = atomic_load(&_framesDecoded);
     s.framesDropped = atomic_load(&_framesDropped);
+    s.fragmentsDiscarded = atomic_load(&_fragmentsDiscarded);
     s.decodeFailures = atomic_load(&_decodeFailures);
     s.keyframeRequests = atomic_load(&_keyframeRequests);
+    double awaiting = atomic_load(&_awaitingKeyframeMs);
+    if (_awaitingKeyframe) awaiting += M1RxNowMs() - _awaitingSinceMs;
+    s.awaitingKeyframeMs = awaiting;
     s.lastDecodeLatencyMs = atomic_load(&_lastDecodeLatencyMs);
     s.decoderCreateMs = atomic_load(&_decoderCreateMs);
     s.decoderPrewarmMs = (gPrewarmMs > 0) ? gPrewarmMs : 0;

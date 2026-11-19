@@ -52,6 +52,9 @@
 #import "M1VideoEncoder.h"
 #import "M1FrameView.h"
 #import "M1InputInjector.h"
+#import "M1SessionCoordinator.h"
+#import "M1RDPDriver.h"
+#import "P0VDisplayControl.h"
 
 static NSString *gIdentity = @".state/rdp-identity.p12";
 static NSString *gPass = @"rdpdev";
@@ -109,6 +112,22 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 @property (nonatomic, copy, nullable) void (^onSessionClosed)(void);
 // Host 侧：收到客户端输入事件（已在 M1ControlSession 过校验与限速）。
 @property (nonatomic, copy, nullable) void (^onInputEvent)(NSDictionary *event);
+// Host 侧：为 session-start 准备真实显示；返回 nil = 失败（会回 session-error），
+// 返回空数组 = 沿用合成占位。
+@property (nonatomic, copy, nullable) NSArray<NSDictionary *> *(^displayProvider)(NSDictionary *message,
+                                                                              NSError **error);
+// Host 侧：收到 keyframe-request（控制收包队列上调用）。
+@property (nonatomic, copy, nullable) void (^onKeyframeRequest)(void);
+// Client 侧：session-start 请求的规格；nil = 1920x1080。
+@property (nonatomic, copy, nullable) NSArray<NSDictionary *> *requestedSpecs;
+
+// 发送端故障注入（只影响帧分片，不影响控制包）。
+@property (nonatomic, assign) double simLossPct;
+@property (nonatomic, assign) double simReorderPct;
+@property (nonatomic, assign) uint64_t simFragmentsDropped;
+@property (nonatomic, assign) uint64_t simReordered;
+@property (nonatomic, assign) uint64_t simState;
+@property (nonatomic, strong, nullable) NSData *simHeld;
 
 // 分流统计
 @property (nonatomic, assign) uint64_t controlDatagrams;
@@ -132,6 +151,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
         _fps = 20;
         _bitrateKbps = 12000;
         _controlArrivals = [NSMutableArray array];
+        _simState = 0x9E3779B97F4A7C15ull ^ (uint64_t)getpid();
     }
     return self;
 }
@@ -197,7 +217,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     cfg.expectedPeerFingerprint = self.expectedFingerprint;
     cfg.fps = self.fps;
     cfg.bitrateKbps = self.bitrateKbps;
-    cfg.specs = @[ @{ @"w": @1920, @"h": @1080, @"hidpi": @NO, @"refresh": @60 } ];
+    cfg.specs = self.requestedSpecs ?: @[ @{ @"w": @1920, @"h": @1080,
+                                             @"hidpi": @NO, @"refresh": @60 } ];
     cfg.heartbeatIntervalMs = 1000;
     self.session = [[M1ControlSession alloc] initWithChannel:self.channel config:cfg];
     self.session.delegate = self;
@@ -241,6 +262,13 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 #pragma mark M1DatagramSink（帧管线出口）
 
+- (double)simRandom {   // xorshift64*，确定性、不依赖 rand()
+    uint64_t x = self.simState;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    self.simState = x;
+    return (double)((x * 0x2545F4914F6CDD1Dull) >> 11) / 9007199254740992.0;
+}
+
 - (BOOL)sendDatagram:(NSData *)datagram error:(NSError **)error {
     M1QuicTransport *conn = self.streamConn;
     if (!conn) {
@@ -248,7 +276,35 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
             userInfo:@{NSLocalizedDescriptionKey: @"连接未就绪"}];
         return NO;
     }
+    // 发送端故障注入：丢片 + 相邻交换（模拟公网乱序）。只在 host 的帧路径上启用。
+    if (self.isHost && (self.simLossPct > 0 || self.simReorderPct > 0)) {
+        if (self.simLossPct > 0 && [self simRandom] * 100.0 < self.simLossPct) {
+            self.simFragmentsDropped += 1;
+            return YES;
+        }
+        if (self.simReorderPct > 0) {
+            if (self.simHeld) {
+                NSData *held = self.simHeld;
+                self.simHeld = nil;
+                self.simReordered += 1;
+                if (![conn sendDatagram:datagram error:error]) return NO;
+                return [conn sendDatagram:held error:error];
+            }
+            if ([self simRandom] * 100.0 < self.simReorderPct) {
+                self.simHeld = datagram;
+                return YES;
+            }
+        }
+    }
     return [conn sendDatagram:datagram error:error];
+}
+
+// 收尾时把被「交换」扣住的最后一个分片放出去，别让它凭空丢一帧。
+- (void)flushSimulatedHeld {
+    if (!self.simHeld) return;
+    NSData *held = self.simHeld;
+    self.simHeld = nil;
+    if (self.streamConn) [self.streamConn sendDatagram:held error:NULL];
 }
 
 #pragma mark 传输回调
@@ -300,7 +356,9 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 - (void)controlLink:(M1ControlLink *)link didDeliverMessage:(NSData *)message {
     double now = NowMs();
-    if (self.lastControlArrivalMs > 0) {
+    // 建虚拟屏（P2.2）在 session-start 内同步耗时可达 10s，此时尚未 STREAMING；
+    // 门禁只约束推流期控制通道，建链期不计入。
+    if (self.streaming && self.lastControlArrivalMs > 0) {
         double gap = now - self.lastControlArrivalMs;
         if (gap > self.maxControlGapMs) {
             self.maxControlGapMs = gap;
@@ -345,6 +403,17 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     if (self.onInputEvent) self.onInputEvent(event);
 }
 
+- (void)controlSessionDidRequestKeyframe:(M1ControlSession *)session {
+    if (self.onKeyframeRequest) self.onKeyframeRequest();
+}
+
+- (NSArray<NSDictionary *> *)controlSession:(M1ControlSession *)session
+                 prepareDisplaysForSessionStart:(NSDictionary *)message
+                                       error:(NSError **)error {
+    if (!self.displayProvider) return @[];
+    return self.displayProvider(message, error);
+}
+
 - (NSArray<NSString *> *)stateLog { return self.session ? self.session.stateLog : @[]; }
 
 - (void)shutdown {
@@ -367,7 +436,9 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 @property (nonatomic, assign) NSUInteger reservedSaves;    // 已占用但尚未落盘的槽位
 @property (nonatomic, strong) dispatch_queue_t saveQueue;  // PNG 编码专用串行队列
 @property (nonatomic, strong) dispatch_queue_t frameQueue; // 重组+解码专用串行队列
-@property (nonatomic, assign) uint64_t keyframeRequests;
+@property (nonatomic, assign) uint64_t keyframeRequests;        // 缺口 episode 数（接收端回调）
+@property (nonatomic, assign) uint64_t keyframeRequestsSent;    // 实际过线的请求数
+@property (nonatomic, assign) uint64_t keyframeRequestFailures; // 非限流原因的发送失败
 @property (nonatomic, assign) double firstFrameMs;
 @property (nonatomic, assign) double lastFrameMs;
 @property (nonatomic, assign) uint32_t lastSavedSeq;
@@ -434,6 +505,13 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
             self.keyframeRequests += 1;
+            // 这次要在线上真的发出去；限流不算失败（Host 产 IDR 本身也要时间）。
+            NSError *kfErr = nil;
+            if ([self.session requestKeyframeWithError:&kfErr]) {
+                self.keyframeRequestsSent += 1;
+            } else if (kfErr.code != M1ControlSessionErrorRateLimited) {
+                self.keyframeRequestFailures += 1;
+            }
         }];
 }
 
@@ -575,14 +653,16 @@ static void PrintUsage(void) {
     fprintf(stderr,
         "用法:\n"
         "  stream_probe --host [--port N] [--port-file PATH] [--duration-ms N]\n"
-        "                    [--display ID] [--fps N] [--out JSON]\n"
+        "                    [--display ID] [--fps N] [--out JSON] [--spec WxH]\n"
+        "                    [--exclusive [--keep-main]] # 建虚拟屏并禁物理屏（keep-main=保留主屏的安全模式）\n"
+        "                    [--sim-loss PCT] [--sim-reorder PCT] # 发送端丢片/乱序模拟\n"
         "                    [--advertise HOST[:PORT]]   # 跨网段/NAT：防火墙映射后的对外端点\n"
         "                    [--wait-ms N]               # host 等客户端 / client 等 STREAMING（默认 15000；0 = 一直等）\n"
         "  stream_probe --preflight host|client [--inject real] [--advertise HOST[:PORT]]\n"
         "                                                        # 本机能力自检\n"
         "  stream_probe --client --connect IP --port N --fingerprint HEX [--duration-ms N]\n"
         "                    [--outdir DIR] [--save-frames N] [--out JSON]\n"
-        "                    [--window [WxH]] [--keep-front] [--input-synth \"X,Y;X,Y;...\"]\n"
+        "                    [--window [WxH]] [--spec WxH] [--keep-front] [--input-synth \"X,Y;X,Y;...\"]\n"
         "                    [--manual SECS] [--handshake-ms N]   # 握手超时默认 12000\n"
         "  --input-synth: 进程内合成鼠标移动（内容坐标，左上原点），\n"
         "                 用于驱动端没有辅助功能授权、无法投递系统事件时。\n"
@@ -645,6 +725,19 @@ static NSData *JSONData(NSDictionary *dict) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
+        // ★ 守护模式必须最先处理：P0VStartGuardian 用同一个二进制 re-exec。
+        //   缺这一段时守护子进程会打印用法后退出，父进程却以为有兜底——
+        //   2026-11-18 的黑屏事故就是这么来的（见 pipeline_kiosk_probe 同段注释）。
+        if (argc > 1 && strcmp(argv[1], "--guardian") == 0) {
+            NSString *snap = argc > 2 ? [NSString stringWithUTF8String:argv[2]] : nil;
+            pid_t parent = 0;
+            for (int i = 3; i + 1 < argc; i++) {
+                if (strcmp(argv[i], "--parent-pid") == 0) parent = atoi(argv[i + 1]);
+            }
+            if (!snap || parent <= 0) return 3;
+            return P0VRunGuardian(snap, parent);
+        }
+
         setvbuf(stdout, NULL, _IOLBF, 0);   // 后台运行 + 被回收时不丢日志
         BOOL hostMode = NO, clientMode = NO;
         uint16_t port = 0;
@@ -672,6 +765,10 @@ int main(int argc, char **argv) {
         NSString *connectHost = @"127.0.0.1";   // 双机时改成对端的公网/跨网段地址
         NSString *advertiseSpec = nil;          // host 对外端点（NAT/防火墙映射后）
         NSString *preflightRole = nil;          // host / client：只做本机能力自检后退出
+        int32_t specW = 0, specH = 0;           // 客户端请求的推流规格（host 建虚拟屏用）
+        BOOL exclusive = NO;                    // host：建虚拟屏并禁物理屏（D-04/D-08）
+        BOOL keepMain = NO;                      // 诊断：保留物理主屏，不满足 C-09
+        double simLossPct = 0, simReorderPct = 0; // host 发送端故障注入
 
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--host")) hostMode = YES;
@@ -704,6 +801,18 @@ int main(int argc, char **argv) {
                 synthSpec = [NSString stringWithUTF8String:argv[++i]];
             else if (!strcmp(argv[i], "--manual") && i + 1 < argc)
                 manualSecs = atoi(argv[++i]);
+            else if (!strcmp(argv[i], "--spec") && i + 1 < argc) {
+                int w = 0, h = 0;
+                if (sscanf(argv[++i], "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                    specW = w; specH = h;
+                }
+            }
+            else if (!strcmp(argv[i], "--exclusive")) exclusive = YES;
+            else if (!strcmp(argv[i], "--keep-main")) keepMain = YES;
+            else if (!strcmp(argv[i], "--sim-loss") && i + 1 < argc)
+                simLossPct = atof(argv[++i]);
+            else if (!strcmp(argv[i], "--sim-reorder") && i + 1 < argc)
+                simReorderPct = atof(argv[++i]);
             else if (!strcmp(argv[i], "--connect") && i + 1 < argc)
                 connectHost = [NSString stringWithUTF8String:argv[++i]];
             else if (!strcmp(argv[i], "--advertise") && i + 1 < argc)
@@ -765,6 +874,90 @@ int main(int argc, char **argv) {
             StreamNode *host = [StreamNode new];
             host.localFingerprint = localFp;
             host.fps = fps;
+            host.simLossPct = simLossPct;
+            host.simReorderPct = simReorderPct;
+
+            __block M1SessionCoordinator *exclusiveCoordinator = nil;
+            __block CGDirectDisplayID virtualDisplayID = 0;
+            __block NSUInteger virtualW = 0, virtualH = 0;
+            __block BOOL exclusiveEnded = NO;
+
+            // 独占会话（P2.2）：在 session-start 到达时同步建虚拟屏/禁物理屏，
+            // 让 session-ready 带的是真实 displayID；失败会回 session-error 并结束会话。
+            if (exclusive) {
+                printf("独占会话模式：session-start 到达后建虚拟屏%s\n",
+                       keepMain ? "（诊断：保留物理主屏，不满足 C-09）" : "并禁用全部物理屏");
+                host.displayProvider = ^NSArray<NSDictionary *> *(NSDictionary *message, NSError **perr) {
+                    NSArray *specs = message[@"specs"];
+                    if (![specs isKindOfClass:[NSArray class]] || specs.count == 0) {
+                        if (perr) *perr = [NSError errorWithDomain:@"streamprobe" code:6
+                            userInfo:@{NSLocalizedDescriptionKey: @"session-start 缺 specs"}];
+                        return nil;
+                    }
+                    NSMutableArray<NSDictionary *> *conv = [NSMutableArray array];
+                    for (NSDictionary *sp in specs) {
+                        NSNumber *w = sp[@"w"], *h = sp[@"h"];
+                        if (![w isKindOfClass:[NSNumber class]] || ![h isKindOfClass:[NSNumber class]]) continue;
+                        [conv addObject:@{ @"width": w, @"height": h }];
+                    }
+                    if (conv.count == 0) {
+                        if (perr) *perr = [NSError errorWithDomain:@"streamprobe" code:6
+                            userInfo:@{NSLocalizedDescriptionKey: @"session-start 缺可用宽度/高度"}];
+                        return nil;
+                    }
+                    M1SessionCoordinator *coord =
+                        [[M1SessionCoordinator alloc] initWithDriver:[M1RDPDriver new]];
+                    coord.locksScreenOnEnd = NO;   // 探针连续测量；锁屏会打断远程操作
+                    if (keepMain) coord.extraKeepDisplayIDs = @[ @(CGMainDisplayID()) ];
+                    NSError *startErr = nil;
+                    if (![coord startWithSpecs:conv needsLogin:NO credential:nil error:&startErr]) {
+                        if (perr) *perr = startErr;
+                        return nil;
+                    }
+                    NSArray<NSNumber *> *ids = coord.createdDisplayIDs;
+                    if (ids.count == 0) {
+                        NSError *endErr = nil;
+                        [coord endSessionError:&endErr];
+                        if (perr) *perr = [NSError errorWithDomain:@"streamprobe" code:6
+                            userInfo:@{NSLocalizedDescriptionKey: @"建屏成功但没有 displayID"}];
+                        return nil;
+                    }
+                    exclusiveCoordinator = coord;
+                    virtualDisplayID = ids.firstObject.unsignedIntValue;
+                    virtualW = [conv.firstObject[@"width"] unsignedIntegerValue];
+                    virtualH = [conv.firstObject[@"height"] unsignedIntegerValue];
+                    NSMutableArray<NSDictionary *> *displays = [NSMutableArray array];
+                    for (NSUInteger i = 0; i < ids.count; i++) {
+                        NSNumber *w = i < conv.count ? conv[i][@"width"] : @0;
+                        NSNumber *h = i < conv.count ? conv[i][@"height"] : @0;
+                        [displays addObject:@{ @"displayID": ids[i], @"w": w, @"h": h,
+                                               @"synthetic": @NO }];
+                    }
+                    printf("  [独占] 虚拟屏就绪 ids=%s  phase=%s  physicalDisabled=%s\n",
+                           [[displays valueForKey:@"displayID"] componentsJoinedByString:@","].UTF8String,
+                           M1HostSessionPhaseName(coord.phase).UTF8String,
+                           keepMain ? "保留主屏" : "是");
+                    fflush(stdout);
+                    return displays;
+                };
+            }
+
+            void (^endExclusive)(void) = ^{
+                @synchronized (host) {
+                    if (exclusiveEnded || !exclusiveCoordinator) return;
+                    exclusiveEnded = YES;
+                    M1SessionCoordinator *coord = exclusiveCoordinator;
+                    exclusiveCoordinator = nil;
+                    NSError *endErr = nil;
+                    if (![coord endSessionError:&endErr]) {
+                        printf("  [独占] 恢复失败: %s\n",
+                               endErr.localizedDescription.UTF8String ?: "unknown");
+                    } else {
+                        printf("  [独占] 已恢复物理屏并销毁虚拟屏\n");
+                    }
+                    fflush(stdout);
+                }
+            };
 
             if (![host startAsHostOnPort:port error:&err]) {
                 printf("✗ listener 启动失败: %s\n", err.localizedDescription.UTF8String);
@@ -805,6 +998,12 @@ int main(int argc, char **argv) {
                 return 4;
             }
             printf("双端已 STREAMING，开始推流（%d ms / %d fps）\n", durationMs, fps);
+            CGDirectDisplayID captureID = virtualDisplayID ? virtualDisplayID : displayID;
+            if (exclusive) {
+                printf("  采集目标：虚拟屏 displayID=%u（请求规格 %lux%lu，%s）\n",
+                       captureID, (unsigned long)virtualW, (unsigned long)virtualH,
+                       keepMain ? "物理主屏仍可见" : "物理屏已禁用");
+            }
 
             M1FramePipelineConfig *cfg = [M1FramePipelineConfig new];
             cfg.targetFps = fps;
@@ -812,8 +1011,8 @@ int main(int argc, char **argv) {
             cfg.outputWidth = outW;
             cfg.outputHeight = outH;
             __block int errCount = 0;
-            M1FramePipeline *pipe =
-                [[M1FramePipeline alloc] initWithDisplayID:displayID
+            __block M1FramePipeline *pipe =
+                [[M1FramePipeline alloc] initWithDisplayID:captureID
                                                     config:cfg
                                                       sink:host
                                                    onError:^(NSError *e) {
@@ -823,10 +1022,20 @@ int main(int argc, char **argv) {
                 }];
             if (![pipe start:&err]) {
                 printf("✗ 管线启动失败: %s\n", err.localizedDescription.UTF8String);
+                endExclusive();
                 [host shutdown];
                 return 5;
             }
             printf("  采集尺寸 %dx%d\n", pipe.pixelWidth, pipe.pixelHeight);
+            // keyframe-request 落到编码器：下一帧强制 IDR。
+            // 900ms 合并窗口：客户端的重试/多请求不应把在途 IDR 冲掉。
+            __block CFAbsoluteTime lastForcedKeyframe = 0;
+            host.onKeyframeRequest = ^{
+                CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                if (now - lastForcedKeyframe < 0.9) return;
+                lastForcedKeyframe = now;
+                [pipe requestKeyframe];
+            };
 
             // ---- 输入回传（M1-B）----
             // record 是默认档：单机环回时 Host 和 Client 是同一个桌面，
@@ -857,7 +1066,7 @@ int main(int argc, char **argv) {
                 }
                 // 目标 rect 用被采集那块屏的 Quartz bounds：
                 // CGDisplayBounds 的原点在主屏左上、y 向下，与协议 y=0 在上一致。
-                CGRect targetRect = CGDisplayBounds(displayID);
+                CGRect targetRect = CGDisplayBounds(captureID);
                 injector = [[M1InputInjector alloc] initWithSink:sink];
                 injector.targetDisplayRect = targetRect;
                 host.onInputEvent = ^(NSDictionary *event) {
@@ -879,6 +1088,7 @@ int main(int argc, char **argv) {
                 stopped = YES;
                 printf("  [host] 对端关闭会话，停止推流\n");
                 [pipe stop];
+                endExclusive();
             };
 
             NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:durationMs / 1000.0];
@@ -893,6 +1103,8 @@ int main(int argc, char **argv) {
                 [NSThread sleepForTimeInterval:0.01];
             }
             [pipe stop];
+            [host flushSimulatedHeld];
+            endExclusive();
 
             M1FramePipelineStats *ps = pipe.stats;
             printf("\n--- host 结果 ---\n");
@@ -942,6 +1154,15 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+            printf("  会话形态: %s  采集 displayID=%u\n",
+                   exclusive ? (keepMain ? "独占（保留主屏）" : "独占（禁物理屏）") : "镜像主屏",
+                   captureID);
+            printf("  关键帧请求：收到 %lu 次\n",
+                   (unsigned long)host.session.keyframeRequestsReceived);
+            if (simLossPct > 0 || simReorderPct > 0) {
+                printf("  注入故障：丢片 %llu 个，乱序交换 %llu 次（%.1f%% / %.1f%%）\n",
+                       host.simFragmentsDropped, host.simReordered, simLossPct, simReorderPct);
+            }
             PrintFlowStats(host, "host");
             printf("  状态序列: %s\n", [host.stateLog componentsJoinedByString:@" → "].UTF8String);
 
@@ -967,6 +1188,14 @@ int main(int argc, char **argv) {
             json[@"controlDatagrams"] = @(host.controlDatagrams);
             json[@"frameDatagrams"] = @(host.frameDatagrams);
             json[@"maxControlGapMs"] = @(round(host.maxControlGapMs));
+            json[@"sessionMode"] = exclusive ? (keepMain ? @"exclusive-keep-main" : @"exclusive")
+                                             : @"mirror";
+            json[@"captureDisplayID"] = @(captureID);
+            json[@"keyframeRequestsReceived"] = @(host.session.keyframeRequestsReceived);
+            json[@"simLossPct"] = @(simLossPct);
+            json[@"simReorderPct"] = @(simReorderPct);
+            json[@"simFragmentsDropped"] = @(host.simFragmentsDropped);
+            json[@"simReordered"] = @(host.simReordered);
             if (injectMode.length > 0) {
                 json[@"injectMode"] = injectMode;
                 json[@"inputReceived"] = @(host.session.inputEventsReceived);
@@ -1041,6 +1270,11 @@ int main(int argc, char **argv) {
         StreamClientNode *client = [StreamClientNode new];
         client.expectedFingerprint = fingerprint;
         client.fps = fps;
+        if (specW > 0 && specH > 0) {
+            client.requestedSpecs = @[ @{ @"w": @(specW), @"h": @(specH),
+                                          @"hidpi": @NO, @"refresh": @60 } ];
+            printf("请求 host 规格 %dx%d\n", specW, specH);
+        }
         client.outdir = outdir;
         client.saveFrames = saveFrames;
         [client prepareReceiver];
@@ -1246,10 +1480,12 @@ int main(int argc, char **argv) {
 
         printf("\n--- client 结果 ---\n");
         printf("  receiver: datagrams=%llu completed=%llu decoded=%llu dropped=%llu "
-               "decodeFail=%llu keyReq=%llu malformed=%llu\n",
+               "discardedFrags=%llu decodeFail=%llu keyReq=%llu keyReqSent=%llu "
+               "awaitKeyframe=%.0fms malformed=%llu\n",
                rs.datagramsReceived, rs.framesCompleted, rs.framesDecoded,
-               rs.framesDropped, rs.decodeFailures, rs.keyframeRequests,
-               rs.malformedDatagrams);
+               rs.framesDropped, rs.fragmentsDiscarded, rs.decodeFailures,
+               rs.keyframeRequests, client.keyframeRequestsSent,
+               rs.awaitingKeyframeMs, rs.malformedDatagrams);
         double firstFrameLatency = (client.firstFrameMs > 0 && client.streamStartMs > 0)
             ? client.firstFrameMs - client.streamStartMs : 0;
         printf("  解码尺寸 %dx%d  解码帧率 %.1f fps  首帧延迟 %.0f ms\n",
@@ -1290,8 +1526,12 @@ int main(int argc, char **argv) {
         json[@"framesCompleted"] = @(rs.framesCompleted);
         json[@"framesDecoded"] = @(rs.framesDecoded);
         json[@"framesDropped"] = @(rs.framesDropped);
+        json[@"fragmentsDiscarded"] = @(rs.fragmentsDiscarded);
+        json[@"awaitingKeyframeMs"] = @(round(rs.awaitingKeyframeMs));
         json[@"decodeFailures"] = @(rs.decodeFailures);
         json[@"keyframeRequests"] = @(rs.keyframeRequests);
+        json[@"keyframeRequestsSent"] = @(client.keyframeRequestsSent);
+        json[@"keyframeRequestFailures"] = @(client.keyframeRequestFailures);
         json[@"malformed"] = @(rs.malformedDatagrams);
         json[@"decodedWidth"] = @(client.decodedWidth);
         json[@"decodedHeight"] = @(client.decodedHeight);

@@ -8,6 +8,7 @@
 #import "M1ScreenLock.h"
 #import "VDManager.h"
 #import "P0VDisplayControl.h"
+#import "ProbeUtil.h"
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <libproc.h>
 #import <unistd.h>
@@ -129,19 +130,26 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     if (![self prepareSessionShieldError:error]) return NO;
 
     // 规格透明传入 VDManager（键名 width/height/hiDPI/refreshRate/name 一致）。
+    // 保守 canvas 路径只在 Tahoe 启用：Sequoia 15.5 直建目标分辨率即可，
+    // 且保守路径不会提前解除残留槽位的镜像态，会让 mode 永远提交不上。
+    NSDictionary *policy = P0OSPolicy();
+    BOOL conservative = [policy[@"conservativeFirst"] boolValue];
+    int modeWaitMs = [policy[@"modeWaitMs"] intValue];
     _vd = [[VDManager alloc] initWithConfigs:specs
                               identityOffset:[VDManager savedIdentityOffset]
-                           conservativeFirst:YES];
+                           conservativeFirst:conservative];
     if (![_vd createAll] || ![_vd waitUntilUsableTimeoutMs:8000]) {
         [_vd destroyAll];
         _vd = nil;
         if (error) *error = M1DrvErr(M1RDPDriverErrorNoDisplays, @"建屏失败或超时");
         return NO;
     }
-    // 保守 canvas → 目标分辨率（PR #288：直接大尺寸会得到壁纸+光标）。
-    [_vd waitUntilModeMatchesTimeoutMs:10000 conservative:YES];
-    [_vd promoteToTarget];
-    [_vd waitUntilModeMatchesTimeoutMs:10000 conservative:NO];
+    if (conservative) {
+        // 保守 canvas → 目标分辨率（PR #288：直接大尺寸会得到壁纸+光标）。
+        [_vd waitUntilModeMatchesTimeoutMs:modeWaitMs conservative:YES];
+        [_vd promoteToTarget];
+        [_vd waitUntilModeMatchesTimeoutMs:modeWaitMs conservative:NO];
+    }
     self.lastActiveDisplayIDs = P0VActiveDisplayIDs();
     return YES;
 }
