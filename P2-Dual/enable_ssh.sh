@@ -124,13 +124,17 @@ cmd_addkey() {
     fi
     echo "  现在共有 $(grep -cE '^(ssh-|ecdsa-|sk-)' "$AUTH_KEYS") 条公钥"
 
-    # 顺手检查家目录权限：组或其他用户可写会让 sshd 拒绝密钥认证
-    local hp
+    # 顺手检查家目录权限：sshd(StrictModes) 只拒绝「组或其他用户可写」的家目录，
+    # 750/755 都是安全的，不必强求 700。
+    local hp gw ow
     hp=$(stat -f '%Sp' "$HOME")
-    case "$hp" in
-        drwxr-xr-x*|drwx------*) : ;;
-        *) c_warn "家目录权限 $hp 偏松，sshd 可能拒绝密钥登录：chmod go-w $HOME" ;;
-    esac
+    gw=$(printf '%s' "$hp" | cut -c6)   # 组写位
+    ow=$(printf '%s' "$hp" | cut -c9)   # 其他用户写位
+    if [ "$gw" = "w" ] || [ "$ow" = "w" ]; then
+        c_warn "家目录权限 $hp 组/其他用户可写，sshd 会拒绝密钥登录：chmod go-w $HOME"
+    else
+        c_ok "家目录权限 $hp（组/其他不可写，符合 StrictModes）"
+    fi
 }
 
 cmd_harden() {
