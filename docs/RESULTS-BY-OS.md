@@ -592,6 +592,47 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
    第一版用了 `NSTrackingActiveInKeyWindow`，端到端 `inputEmitted` 恒为 0，
    一个事件都收不到；另外 `NSWindow.acceptsMouseMovedEvents` 默认 NO，也要显式打开。
 
+#### 5.9.1 补测：端到端判据已通过（2026-11-19 早晨，Tahoe）
+
+上文的「阻塞」有一半是脚本自己造成的，不是环境：
+
+1. **`verify_m1b.sh` 的锁屏判据写反了。** `cursor_move locked` 的约定是
+   「锁定 → exit 1，解锁 → exit 0」，脚本却用 `&& return 1`（把 0 当锁定），
+   于是屏幕明明解锁也判「锁定」，三轮一次都没真跑。改成 `||` 后立刻跑起来。
+2. **真正的阻塞是「辅助功能」授权，不是锁屏。** 由 agent 拉起的命令行工具
+   `AXIsProcessTrusted()=0`，此时：
+   - `CGWarpMouseCursorPosition` 能改光标位置（`NSEvent.mouseLocation` 随之变），
+     但**一条 `mouseMoved` 都不投递**；
+   - `CGEventPost(kCGHIDEventTap)` 的合成事件被系统直接丢弃；
+   - 最小复现（~60 行 AppKit 接收器）：`active=1 key=1 occl_visible=1`、
+     光标确实在动、`mouseEntered` 收到 1 次，而 `mouseMoved` 连本地事件监听都是 **0**。
+
+   ⇒ 光标位移与事件投递是两条独立的路，只看「光标动了」会误判成客户端没采集。
+
+因此驱动端分流（`verify_m1b.sh` 自动探测 `cursor_move ax`）：
+
+| 驱动 | 条件 | 覆盖到哪 |
+|---|---|---|
+| `physical` | `AXIsProcessTrusted=1` | 全链路，含「系统把事件交给 App」 |
+| `synth` | 无辅助功能授权 | 除 OS 投递外的全链路：`NSWindow sendEvent:` → hitTest → `mouseMoved:` → 坐标换算 → 协议编码 → QUIC → 主机解析 → 注入计划 |
+
+`synth` 模式实测（第 1 轮全过，`/tmp/m1b-local/run1`）：
+
+| 项 | 实测 |
+|---|---|
+| 上屏 | **29 帧**，跳过 0、积压丢 0，单帧 8.0 / 峰值 21.7 ms |
+| 上行输入 | 客户端 emit 8 / 发出 8 / 失败 0；主机收到 8 条，其中 `mouse` 6 条 |
+| 坐标 | 三次移动 → x = 1720 / 955.6 / 2484.4，y 恒 720（3440×1440 的 0.5 / 0.278 / 0.722） |
+| 换算 | 900×506 窗口内 ±200 px → 屏幕 ±764 px，与 letterbox 理论值一致 |
+
+**顺带挖到的第 4 个真问题**：同一个 `NSEvent` 被投递两次（一次按 hit-test 命中视图，
+一次按 tracking area 派给 owner，而视图两者兼具且开了 `NSTrackingMouseMoved`），
+每次移动变成 2 条上行事件、白占一倍带宽。已按「时间戳 + 窗口内坐标相同即为同一事件」
+去重（`M1FrameView mouseMoved:`）。
+
+**仍未闭合**：`physical` 驱动那一跳（需给宿主进程授予「辅助功能」），以及真实主机的
+`CGEventPost` 注入——两者是同一个授权前置，已列入双机验收清单。
+
 #### 遗留
 
 - 上屏走 `CIContext → IOSurface`，离屏实测 **10.4 ms/帧（3440×1440）**、**1.1 ms（640×360）**。
@@ -631,6 +672,7 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 - v0.11-draft 2026-11-18 17:10：**新增 §5.5 QUIC datagram 帧通道实测（M1-A 第 1/2 步）**。400 帧/1200 分片/1.22MB 环回零丢失零重复零乱序，协商上限 1497B，9.6Mbps。两条硬结论：① 瞬时突发 1200 片丢 43.6%（整帧级），发送必须按帧节奏投递；② 指纹不符只 `complete(false)` 会吊在 preparing（20s 无结论），必须主动 cancel（D-13 C-13.3）。待查：偶发 6–11s 握手离群。
 - v0.12-draft 2026-11-18 18:55：**新增 §5.6 控制通道端到端 + 两个结论更正**。控制通道 8 态在真实 QUIC 连接上跑通（`--self` 5/5、两进程 host/client 通过、148 单测全过、握手 13.5–19.3ms）。三处更正：① **§5.5 的「6–11s 离群疑为 QUIC Initial 退避」作废**——真因是 p12 私钥的 keychain ACL 触发 securityd 授权阻塞，`SecKeyCreateSignature` 卡在 `mach_msg`，服务端发不出 `CertificateVerify`，客户端永停 `preparing` 且无错误码（NEG-02）；② **「QUIC stream 模式不可用」作废**——复核握手 64.6/80.4ms 正常，此前失败同因（NEG-01），D-14 改按「一个连接一条流」立论；③ 「证书材料随机损坏」假象撤回。修复：临时钥匙串 + ACL 信任当前进程 + 进程内单次导入。
 - v0.13-draft 2026-11-18 19:10：**新增 NEG-04 授权弹窗复发根因与清理**。NEG-02 修完之后弹窗仍在，原因是 ① 仓库里 `quic_probe`/`pipeline_probe`/`pipeline_kiosk_probe`/`driver_probe` 四份二进制是修复前编的，仍走登录钥匙串旧路径；② `M1CopyIdentity` 在临时钥匙串创建失败时静默回退到登录钥匙串。修法：全部重建、删除回退分支（失败即报错）、临时钥匙串先 unlink 防 PID 复用残留、新增 `cleanup_stale_identities.sh`，并清掉登录钥匙串里 30 张残留测试证书。验证：`--self` 5/5（12.4–14.7ms）、`quic_probe` 默认 500 帧退出码 0、148 断言全过，且跑完后 `SecurityAgent` 不再出现。
+- v0.19-draft 2026-11-19 09:0x：**§5.9.1 端到端判据通过，并更正 v0.18 的归因**。v0.18 把「端到端跑不动」全记在会话自动锁定上，实测有一半是脚本自己的 bug：`verify_m1b.sh` 把 `cursor_move locked` 的退出码判反（0=解锁被当锁定），三轮全是空转。修正后真正的阻塞浮现为**辅助功能授权**：`AXIsProcessTrusted=0` 时 `CGWarpMouseCursorPosition` 能改光标位置但不产生 `mouseMoved`，`CGEventPost` 的合成事件被丢弃（最小 AppKit 接收器复现：active/key/visible 全 1、光标在动、`mouseEntered` 1 次、`mouseMoved` 0 次）。据此把驱动分流为 `physical`/`synth`（新增 `--input-synth` 进程内投递），`synth` 下第 1 轮即 PASS：29 帧上屏、单帧 8.0 ms、三次移动 x=1720/955.6/2484.4、y 恒 720，与 letterbox 换算一致。另修掉同一 `NSEvent` 被投递两次（hit-test + tracking area owner 同体）导致上行事件翻倍的问题。单测 193 项仍全过。
 - v0.18-draft 2026-11-18 23:1x：**§5.9 补齐端到端实测与三个真问题**。上屏从 `createCGImage`（每帧 GPU→CPU 回读 19.8 MB，实测 0.5–0.9 s/帧）改为 `render:toCVPixelBuffer:` 渲染到 IOSurface 再直接当 `layer.contents`（零拷贝），离屏 3440×1440 **10.4 ms/帧**。发现窗口不可见时 `layer.contents` 赋值会被 CA 阻塞（943–3233 ms 的假性能数字由此而来），改为 `occlusionState` 不可见则跳过并计 `framesSkippedOccluded`。发现 CLI 应用拿不到 key window，tracking area 改用 `NSTrackingActiveAlways` + `acceptsMouseMovedEvents`（此前 `inputEmitted` 恒为 0）。端到端仍被「会话反复自动锁定」挡住：窗口 `visible=1 key=0 active=0 occluded=1`，登录窗在最上层；已把 `verify_m1b.sh` 改为多轮短尝试，若单机无法稳定解锁则并入双机验收。
 - v0.17-draft 2026-11-18 21:5x：**新增 §5.9 M1-B 客户端上屏 + 输入回传（代码与单测完成，端到端待解锁验证）**。补上此前被静默忽略的 `input` 消息收发（`sendInputEvent:` / `didReceiveInputEvent:`，含 STREAMING 门禁与 1000 event/s 限速）；新增 `M1FrameView`（CIContext→CGImage→layer，letterbox 与坐标映射共用 `M1AspectFitRect`/`M1NormalizedPointFromViewPoint` 纯函数）、`M1RecordingEventSink`（环回不真注入）、`tools/cursor_move` 与 `verify_m1b.sh`。单测 193 项全过（输入通路 24、letterbox/坐标 12、注入器 6 为新增）；另有离屏渲染自检 `render_selftest` 全过（颜色/尺寸/letterbox/覆盖），并量出 CIContext 首次转换 623 ms，已按同样思路预热到 2 ms 级。顺带修掉 `displayID` 文档与实现位置不一致（两处都带 + event 缺失回落消息层）。阻塞：屏幕锁定导致 SCK 无 display、窗口收不到事件，端到端判据未执行。
 - v0.16-draft 2026-11-18 21:20：**帧头升 v2，修掉 3440×1440 打穿 255 片上限的缺陷**。`fragIdx/fragCount` 由 1 字节扩到 2 字节、帧头 16B→18B，单帧上限从 286 KB 提到 75 MB。先验证并**排除**了「`displayID` 压 16 位、帧头保持 16B」这条更小的改动——实测 `CGMainDisplayID()=2026701824`（0x78CD0400），32 位都紧，压 16 位会截断。`payloadLen` 仍 1150，分片预算不变，不影响 MTU。验证：原生 3440×1440 推流 30/30 帧、`sendFail=0`、首帧 1278 ms（修复前 4069 ms）；400 片大帧重组逐字节一致；`quic_probe` 500 片零丢零乱序；P1 148 项 + M1 全绿。顺带修掉 `quic_probe` 的位图越界隐患（原本固定 32B 位图只够 fragIdx 0..255）。已有二进制必须全部重建，新旧帧头不兼容。

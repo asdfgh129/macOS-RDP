@@ -60,6 +60,10 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 @property (nonatomic, assign, readwrite) double lastRenderMs;
 @property (nonatomic, assign, readwrite) double maxRenderMs;
 @property (nonatomic, assign, readwrite) double warmUpMs;
+// 同一份 NSEvent 的重复投递判据（见 mouseMoved:）
+@property (nonatomic, assign) BOOL hasLastMouseEvent;
+@property (nonatomic, assign) NSTimeInterval lastMouseEventTimestamp;
+@property (nonatomic, assign) NSPoint lastMouseEventPoint;
 @end
 
 @implementation M1FrameView
@@ -290,6 +294,18 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 
 - (void)mouseMoved:(NSEvent *)event {
     if (self.dragging) return;   // 拖动由 mouseDragged 负责，避免重复事件
+    // 同一份 NSEvent 会被投两次：一次按 hit-test 命中视图，一次按 tracking area
+    // 派给 owner（本视图既是命中视图又是 owner，且开了 NSTrackingMouseMoved）。
+    // 实测每次移动都变成 2 条上行事件，白占一倍带宽；物理鼠标同样如此。
+    // 同一事件的时间戳与窗口内坐标必然相同，按此去重，不影响真实连续移动。
+    if (self.hasLastMouseEvent &&
+        event.timestamp == self.lastMouseEventTimestamp &&
+        NSEqualPoints(event.locationInWindow, self.lastMouseEventPoint)) {
+        return;
+    }
+    self.hasLastMouseEvent = YES;
+    self.lastMouseEventTimestamp = event.timestamp;
+    self.lastMouseEventPoint = event.locationInWindow;
     [self emitMouse:event button:@"left" action:@"move"];
 }
 

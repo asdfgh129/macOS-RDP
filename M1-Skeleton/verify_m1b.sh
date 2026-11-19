@@ -33,10 +33,13 @@ say() { printf '%s\n' "$*"; }
 
 # 连续 3 次都读成解锁才算解锁：单次读取会被会话切换的瞬时 NULL 骗到，
 # 实测出现过「报解锁、随即又锁」的假信号。
+#
+# 退出码约定（别记反）：`cursor_move locked` → 锁定时 exit 1，解锁时 exit 0。
+# 所以「检查失败（非 0）」= 锁定 = 本轮不可测。
 is_unlocked() {
   local _i
   for _i in 1 2 3; do
-    ./cursor_move locked >/dev/null 2>&1 && return 1
+    ./cursor_move locked >/dev/null 2>&1 || return 1
     sleep 0.3
   done
   return 0
@@ -62,7 +65,7 @@ one_attempt() {
 
   ./stream_probe --client --port "$port" --fingerprint "$fp" \
       --duration-ms "$((DURATION_MS - 1500))" --window "${WIN_W}x${WIN_H}" \
-      --save-frames 0 --out "$out/client.json" \
+      --save-frames 0 ${SYNTH_ARG:-} --out "$out/client.json" \
       > "$out/client.log" 2>&1 &
   local client_pid=$!
 
@@ -78,16 +81,20 @@ one_attempt() {
   read -r dw dh <<< "$(./cursor_move info | head -1)"
   cx=$(awk -v w="${dw:-3440}" 'BEGIN{printf "%d", w/2}')
   cy=$(awk -v h="${dh:-1440}" 'BEGIN{printf "%d", h/2}')
-  say "  光标三点：($cx,$cy) ($((cx-200)),$cy) ($((cx+200)),$cy)"
 
-  # 解锁窗口只有十几秒，驱动节奏要快
-  sleep 0.6
-  ./cursor_move move "$cx" "$cy" >/dev/null
-  sleep 0.35
-  ./cursor_move move $((cx - 200)) "$cy" >/dev/null
-  sleep 0.35
-  ./cursor_move move $((cx + 200)) "$cy" >/dev/null
-  sleep 0.3
+  if [ "$DRIVER" = physical ]; then
+    say "  驱动=physical（真光标）三点：($cx,$cy) ($((cx-200)),$cy) ($((cx+200)),$cy)"
+    # 解锁窗口只有十几秒，驱动节奏要快
+    sleep 0.6
+    ./cursor_move move "$cx" "$cy" >/dev/null
+    sleep 0.35
+    ./cursor_move move $((cx - 200)) "$cy" >/dev/null
+    sleep 0.35
+    ./cursor_move move $((cx + 200)) "$cy" >/dev/null
+    sleep 0.3
+  else
+    say "  驱动=synth（进程内 NSEvent，客户端在 +1.2/+1.55/+1.9s 各投一次）"
+  fi
 
   wait "$client_pid" 2>/dev/null
   wait "$host_pid" 2>/dev/null
@@ -143,10 +150,11 @@ else:
         pw, ph, win_w, win_h, fit_w, expected_delta))
 
 if len(mouse) >= 3:
-    xs = [p["x"] for p in mouse[-3:]]
-    ys = [p["y"] for p in mouse[-3:]]
-    print("  最后三次 x = " + ", ".join("%.0f" % v for v in xs) +
-          " ；y = " + ", ".join("%.0f" % v for v in ys))
+    xs = [p["x"] for p in mouse]
+    ys = [p["y"] for p in mouse]
+    print("  收到 %d 条 mouse，x = %s ；y = %s" % (
+        len(mouse), " ".join("%.0f" % v for v in xs[-6:]),
+        " ".join("%.0f" % v for v in ys[-6:])))
     center_like = [v for v in xs if abs(v - cx) <= 0.03 * pw]
     left_like   = [v for v in xs if v < cx - 0.5 * expected_delta]
     right_like  = [v for v in xs if v > cx + 0.5 * expected_delta]
@@ -161,8 +169,8 @@ if len(mouse) >= 3:
             if cand and abs(abs(cand[0] - cx) - expected_delta) > 0.20 * expected_delta:
                 fails.append("%s位移 %.0f 与预期 %.0f 偏差超 20%%" % (
                     label, abs(cand[0] - cx), expected_delta))
-    if ys and abs(ys[0] - cy) > 0.08 * ph:
-        fails.append("y=%.0f 偏离屏幕中心 %.0f 超过 8%%" % (ys[0], cy))
+    if ys and max(abs(v - cy) for v in ys) > 0.08 * ph:
+        fails.append("y 最大偏离屏幕中心 %.0f 超过 8%%" % max(abs(v - cy) for v in ys))
 
 if fails:
     print("  本轮 FAIL: " + "；".join(fails))
@@ -179,6 +187,20 @@ PY
 # ---- 构建 ----
 bash ./build_cursor_move.sh >/dev/null 2>&1 || { say "✗ cursor_move 构建失败"; exit 2; }
 bash ./build_stream_probe.sh >/dev/null 2>&1 || { say "✗ stream_probe 构建失败"; exit 2; }
+
+# ---- 驱动方式 ----
+# 有「辅助功能」授权 → 真光标 + CGEventPost，连「系统把事件交给 App」这一跳也测到。
+# 没有 → 进程内投 NSEvent，走同一条 NSWindow sendEvent → M1FrameView 分发路径，
+#         只少 OS 投递那一跳；坐标换算、协议编码、传输、主机解析、注入计划全是真的。
+if ./cursor_move ax >/dev/null 2>&1; then
+  DRIVER=physical
+  SYNTH_ARG=""
+  say "驱动: physical —— 真光标（AXIsProcessTrusted=1）"
+else
+  DRIVER=synth
+  SYNTH_ARG="--input-synth 450,253;250,253;650,253"
+  say "驱动: synth —— AXIsProcessTrusted=0，改用进程内 NSEvent（缺 OS 投递一跳）"
+fi
 
 for a in $(seq 1 "$ATTEMPTS"); do
   say "=== 第 $a/$ATTEMPTS 轮 ==="

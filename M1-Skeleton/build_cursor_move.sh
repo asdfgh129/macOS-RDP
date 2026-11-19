@@ -15,7 +15,7 @@ CLANG="$(xcrun --sdk macosx --find clang)"
   -isysroot "$SDKROOT" \
   -Wall -Wno-unused-parameter \
   tools/cursor_move.m \
-  -framework Foundation -framework CoreGraphics \
+  -framework Foundation -framework CoreGraphics -framework ApplicationServices \
   -o ./cursor_move
 
 echo "built: ./cursor_move"

@@ -826,18 +826,20 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.12 | 窗口不可见（`occlusionState` 不含 Visible）时**不贴帧**并计入 `framesSkippedOccluded`：否则 `layer.contents` 赋值会被 CA 合成阻塞 0.3–3 s，把渲染队列堵死 | `M1FrameView` |
 | C-17.13 | tracking area 用 `NSTrackingActiveAlways`（不能用 `...InKeyWindow`）+ 显式 `acceptsMouseMovedEvents=YES`：CLI 起的 App 常常拿不到 key window | `M1FrameView` / `stream_probe` |
 | C-17.11 | 上屏正确性用**离屏自检**（喂已知图案、采样 `layer.contents`）而非只靠肉眼截图：颜色通道反转在截图里不容易发现 | `tools/render_selftest.m` |
+| C-17.14 | 端到端驱动分流：`cursor_move ax` 判定 `AXIsProcessTrusted`，有授权用真光标（`physical`），没有则客户端用 `--input-synth` 进程内投 `NSEvent`（`synth`）。无授权时光标位移动得动但 `mouseMoved` 一条都不到，只看光标会误判成客户端没采集 | `verify_m1b.sh` / `stream_probe` |
+| C-17.15 | 同一 `NSEvent` 会因「hit-test 视图 + tracking area owner 同体」被投两次，按**时间戳 + 窗口内坐标**去重，避免每次移动发 2 条上行 | `M1FrameView mouseMoved:` |
 
 ### 代价与边界
 
-- 上屏路径是 `createCGImage`，离屏实测单帧 1.3–2.1 ms（640×360 源）；全分辨率
-  3440×1440 的耗时仍未知，超过 ~15 ms 就应改 `IOSurface` 直贴或 `CAMetalLayer`。
+- 上屏路径是 `CIContext → IOSurface → layer.contents`（零拷贝），离屏实测 10.4 ms/帧
+  @3440×1440、1.1 ms@640×360；更早的 `createCGImage` 版本单帧 0.5–0.9 s，已废弃。
 - `CIContext` 首次转换 623 ms 属全系统 GPU 管线冷启动，预热只能在进程内提前，
   跨进程/重启后仍需再付一次。
 - 客户端不做本地节流：1000 Hz 鼠标会先把控制通道塞满再被 Host 丢弃。M1-C 再改。
 - 环回时窗口会被自己采集进去，出现「画中画递归」，是预期现象。
-- 端到端判据（窗口出画面 + 三点坐标换算）**未执行**：这台机器的会话在反复自动锁定，
-  窗口虽然 `visible=1` 但 `occluded=1 / key=0 / active=0`（登录窗在最上层），
-  上屏与输入都拿不到。离屏判据已通过（颜色/尺寸/letterbox/覆盖/10.4 ms@3440×1440）。
+- 端到端判据已通过（`synth` 驱动，2026-11-19 早晨：29 帧上屏 + 3 次移动的 x 全部落在
+  预期位置）。**`physical` 驱动与主机真注入未验证**：两者都要求宿主进程
+  `AXIsProcessTrusted=1`，属授权前置而非代码问题，列入双机验收。
   若单机无法稳定解锁，判据并入双机验收（届时窗口在另一台机器上）。
 
 ---

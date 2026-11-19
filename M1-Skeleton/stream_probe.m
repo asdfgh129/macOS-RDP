@@ -453,7 +453,10 @@ static void PrintUsage(void) {
         "  stream_probe --host [--port N] [--port-file PATH] [--duration-ms N]\n"
         "                    [--display ID] [--fps N] [--out JSON]\n"
         "  stream_probe --client --port N --fingerprint HEX [--duration-ms N]\n"
-        "                    [--outdir DIR] [--save-frames N] [--out JSON]\n");
+        "                    [--outdir DIR] [--save-frames N] [--out JSON]\n"
+        "                    [--window [WxH]] [--input-synth \"X,Y;X,Y;...\"]\n"
+        "  --input-synth: 进程内合成鼠标移动（内容坐标，左上原点），\n"
+        "                 用于驱动端没有辅助功能授权、无法投递系统事件时。\n");
 }
 
 static NSData *JSONData(NSDictionary *dict) {
@@ -480,6 +483,7 @@ int main(int argc, char **argv) {
         BOOL windowMode = NO;
         double windowW = 1280, windowH = 720;
         NSString *injectMode = nil;   // nil / record / real
+        NSString *synthSpec = nil;    // "X,Y;X,Y" 内容坐标（左上原点）
 
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--host")) hostMode = YES;
@@ -508,6 +512,8 @@ int main(int argc, char **argv) {
             else if (!strcmp(argv[i], "--height") && i + 1 < argc) outH = atoi(argv[++i]);
             else if (!strcmp(argv[i], "--inject") && i + 1 < argc)
                 injectMode = [NSString stringWithUTF8String:argv[++i]];
+            else if (!strcmp(argv[i], "--input-synth") && i + 1 < argc)
+                synthSpec = [NSString stringWithUTF8String:argv[++i]];
             else if (!strcmp(argv[i], "--window")) {
                 windowMode = YES;
                 // 可选 --window 1600x900；不给就 1280x720。
@@ -739,6 +745,7 @@ int main(int argc, char **argv) {
         // 窗口模式：先建 NSWindow，保证首帧一到就能上屏（渲染本身在独立队列，
         // 帧到了先排队，run loop 起来后立即贴图）。
         M1FrameView *frameView = nil;
+        __block NSUInteger synthPosted = 0;   // 进程内合成鼠标事件的投递次数（收尾时进 JSON）
         __block BOOL closedByUser = NO;
         NSWindow *frameWindow = nil;
         if (windowMode) {
@@ -810,6 +817,43 @@ int main(int argc, char **argv) {
                 else winSendFail += 1;
             };
             frameView.onCloseRequest = ^{ closedByUser = YES; [NSApp stop:nil]; };
+
+            // 合成鼠标驱动：这台机器上由 agent 拉起的命令行工具没有「辅助功能」授权
+            // （AXIsProcessTrusted=0）。实测 CGWarpMouseCursorPosition 能改光标位置，
+            // 但窗口一条 mouseMoved 都收不到（连本地事件监听都是 0），CGEventPost 的
+            // 合成事件同样被丢弃。此时改用 NSEvent 在进程内投递：走的是同一条
+            // NSWindow sendEvent → hitTest → M1FrameView.mouseMoved: 分发路径，
+            // 只差「系统把物理事件交给 App」这一跳，其余全链路（坐标换算→协议编码→
+            // 传输→主机解析→注入计划）都是真的。
+            if (synthSpec.length > 0) {
+                NSArray<NSString *> *pairs = [synthSpec componentsSeparatedByString:@";"];
+                for (NSUInteger k = 0; k < pairs.count; k++) {
+                    NSString *item = [pairs[k] stringByTrimmingCharactersInSet:
+                                      [NSCharacterSet whitespaceCharacterSet]];
+                    double sx = 0, sy = 0;
+                    if (sscanf(item.UTF8String, "%lf,%lf", &sx, &sy) != 2) continue;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                 (int64_t)(1200 + (int64_t)k * 350) * NSEC_PER_MSEC),
+                                   dispatch_get_main_queue(), ^{
+                        if (closedByUser) return;
+                        // 内容坐标（左上原点）→ 窗口坐标（左下原点）
+                        NSPoint win = NSMakePoint(sx, windowH - sy);
+                        NSEvent *ev = [NSEvent mouseEventWithType:NSEventTypeMouseMoved
+                                                        location:win
+                                                   modifierFlags:0
+                                                       timestamp:[NSProcessInfo processInfo].systemUptime
+                                                    windowNumber:frameWindow.windowNumber
+                                                         context:nil
+                                                     eventNumber:0
+                                                      clickCount:0
+                                                        pressure:0];
+                        [frameWindow sendEvent:ev];
+                        synthPosted += 1;
+                        printf("  [synth] mouseMoved 内容(%.0f,%.0f) → 窗口(%.0f,%.0f)\n",
+                               sx, sy, win.x, win.y);
+                    });
+                }
+            }
 
             // 到点自动收尾。stop: 之后必须再投一个事件，否则 run loop 可能还挂在等事件上。
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -938,6 +982,8 @@ int main(int argc, char **argv) {
             json[@"lastRenderMs"] = @(round(frameView.lastRenderMs * 10) / 10.0);
             json[@"maxRenderMs"] = @(round(frameView.maxRenderMs * 10) / 10.0);
             json[@"inputEmitted"] = @(frameView.inputEventsEmitted);
+            json[@"inputSynthPosted"] = @(synthPosted);
+            json[@"inputDriver"] = synthSpec.length > 0 ? @"synth" : @"physical";
             json[@"inputSent"] = @(client.session.inputEventsSent);
             json[@"inputDropped"] = @(client.session.inputEventsDropped);
             json[@"inputRejected"] = @(client.session.inputEventsRejected);

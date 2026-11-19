@@ -10,10 +10,13 @@
 //  用法：
 //    ./cursor_move info            打印主屏尺寸与当前光标位置
 //    ./cursor_move move X Y        把光标移到全局坐标 (X, Y) 并发一个 mouseMoved
+//    ./cursor_move locked          锁屏 → exit 1；解锁 → exit 0
+//    ./cursor_move ax              有辅助功能授权 → exit 0（合成事件能投递）
 //
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <ApplicationServices/ApplicationServices.h>
 
 int main(int argc, char **argv) {
     @autoreleasepool {
@@ -31,6 +34,14 @@ int main(int argc, char **argv) {
             }
             printf("%s\n", locked ? "locked" : "unlocked");
             return locked ? 1 : 0;
+        }
+        if (argc >= 2 && !strcmp(argv[1], "ax")) {
+            // 合成事件（CGEventPost）能不能投递，全看这条：没有辅助功能授权时
+            // 事件会被系统直接丢掉，光标位置却照样被 warp 改掉——很容易误判成
+            // 「客户端没采集」，所以单独做一个可探测的判据。
+            BOOL trusted = AXIsProcessTrusted();
+            printf("%s\n", trusted ? "trusted" : "untrusted");
+            return trusted ? 0 : 1;
         }
         if (argc >= 2 && !strcmp(argv[1], "info")) {
             CGRect b = CGDisplayBounds(CGMainDisplayID());
