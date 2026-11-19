@@ -832,6 +832,8 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.17 | 服务端监听必须显式指定端口（`nw_listener_create_with_port`）：`nw_listener_create(params)` 会忽略 init 传入的 port，实测 `--port 46600` 实际监听 61174。单机靠 `--port-file` 传端口不暴露，跨机（防火墙、人工抄写）必须固定 | `M1QuicTransport start` |
 | C-17.18 | 跨机联调以 `--inject real` 为准，判据包含「主机光标位移 > 0」（`cursorMovedPx`）：`inputReceived` 只证明收到了事件，不证明 CGEventPost 真的生效（无 AX 授权时会静默失败） | `stream_probe` host 汇总 / `P2-Dual/p2.sh summary` |
 | C-17.19 | glass-to-glass 不在没有测量手段时下结论。现有打点只覆盖「采集→编码→发出」与「收到→解码→上屏」，缺显示扫描与单程时延；三条候选测量路线见 `docs/P2-CHECKLIST.md` §7 | P2 延迟验收 |
+| C-17.20 | 跨网段/NAT 联调时 host **只开一个入站 UDP 端口**（46600，或映射后的外部端口），不开 TCP；`--advertise HOST[:PORT]` 只改「给客户端的三项」展示、不改本地监听，外部端口与内部端口可不同，由 client 的 `--port` 指定。分片 18+1150=1168B，整包约 1.2 KB < 1500 MTU，不产生 IP 分片 | `stream_probe --advertise` / `P2-Dual/p2.sh P2_ADVERTISE` / `docs/P2-CHECKLIST.md` §1.1 |
+| C-17.21 | 控制端换成 Sequoia 15.5 那台时，两端必须同一 commit 且各自本地构建（部署目标 13.0）；client 侧无 TCC 前置，host 侧仍需屏幕录制+辅助功能。`--inject real` 的 CGEventPost 授权按二进制 code requirement 记，`stream_probe` 用固定签名标识 `com.m1.pipeline`，重编不掉授权 | `build_stream_probe.sh` / `docs/P2-CHECKLIST.md` §3 |
 
 ### 代价与边界
 

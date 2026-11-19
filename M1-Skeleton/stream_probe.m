@@ -464,6 +464,28 @@ static void PrintFlowStats(StreamNode *n, const char *tag) {
 // 「可执行文件的 code requirement」记的，换一个二进制查出来的结果不代表本二进制
 // （已踩过：同一份源码重建后 AX 从 1 变 0）。所以必须由真正干活的那个进程自查。
 
+// --advertise HOST[:PORT]：跨网段/NAT 时防火墙映射出来的「对外端点」。
+// 只改「给客户端的三项」和 JSON 里的展示，不改本机实际监听（永远 0.0.0.0:PORT）。
+// 外部端口可以与内部端口不同，客户端用 --port 单独指定映射后的端口。
+static BOOL P2ParseAdvertise(NSString *spec, NSString **outHost, uint16_t *outPort) {
+    if (spec.length == 0) return NO;
+    NSString *h = spec;
+    uint16_t p = 0;
+    NSRange colon = [spec rangeOfString:@":" options:NSBackwardsSearch];
+    if (colon.location != NSNotFound && colon.location + 1 < spec.length) {
+        NSString *tail = [spec substringFromIndex:colon.location + 1];
+        int n = atoi(tail.UTF8String);
+        if (n > 0 && n <= 65535) {
+            h = [spec substringToIndex:colon.location];
+            p = (uint16_t)n;
+        }
+    }
+    if (h.length == 0) return NO;
+    if (outHost) *outHost = h;
+    if (outPort) *outPort = p;
+    return YES;
+}
+
 // 本机可对接的 IPv4（排除回环与 169.254 自分配地址）。
 static NSArray<NSString *> *P2LANAddresses(void) {
     NSMutableArray<NSString *> *out = [NSMutableArray array];
@@ -484,7 +506,7 @@ static NSArray<NSString *> *P2LANAddresses(void) {
 }
 
 // 返回 0 = 就绪。输出 `[preflight] k=v` 行，脚本只认最后那行 ok=。
-static int P2RunPreflight(NSString *role, BOOL needAX) {
+static int P2RunPreflight(NSString *role, BOOL needAX, NSString *advertise) {
     BOOL ax = AXIsProcessTrusted();
     BOOL capture = CGPreflightScreenCaptureAccess();
     uint32_t activeCount = 0;
@@ -513,6 +535,8 @@ static int P2RunPreflight(NSString *role, BOOL needAX) {
            (unsigned)P1FrameHeaderVersion, (unsigned long)P1FrameHeaderSize,
            (unsigned long)P1FrameMaxPayload);
     for (NSString *ip in P2LANAddresses()) printf("[preflight] ip=%s\n", ip.UTF8String);
+    if (advertise.length) printf("[preflight] advertise=%s\n", advertise.UTF8String);
+    else printf("[preflight] advertise=（未设置；跨网段请传 --advertise 公网IP[:映射端口]）\n");
     for (NSString *f in fails) printf("[preflight] fail=%s\n", f.UTF8String);
     printf("[preflight] ok=%d\n", fails.count == 0 ? 1 : 0);
     return fails.count == 0 ? 0 : 1;
@@ -523,7 +547,9 @@ static void PrintUsage(void) {
         "用法:\n"
         "  stream_probe --host [--port N] [--port-file PATH] [--duration-ms N]\n"
         "                    [--display ID] [--fps N] [--out JSON]\n"
-        "  stream_probe --preflight host|client [--inject real]   # 本机能力自检\n"
+        "                    [--advertise HOST[:PORT]]   # 跨网段/NAT：防火墙映射后的对外端点\n"
+        "  stream_probe --preflight host|client [--inject real] [--advertise HOST[:PORT]]\n"
+        "                                                        # 本机能力自检\n"
         "  stream_probe --client --connect IP --port N --fingerprint HEX [--duration-ms N]\n"
         "                    [--outdir DIR] [--save-frames N] [--out JSON]\n"
         "                    [--window [WxH]] [--keep-front] [--input-synth \"X,Y;X,Y;...\"]\n"
@@ -609,7 +635,8 @@ int main(int argc, char **argv) {
         BOOL windowTop = NO;
         BOOL keepFront = NO;
         int manualSecs = 0;           // >0：不造事件，改为提示真人动鼠标 SECS 秒
-        NSString *connectHost = @"127.0.0.1";   // 双机时改成对端的局域网地址
+        NSString *connectHost = @"127.0.0.1";   // 双机时改成对端的公网/跨网段地址
+        NSString *advertiseSpec = nil;          // host 对外端点（NAT/防火墙映射后）
         NSString *preflightRole = nil;          // host / client：只做本机能力自检后退出
 
         for (int i = 1; i < argc; i++) {
@@ -645,6 +672,8 @@ int main(int argc, char **argv) {
                 manualSecs = atoi(argv[++i]);
             else if (!strcmp(argv[i], "--connect") && i + 1 < argc)
                 connectHost = [NSString stringWithUTF8String:argv[++i]];
+            else if (!strcmp(argv[i], "--advertise") && i + 1 < argc)
+                advertiseSpec = [NSString stringWithUTF8String:argv[++i]];
             else if (!strcmp(argv[i], "--preflight")) {
                 preflightRole = (i + 1 < argc && argv[i + 1][0] != '-')
                               ? [NSString stringWithUTF8String:argv[++i]] : @"host";
@@ -673,7 +702,7 @@ int main(int argc, char **argv) {
             else { PrintUsage(); return 1; }
         }
         if (preflightRole) {
-            return P2RunPreflight(preflightRole, [injectMode isEqualToString:@"real"]);
+            return P2RunPreflight(preflightRole, [injectMode isEqualToString:@"real"], advertiseSpec);
         }
         if (!hostMode && !clientMode) { PrintUsage(); return 1; }
 
@@ -706,19 +735,24 @@ int main(int argc, char **argv) {
             printf("host 监听端口 %u\n", host.port);
             printf("  证书指纹 %s\n", localFp.UTF8String);
             // 双机对接要人工把这三项抄到另一台机器上，单独打一块免得漏。
-            printf("\n===== 给客户端的三项 =====\n");
+            // 跨网段时这里必须是「防火墙映射后的对外地址」，而不是本机内网 IP。
+            NSString *advHost = nil;
+            uint16_t advPort = 0;
+            BOOL advertised = P2ParseAdvertise(advertiseSpec, &advHost, &advPort);
             NSArray<NSString *> *ips = P2LANAddresses();
-            printf("  IP   : %s\n", ips.count ? ips.firstObject.UTF8String
-                                              : "（没有局域网 IPv4，只有回环）");
-            if (ips.count > 1) {
-                printf("  其他 : ");
-                for (NSUInteger k = 1; k < ips.count; k++)
-                    printf("%s ", ips[k].UTF8String);
-                printf("\n");
-            }
-            printf("  端口 : %u\n", host.port);
+            NSString *innerIP = ips.count ? [ips.firstObject componentsSeparatedByString:@"("].firstObject
+                                          : @"127.0.0.1";
+            printf("\n===== 给客户端的三项（跨网段填映射后的地址）=====\n");
+            printf("  IP   : %s\n", advertised ? advHost.UTF8String : innerIP.UTF8String);
+            printf("  端口 : %u\n", advertised && advPort ? advPort : host.port);
             printf("  指纹 : %s\n", localFp.UTF8String);
-            printf("=========================\n\n");
+            printf("=============================================\n");
+            printf("本机实际监听: %s:%u（%s）\n", innerIP.UTF8String, host.port,
+                   advertised ? "NAT 后面；对外请用上面三项" : "同网段可直接用");
+            if (advertised && advPort && advPort != host.port)
+                printf("外部端口 %u → 内部端口 %u：防火墙/路由器上必须已有这条 UDP 映射\n",
+                       advPort, host.port);
+            printf("\n");
 
             if (portFile.length > 0) {
                 NSString *payload = [NSString stringWithFormat:@"%u\n%@\n", host.port, localFp];
@@ -876,6 +910,7 @@ int main(int argc, char **argv) {
             NSMutableDictionary *json = [NSMutableDictionary dictionary];
             json[@"role"] = @"host";
             json[@"port"] = @(host.port);
+            if (advertiseSpec.length) json[@"advertisedEndpoint"] = advertiseSpec;
             json[@"streaming"] = @(host.streaming);
             json[@"stateLog"] = host.stateLog;
             json[@"pixelWidth"] = @(pipe.pixelWidth);

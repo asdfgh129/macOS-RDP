@@ -17,7 +17,9 @@
 #       ./p2.sh summary <host.json> <client.json>
 #
 # 环境变量（都可选）：
-#   P2_PORT=46600       监听/连接端口，防火墙要放行同一个
+#   P2_PORT=46600       host 本机监听端口 / client 默认连接端口（防火墙放行这个 UDP 端口）
+#   P2_ADVERTISE=IP:PORT  host 对外端点（跨网段/NAT 时填防火墙映射后的公网 IP 与端口）
+#                         外部端口可与 P2_PORT 不同；client 侧用 --port 指定映射后的端口
 #   P2_SECONDS=60       推流时长
 #   P2_FPS=20           目标帧率
 #   P2_INJECT=real      host 的注入方式：real（真注入，需辅助功能授权）/ record
@@ -33,6 +35,7 @@ SKEL="$HERE/../M1-Skeleton"
 cd "$SKEL" || { echo "找不到 M1-Skeleton"; exit 2; }
 
 PORT="${P2_PORT:-46600}"
+ADVERTISE="${P2_ADVERTISE:-}"
 SECS="${P2_SECONDS:-60}"
 FPS="${P2_FPS:-20}"
 INJECT="${P2_INJECT:-real}"
@@ -50,10 +53,11 @@ need_bin() {
 }
 
 do_preflight() {
-  local role="$1" peer="${2:-}" inject_arg="" rc
+  local role="$1" peer="${2:-}" inject_arg="" adv_arg="" rc
   [ "$role" = host ] && [ "$INJECT" = real ] && inject_arg="--inject real"
+  [ -n "$ADVERTISE" ] && adv_arg="--advertise $ADVERTISE"
   # shellcheck disable=SC2086
-  ./stream_probe --preflight "$role" $inject_arg
+  ./stream_probe --preflight "$role" $inject_arg $adv_arg
   rc=$?
   [ "$rc" = 0 ] || die "本机自检未通过（见上面 [preflight] fail= 行）"
   if [ -n "$peer" ]; then
@@ -94,7 +98,10 @@ host)
   caffeinate -d -u -t $((SECS + 120)) &
   CAF=$!
   trap 'kill $CAF 2>/dev/null' EXIT INT TERM
-  ./stream_probe --host --port "$PORT" \
+  adv_arg=""
+  [ -n "$ADVERTISE" ] && adv_arg="--advertise $ADVERTISE"
+  # shellcheck disable=SC2086
+  ./stream_probe --host --port "$PORT" $adv_arg \
       --duration-ms "$((SECS * 1000))" --fps "$FPS" \
       --inject "$INJECT" --out "$OUT/host.json" 2>&1 | tee "$OUT/host.log"
   rc=${PIPESTATUS[0]}
