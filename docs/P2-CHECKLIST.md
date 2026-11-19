@@ -63,16 +63,22 @@
    → 内部 `192.168.10.23:46600`；host 启动时要告诉程序这个对外端点：
 
 ```bash
-P2_ADVERTISE=203.0.113.7:47000 P2_PORT=46600 ./p2.sh host
-# 打印的三项会变成：IP=203.0.113.7 / 端口=47000 / 指纹=...
+P2_ADVERTISE=112.5.32.34:46600 P2_PORT=46600 P2_WAIT_MS=60000 ./p2.sh host
+# 打印的三项会变成：IP=112.5.32.34 / 端口=46600 / 指纹=...
 # 同时另打印「本机实际监听: 192.168.10.23:46600」便于核对映射
 ```
 
-client 侧用**映射后的**地址和端口：
+client 侧用**映射后的**地址和端口（本轮外部端口与内部端口相同）：
 
 ```bash
-./p2.sh client --host 203.0.113.7 --port 47000 --fingerprint <指纹>
+P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
+  ./p2.sh client --host 112.5.32.34 --port 46600 --fingerprint <指纹>
 ```
+
+> **本机回环自检的限制**：从 host 自己连 `112.5.32.34:46600` 失败，不能证明映射没生效——
+> 多数家用/边界 NAT 不支持 hairpin（内网源地址经公网 IP 再回到同一台主机）。
+> 本环境另有 UDP 出向到公网 STUN 超时，导致无法从内侧确认映射。
+> **唯一可靠判据是从另一网段（Sequoia 那台）实际握手成功**；失败时按 §5 失败对照表查。
 
 > 分片上限 `18B 帧头 + 1150B 载荷 = 1168B`，加上 QUIC/UDP/IP 头约 1200 多字节，
 > 低于 1500 MTU，**不会产生 IP 分片**——这点对跨网段的 firewall 很关键。
@@ -86,9 +92,9 @@ cd P2-Dual
 ./p2.sh preflight host          # 先自检
 ./p2.sh host                    # 正式跑，默认 60s、20fps、--inject real
 
-# 跨网段/NAT：把防火墙映射后的对外端点告诉程序
-P2_ADVERTISE=203.0.113.7:47000 ./p2.sh preflight host
-P2_ADVERTISE=203.0.113.7:47000 ./p2.sh host
+# 跨网段/NAT：把防火墙映射后的对外端点告诉程序（本轮实际参数）
+P2_ADVERTISE=112.5.32.34:46600 P2_WAIT_MS=60000 ./p2.sh preflight host
+P2_ADVERTISE=112.5.32.34:46600 P2_WAIT_MS=60000 ./p2.sh host
 ```
 
 `preflight` 逐行看，必须 `ok=1`：
@@ -128,8 +134,9 @@ cd P2-Dual
 ./p2.sh preflight client --host 192.168.10.23     # 顺带测连通性
 
 # 跨网段/NAT：--host 用公网 IP，--port 用映射后的外部端口
-./p2.sh preflight client --host 203.0.113.7
-./p2.sh client --host 203.0.113.7 --port 47000 --fingerprint 3305dec4...
+P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 ./p2.sh preflight client --host 112.5.32.34
+P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
+  ./p2.sh client --host 112.5.32.34 --port 46600 --fingerprint 3305dec4...
 ```
 
 **控制端用 Sequoia 15.5（前天那台）的注意事项：**
@@ -193,6 +200,8 @@ cd P2-Dual
 | 同网段通、跨网段不通 | 防火墙没放行 UDP 46600，或 NAT 映射的是 TCP | 在边界设备上确认 `UDP <外部端口> → host:46600` |
 | host 打印的 IP 是内网地址、客户端连不上 | 没传 `P2_ADVERTISE` | host 加 `P2_ADVERTISE=公网IP:映射端口`，让打印的三项变成对外地址 |
 | 映射端口 ≠ 46600 但客户端仍连 46600 | client 没指定外部端口 | `./p2.sh client --host <公网IP> --port <外部端口> --fingerprint ...` |
+| 从 host 自己连公网 IP 不通 | 多数 NAT 不支持 hairpin，属预期现象 | 不要据此判断映射失败；从另一网段的 client 实测 |
+| 跨网段 12s 内握手超时 | 默认超时按同网段设的，偏短 | `P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000` |
 | 握手卡在 `preparing` 且无错误码 | 证书材料不可用（旧二进制 / 钥匙串 ACL 弹窗） | 看有没有 SecurityAgent 弹窗；重跑 `./gen_quic_identity.sh` 后重建 |
 | 端口和 `--port` 不一致 | **已修**：`nw_listener_create` 会忽略端口，改用 `nw_listener_create_with_port` | 本次已修，host 会打出真实端口 |
 | `capture=0` / 主机无帧 | 缺屏幕录制授权 | 勾选后**重启进程** |

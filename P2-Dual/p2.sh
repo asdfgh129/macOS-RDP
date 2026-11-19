@@ -24,6 +24,8 @@
 #   P2_FPS=20           目标帧率
 #   P2_INJECT=real      host 的注入方式：real（真注入，需辅助功能授权）/ record
 #   P2_WINDOW=1280x720  client 窗口尺寸
+#   P2_WAIT_MS=15000    等客户端/等 STREAMING 的超时；跨网段建议 60000
+#   P2_HANDSHAKE_MS=12000 客户端握手超时；跨网段建议 30000
 #   P2_OUT=<dir>        输出目录，默认 P2-Dual/out/<时间戳>
 #
 # 退出码：0 成功；2 前置条件不满足；3 构建失败；其他见输出。
@@ -36,6 +38,8 @@ cd "$SKEL" || { echo "找不到 M1-Skeleton"; exit 2; }
 
 PORT="${P2_PORT:-46600}"
 ADVERTISE="${P2_ADVERTISE:-}"
+WAIT_MS="${P2_WAIT_MS:-15000}"
+HANDSHAKE_MS="${P2_HANDSHAKE_MS:-12000}"
 SECS="${P2_SECONDS:-60}"
 FPS="${P2_FPS:-20}"
 INJECT="${P2_INJECT:-real}"
@@ -101,7 +105,7 @@ host)
   adv_arg=""
   [ -n "$ADVERTISE" ] && adv_arg="--advertise $ADVERTISE"
   # shellcheck disable=SC2086
-  ./stream_probe --host --port "$PORT" $adv_arg \
+  ./stream_probe --host --port "$PORT" $adv_arg --wait-ms "$WAIT_MS" \
       --duration-ms "$((SECS * 1000))" --fps "$FPS" \
       --inject "$INJECT" --out "$OUT/host.json" 2>&1 | tee "$OUT/host.log"
   rc=${PIPESTATUS[0]}
@@ -128,6 +132,7 @@ client)
   say "client：连 ${PEER}:${PORT}，窗口 ${WIN}，接收 ${SECS}s"
   say "输出：$OUT"
   ./stream_probe --client --connect "$PEER" --port "$PORT" --fingerprint "$FP" \
+      --handshake-ms "$HANDSHAKE_MS" --wait-ms "$WAIT_MS" \
       --duration-ms "$((SECS * 1000))" --window "$WIN" \
       --save-frames 0 --out "$OUT/client.json" 2>&1 | tee "$OUT/client.log"
   rc=${PIPESTATUS[0]}

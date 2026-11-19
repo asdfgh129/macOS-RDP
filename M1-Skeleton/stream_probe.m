@@ -548,12 +548,13 @@ static void PrintUsage(void) {
         "  stream_probe --host [--port N] [--port-file PATH] [--duration-ms N]\n"
         "                    [--display ID] [--fps N] [--out JSON]\n"
         "                    [--advertise HOST[:PORT]]   # 跨网段/NAT：防火墙映射后的对外端点\n"
+        "                    [--wait-ms N]               # host 等客户端 / client 等 STREAMING（默认 15000）\n"
         "  stream_probe --preflight host|client [--inject real] [--advertise HOST[:PORT]]\n"
         "                                                        # 本机能力自检\n"
         "  stream_probe --client --connect IP --port N --fingerprint HEX [--duration-ms N]\n"
         "                    [--outdir DIR] [--save-frames N] [--out JSON]\n"
         "                    [--window [WxH]] [--keep-front] [--input-synth \"X,Y;X,Y;...\"]\n"
-        "                    [--manual SECS]\n"
+        "                    [--manual SECS] [--handshake-ms N]   # 握手超时默认 12000\n"
         "  --input-synth: 进程内合成鼠标移动（内容坐标，左上原点），\n"
         "                 用于驱动端没有辅助功能授权、无法投递系统事件时。\n"
         "  --manual:      不造事件，改为给出「立刻动鼠标」的提示（响铃 3 声 + 窗口标题 +\n"
@@ -623,6 +624,10 @@ int main(int argc, char **argv) {
         NSString *outdir = nil;
         NSString *fingerprint = nil;
         int durationMs = 5000;
+        // 跨网段/NAT 下 QUIC Initial 可能被防火墙拖慢或丢一次；15s/12s 是同网段
+        // 基线值，改成可配置，避免「映射其实通了但等待窗口太短」的假失败。
+        uint32_t waitMs = 15000;
+        uint32_t handshakeTimeoutMs = 12000;
         int fps = 20;
         CGDirectDisplayID displayID = CGMainDisplayID();
         NSUInteger saveFrames = 5;
@@ -674,6 +679,10 @@ int main(int argc, char **argv) {
                 connectHost = [NSString stringWithUTF8String:argv[++i]];
             else if (!strcmp(argv[i], "--advertise") && i + 1 < argc)
                 advertiseSpec = [NSString stringWithUTF8String:argv[++i]];
+            else if (!strcmp(argv[i], "--wait-ms") && i + 1 < argc)
+                waitMs = (uint32_t)atoi(argv[++i]);
+            else if (!strcmp(argv[i], "--handshake-ms") && i + 1 < argc)
+                handshakeTimeoutMs = (uint32_t)atoi(argv[++i]);
             else if (!strcmp(argv[i], "--preflight")) {
                 preflightRole = (i + 1 < argc && argv[i + 1][0] != '-')
                               ? [NSString stringWithUTF8String:argv[++i]] : @"host";
@@ -761,7 +770,7 @@ int main(int argc, char **argv) {
             }
 
             printf("等待客户端接入…\n");
-            if (![host waitForStreamingTimeoutMs:15000]) {
+            if (![host waitForStreamingTimeoutMs:waitMs]) {
                 printf("✗ 15s 内未进入 STREAMING: %s\n",
                        host.error.localizedDescription.UTF8String ?: "无客户端");
                 return 4;
@@ -1045,12 +1054,12 @@ int main(int argc, char **argv) {
 
         NSError *err = nil;
         printf("连接 %s:%u\n", connectHost.UTF8String, port);
-        if (![client startAsClientTo:connectHost port:port timeout:12000 error:&err]) {
+        if (![client startAsClientTo:connectHost port:port timeout:handshakeTimeoutMs error:&err]) {
             printf("✗ 握手失败: %s\n", err.localizedDescription.UTF8String);
             return 3;
         }
         printf("握手完成 %.1f ms\n", client.handshakeMs);
-        if (![client waitForStreamingTimeoutMs:15000]) {
+        if (![client waitForStreamingTimeoutMs:waitMs]) {
             printf("✗ 15s 内未进入 STREAMING: %s\n",
                    client.error.localizedDescription.UTF8String ?: "unknown");
             return 4;
