@@ -52,6 +52,9 @@ P0V-DisplayIsolation/recover_v2
 P0V-DisplayIsolation/recover_v4
 P0V-DisplayIsolation/recover_v5
 
+# P2 双机联调产物（日志/JSON，本地留证，不入库）
+P2-Dual/out/
+
 # M1 探针二进制
 M1-Skeleton/control_probe
 M1-Skeleton/quic_probe

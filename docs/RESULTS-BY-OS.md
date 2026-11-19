@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.6-draft |
-| 日期 | 2026-11-18 |
+| 版本 | v0.30-draft |
+| 日期 | 2026-11-19 |
 | 原则 | **结论绑定具体 OS build 与机器，禁止跨版本外推**。同一判据在 Sequoia 与 Tahoe 分别记录，未测就写未测。 |
 | 上位文档 | `docs/DESIGN.md` §8、`docs/DECISIONS.md` |
 
@@ -757,6 +757,156 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 
 ---
 
+### 5.11 Sequoia 15.5 客户端侧离线验证（2026-11-19 20:1x，Sequoia）
+
+跨网段 P2 联调前，先在**本机（Sequoia，本轮扮演 client）**跑一遍不依赖 TCC、
+不需要对端的客户端路径。此前 M1-B 上屏/输入的验证全部只在 Tahoe 做过。
+
+| 项 | 值 |
+|---|---|
+| 环境 | macOS **15.5 / 24F74** / Macmini8,1 / i5-9500 / x86_64 |
+| 显示 | 3 块：6016×3384（UI 3008×1692 @60，主屏）、1440×2560 竖屏、1920×1080 |
+| 网络 | en1 192.168.31.171；到公网端点 112.5.32.34 ICMP 8.2 ms（仅证明可达，不证明 UDP 映射） |
+| 代码 | commit `624cd94`，SDK 15.5、部署目标 13.0，本地重建 |
+| 会话 | `locked=0 asleep=0 onConsole=1 loginDone=1 activeDisplays=3` |
+
+| 验证项 | 结果 |
+|---|---|
+| 构建 | `stream_probe` / `test_skeleton` / `render_selftest` / `cursor_move` 全部通过 |
+| 单测 | **193/193**；`guardian_handshake_test` 的「无兜底拒绝禁屏」为 PASS |
+| 离屏上屏自检 | **ALL PASS**（颜色、尺寸、letterbox、第二帧覆盖、IOSurface 承载） |
+| 3440×1440 单帧渲染 | **66.5 / 74.0 / 77.2 ms**（3 次独立进程），Tahoe 同测试为 **10.4 ms** |
+| client preflight | `ok=1`，`ax=1 capture=1`，proto v2 / 18B / 1150B |
+
+**判读**：
+
+1. **客户端功能在 15.5 上成立**：编解码/上屏/letterbox/输入逻辑的离线判据全过。
+2. **渲染成本有显著 OS 差异**：同一份 `render_selftest`、同一颗 i5-9500 + UHD 630，
+   Tahoe 10.4 ms → Sequoia 66–77 ms。存在显示拓扑混杂因素（这台是 3 屏、主屏 6K 级
+   HiDPI，Tahoe 是 2 物理屏），但 20fps 的 50 ms 预算已被打穿是事实。
+   ⇒ **若 host 按原生 3440×1440 推流，Sequoia client 的上屏上限约 13–15fps，
+   且积压丢帧会先于链路问题出现**。本轮跨机建议 host 以 `--width 1920 --height 1080`
+   编码，或把该 OS 分支记入 NFR-03。
+3. **不得把 Tahoe 的 10.4 ms 客户端渲染值外推到 Sequoia**；反之亦然。
+4. 本机 preflight 的 `ax=1/capture=1` 来自 Qoder 会话继承（见 V-04 记录），
+   **不代表 `stream_probe` 作为独立 App 已获得授权**；本轮 client 角色不需要这两项。
+5. 未在本机执行：host 侧的 V-02/V-03/V-04/SPI 验收、M1-B 真鼠标端到端、
+   与 Tahoe host 的实际握手。A-02 状态不变。
+
+---
+
+### 5.12 P2 跨网段联调：边界 UDP 未通（2026-11-19 21:3x–21:4x）
+
+第一次跨公网联调，**连接未建立**。结论是网络边界问题，不是 host 进程、指纹或 TCC。
+
+| 项 | 值 |
+|---|---|
+| host | Tahoe **26.5.2** / Macmini8,1 / i5-9500 / x86_64；内网 `192.168.10.23`，WAN `112.5.32.34` |
+| client | Sequoia **15.5 / 24F74** / Macmini8,1 / i5-9500 / x86_64；`en1 192.168.31.171` |
+| 路径 | client → `112.5.32.34:46600/UDP` → host `:46600` |
+| 代码 / 指纹 | 两端 commit `624cd94`；指纹 `3305dec4…b1604` 与 host 打印一致 |
+
+**观察**：
+
+- client 侧窗口正常打开，握手 **30s 超时**，无其他错误码。
+- host 侧 `stream_probe --host --port 46600 --wait-ms 0` 持续运行；`lsof -nP -iUDP:46600`
+  显示 `UDP *:46600`，系统防火墙 `State = 0`，控制台一直打印「仍在等待对端」。
+- host 上 `tcpdump -ni en0 'udp port 46600'` 在 client 尝试期间捕获 **0 包**（pcap 0 字节）。
+- 对照：从 client 向 `112.5.32.34:46601` 发 20 个 UDP 包，host 抓 `udp port 46601`
+  同样 **0 包**；但 TCP 46601 的 SSH 登录正常。
+- client 出向 UDP 正常：`stun.l.google.com:19302` 4s 内返回 32B。
+
+**判读**：
+
+1. 不是 host 未启动、指纹错误、TCC 或客户端防火墙：host 在监听、指纹一致、client 能发 UDP。
+2. **边界设备没有可用的入站 UDP 映射**。TCP 46601 能转发只证明 TCP 路径；
+   UDP 46600 与 UDP 46601 都零包到达，可能是只建了 TCP 规则、内部目标 IP 不对，
+   或 CPE/ISP 对入站 UDP 有过滤。
+3. 本轮**没有取得任何 P2 指标**；A-02 状态不变。
+4. 待办：在边界设备加 `外部 UDP 46600 → 192.168.10.23:46600`，确认无 UDP 过滤；
+   若外部端口不同，client 用 `--port <外部端口>`。
+
+---
+
+### 5.13 P2 跨公网联调：Tahoe 26.5.2 host × Sequoia 15.5 client（2026-11-19 21:4x–22:0x）
+
+CPE 的入站规则从 TCP 改成 UDP 后，**首次跨公网端到端跑通**：握手、控制通道、视频、解码、上屏、输入回传全部成立。过程中挖出两个只在「长时间运行 + 重编」后出现的新根因（NEG-05、TCC 重编失效）。以下结论只属于 Tahoe host × Sequoia client 这一组合。
+
+| 项 | 值 |
+|---|---|
+| host | Tahoe **26.5.2 / 25F84** / Macmini8,1 / i5-9500 / x86_64；LAN `192.168.10.23`；WAN `112.5.32.34:46600` |
+| client | Sequoia **15.5 / 24F74** / Macmini8,1 / i5-9500 / x86_64；`en1 192.168.31.171` |
+| 路径 | client → `112.5.32.34:46600/UDP` → host `:46600`（外部与内部同端口） |
+| 代码 | 两端 `624cd94` + host 本地提交；`M1QuicTransport` 含 NEG-05 修复 |
+| 指纹 | `3305dec4…b1604`（两端一致） |
+
+**边界与握手**：CPE 改为 UDP 映射后，host 立刻出现 `已接受连接`，`lsof` 显示与 client 公网地址的 UDP 对；但握手仍 30s 超时且无错误码。
+
+#### NEG-05 临时钥匙串空闲自动上锁 → 签名阻塞
+
+- 现象与 NEG-02 同形：client 停在 preparing；host `sample` 卡在 `SecKeyCreateSignature`；securityd 日志同时出现 `unlocking for makeUnlocked()`、`code requirement check failed (-67050)`，随后拉起 SecurityAgent。
+- 真因：进程私有临时钥匙串是**旧式钥匙串，会按空闲时间自动上锁**。host 启动 18 分钟后才来第一次握手，签名时钥匙串已锁；securityd 只能弹 SecurityAgent 要密码，后台 CLI 永等不到。
+- 修法：创建后 `SecKeychainUnlock(..., promptUser=false)`；新增 `M1UnlockTempKeychain()`，在 `beginConnection`（客户端/入站共用）开头静默续解。**不要调用 `SecKeychainSetSettings`**——实测它自己会进 securityd 授权并卡住启动（sample 栈：`SecKeychainSetSettings → … → mach_msg`）。
+- 修后握手 **60.3–103.9ms**，随后稳定进入 STREAMING。
+
+#### TCC：ad-hoc 重编后屏幕录制授权失效
+
+- 重编后 `--preflight host` 变成 `ax=0 capture=0`，SCK 报 `The user declined TCCs`。ad-hoc 签名下 TCC 不随 identifier 保留，重编换 cdhash 即失效。
+- host 的 TCC 里 `com.apple.Terminal` 有 ScreenCapture（auth=2），而 `/usr/libexec/sshd-keygen-wrapper` 的 Accessibility 是 auth=0。于是用 `open -a Terminal /tmp/p2_host.command` 在 GUI 会话启动 host，继承 Terminal 的屏幕录制授权；AX 仍缺，故 host 用 `--inject record`（记录注入计划，不做真注入）。
+- 未做：在 host 上给 `M1-Skeleton/stream_probe` 单独授予屏幕录制/辅助功能；要走 `--inject real` 必须先补 AX。
+
+#### 实测 A：1920×1080 / 20fps（client 窗口 1280×720，20s）
+
+| 项 | host | client |
+|---|---|---|
+| 握手 | — | **103.9 ms** |
+| 采集 / 编码 / 发出 | 376 / 375 / 375 | 收齐 337 / 解出 54 / 上屏 32 |
+| 丢弃 / 失败 | 编码前 0 / 发送 0 | 分片丢弃 2779 / 解码 0 |
+| 首帧 | 524 ms | 1139 ms |
+| 单帧耗时 | 编码初始化 182 ms | 解码 0.9 ms / 渲染 84.7 ms（峰值 199.5） |
+| 控制通道最大间隔 | — | 1015 ms |
+| 输入 | 收到 4 / 计划 4（record） | 发出 4 / 丢弃 0 / 拒绝 0 |
+
+- `p2.sh summary`：结构性指标（STREAMING、解码>0、无发送失败、无畸形分片、控制间隔<3s）通过；但 **解码/发出 = 54/375 < 0.95 → 判定 FAIL**。
+- 这不是丢包：host 发出 3263 个包，client 收到 3202（98.1%）；2779 是客户端主动丢弃的帧分片。瓶颈是 **Sequoia 客户端 1080p 渲染 84.7ms/帧**（三屏、主屏 3008×1692@2x），跑不满 20fps。
+
+#### 实测 B：1280×720 / 10fps（client 窗口 1280×720，30s）
+
+| 项 | client |
+|---|---|
+| 握手 / 首帧 | 60.3 ms / 302 ms |
+| 收齐 / 解出 / 上屏 | 192 / 58 / 58（上屏积压丢 0） |
+| 解码 / 渲染 | 0.8 ms / **41.6 ms**（峰值 170.0） |
+| 控制通道最大间隔 | 1036 ms |
+| 输入 | 发出 4 / 丢弃 0 / 拒绝 0 |
+
+- 720p 源把客户端渲染压到 ~42ms，10fps（100ms 预算）有富余，上屏队列 0 积压；说明**网络与 720p 档本身可用**，A 的失败是客户端 1080p 渲染能力所限。
+- 本轮 host 侧 `remote-gui-720/host.json` **未生成**：期间另有一个 21:57:59 启动的 `p2.sh host`（PID 65555，输出 `remote-2206`）占着同一 46600，host 进程被替换，故只有客户端侧指标；需在端口独占后补一轮 host+client 完整 JSON。
+
+#### 补测 C/D：端口独占后的完整配对（22:0x，两轮 host+client JSON 都在）
+
+| 项 | C：3440×1440 / 20fps / 20s | D：1280×720 / 15fps / 30s |
+|---|---|---|
+| 握手 | 58.7 ms | 74.1 ms |
+| host 采集 / 编码 / 发出 | 392 / 391 / 391 | 444 / 443 / 443 |
+| host 编码前丢弃 / 发送失败 | 0 / 0（key 10，分片 7638，载荷 8.63MB） | 0 / 0（key 15，分片 2173，载荷 2.21MB） |
+| 首帧 | host 177 ms / client 2508 ms | host 110 ms / client 339 ms |
+| client 收齐 / 解出 / 上屏 | 340 / **7** / 4 | 401 / **136** / 129 |
+| client 分片丢弃 | 7444 | 1559 |
+| 解码 / 渲染 | 1.3 ms / 9.1 ms（峰 79.2） | 0.5 ms / 16.6 ms（峰 143.6） |
+| 控制通道最大间隔 | 1205 ms | 1806 ms |
+| summary 判定 | FAIL：7/391 | FAIL：136/443 |
+
+两轮都拿到 host+client 完整配对，`sendFailures=0`、状态序列两端一致、控制间隔 <2s，**结构性链路无问题**。同时更正实测 A 的解释：
+
+- **公网 UDP 确实丢包，且被严格按序的重组放大。** host 发 2253 片 / client 收 2151（94.1%），host 发 3263 / client 收 3202（98.1%）。`P1FrameReassembler`（`P1-ClientProbe/src/ProtocolCodec.m:302`）要求分片严格 `fragIdx` 连续，任一片丢失/错位就整帧作废并置 `needsKeyframe`，之后**一直等到下一个关键帧**（host 每 2s 一个）才恢复。4–6% 的丢包因此变成长时间停顿：720p15 下 30s 只解出 136/443（0.31），1080p20 下只解出 7/391。
+- **`framesDropped` 是分片计数，不是帧计数**：`M1FrameReceiver.m:208` 在等关键帧期间按 datagram 累加，所以出现 1559 > 443、7444 > 391 这种数字，不能除以 `framesCompleted` 解读。
+- **渲染不是 720p 档的瓶颈**：D 轮单帧 16.6ms（峰值 143.6），另一次加 `caffeinate -d -u` 的重跑反而 83.8ms/帧、只上屏 43 帧，单帧耗时波动大；3440×1440 档 84.7ms 才是渲染瓶颈。上屏数 ≈ 解出数（129/136），说明积压发生在**解码之前**。
+
+**结论（v0.27 更正）**：跨公网 P2 结构链路成立（Tahoe 26.5.2 host × Sequoia 15.5 client）；A-02（glass-to-glass 60fps）仍开放。P2 跨公网的首要缺口**不是渲染，而是"严格按序重组 + 丢一片等 2s 关键帧"**：在 4–6% 丢包的 WAN 上吞吐跌到 0.3 以下。下一步应做重组容错（分片位图 + 帧截止时间，乱序可用）和/或更密的关键帧/丢包后立即请求关键帧；这属于协议改动，需先定方案。Sequoia 渲染上限（3440×1440 下 84.7ms）是独立的第二瓶颈，不能外推 Tahoe 的 10.4ms。
+
+---
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe |
@@ -765,7 +915,7 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 |
 | A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
 | A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） |
-| A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。双机端到端延迟仍未测（M1-A 第 4 步已打通跨进程推流：1920×1080、零丢帧、控制通道未被挤占，但仍是单机 loopback），A-02 保持开放且帧管线参数暂不冻结，见 D-10 |
+| A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。2026-11-19 跨公网已取得首批双机数据（§5.13，Tahoe host × Sequoia client）：1080p20 客户端渲染 84.7ms/帧、解码/发出 54/375；720p10 渲染 41.6ms、上屏 0 积压；补测 C/D 拿到完整配对（3440×1440 → 7 解出；720p15 → 136/443，丢包 4–6% + 严格按序重组等关键帧是主因）。无 60fps / glass-to-glass 证据，A-02 保持开放，见 D-10 |
 
 ---
 
@@ -784,6 +934,7 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 - v0.11-draft 2026-11-18 17:10：**新增 §5.5 QUIC datagram 帧通道实测（M1-A 第 1/2 步）**。400 帧/1200 分片/1.22MB 环回零丢失零重复零乱序，协商上限 1497B，9.6Mbps。两条硬结论：① 瞬时突发 1200 片丢 43.6%（整帧级），发送必须按帧节奏投递；② 指纹不符只 `complete(false)` 会吊在 preparing（20s 无结论），必须主动 cancel（D-13 C-13.3）。待查：偶发 6–11s 握手离群。
 - v0.12-draft 2026-11-18 18:55：**新增 §5.6 控制通道端到端 + 两个结论更正**。控制通道 8 态在真实 QUIC 连接上跑通（`--self` 5/5、两进程 host/client 通过、148 单测全过、握手 13.5–19.3ms）。三处更正：① **§5.5 的「6–11s 离群疑为 QUIC Initial 退避」作废**——真因是 p12 私钥的 keychain ACL 触发 securityd 授权阻塞，`SecKeyCreateSignature` 卡在 `mach_msg`，服务端发不出 `CertificateVerify`，客户端永停 `preparing` 且无错误码（NEG-02）；② **「QUIC stream 模式不可用」作废**——复核握手 64.6/80.4ms 正常，此前失败同因（NEG-01），D-14 改按「一个连接一条流」立论；③ 「证书材料随机损坏」假象撤回。修复：临时钥匙串 + ACL 信任当前进程 + 进程内单次导入。
 - v0.13-draft 2026-11-18 19:10：**新增 NEG-04 授权弹窗复发根因与清理**。NEG-02 修完之后弹窗仍在，原因是 ① 仓库里 `quic_probe`/`pipeline_probe`/`pipeline_kiosk_probe`/`driver_probe` 四份二进制是修复前编的，仍走登录钥匙串旧路径；② `M1CopyIdentity` 在临时钥匙串创建失败时静默回退到登录钥匙串。修法：全部重建、删除回退分支（失败即报错）、临时钥匙串先 unlink 防 PID 复用残留、新增 `cleanup_stale_identities.sh`，并清掉登录钥匙串里 30 张残留测试证书。验证：`--self` 5/5（12.4–14.7ms）、`quic_probe` 默认 500 帧退出码 0、148 断言全过，且跑完后 `SecurityAgent` 不再出现。
+- v0.30-draft 2026-11-19 22:1x：**补齐同一轮跨公网的双端配对，并限定 v0.29「数据面 PASS」的范围**。v0.29 只有 host 侧；本轮在同一 host 上跑 client 并留档：3440×1440/20fps/20s → client 收齐 340 / 解出 **7** / 上屏 4；720p/15fps/30s → host 444/443/443、client 收齐 401 / 解出 **136** / 上屏 129，两轮 `sendFailures=0`、控制间隔 <2s。真因：公网 UDP 到达率 94–99%，而 `P1FrameReassembler` 严格按序、丢或乱一片即整帧作废，且 client 的 `onNeedKeyframe` 只计数、wire 上没有 `keyframe-request`，只能等 host 每 2s 的周期关键帧——丢一片被放大成 2s 停顿，解码率跌到 0.31（720p15）/0.02（3440×1440）。另更正 `framesDropped` 是分片计数（1559 > 443），不可当帧数；720p 渲染 16.6–83.8ms 波动，不是该档瓶颈。NEG-05（临时钥匙串空闲上锁阻塞签名）已在 §5.13 记录并修复。下一步见 `docs/P2-NEXT-PLAN.md`：P2.1 位图重组+关键帧请求+帧口径指标 → P2.2 虚拟屏会话接入 → P2.3 渲染。
 - v0.29-draft 2026-11-19 22:0x：**跨网段端到端首次跑通（P2 数据面 PASS）**。Sequoia 那台从公网 `112.47.109.8:21026` 连入，状态链完整 `DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → STREAMING → CLOSED`。实测：采集 3440×1440、`captured=392 / encoded=391 / sent=391`、`dropPreEnc=0 / encFail=0 / sendFail=0`、keyframe 10、payload 8,626,350B、`fragmentsSent=7638`、协商 `maxDatagram=1176`；首帧发出 107ms（采集首帧 177ms）；控制包 100、最大控制间隔 1083ms；约 20.1s 内 391 帧 ≈ **19.5 fps（目标 20）**、约 **3.4 Mbps**。`stateLog` 结尾 `CLOSED` 是 client 主动按 Esc 结束（本次只测数据面）。**输入通路未验证**：`inputReceived=0 / inputInjected=0 / cursorMovedPx=0`——client 侧没有产生鼠标事件。上一轮 `-9858` 失败最可能原因是**两端二进制不同 commit**（client 未 `git pull` 重建），本轮同 commit 后一次握手通过；单客户端重连修复（C-17.27）本轮未被触发验证，需再做一次「先失败再重试」的用例。
 - v0.28-draft 2026-11-19 22:0x：**首次跨网段实测有进展但握手未成**。host 以 `P2_WAIT_MS=0` 等 1070s 时出现 `[host] 已接受连接` —— 说明 `112.5.32.34:46600` 的 UDP 映射**通了**，client 的包确实到达本机；随后始终没有 `控制通道就绪`，直到 ~1400s 报 `连接失败：-9858`（当时只打裸码，无法区分 TLS/MTU/RST）。排查中发现两个真问题并已修：①**单客户端模型不接重连**——第一次入站连接失败后 `acceptedConnection` 一直非 nil，后续重试全被 cancel（`parentListener` + `rearmParentListener` 修复）；②错误日志缺 domain 与对端地址（`M1DescribeNWError` 补 tls 域、`peerDescription` 打印 `IP:port`）。另 `p2.sh host` 增端口占用预检（子进程会在父 shell 被杀后存活，导致 `监听失败：48`）。重建后单测 193/193 PASS，host 以 `M1_QUIC_DEBUG=1` + `P2_WAIT_MS=0` 重启等复测。
 - v0.27-draft 2026-11-19 21:2x：host 支持**无限等待**——`--wait-ms 0` / `P2_WAIT_MS=0`，用 10s 切片等待并每片打印「仍在等待对端…已等 Ns」，不再因 15 分钟窗口到期退出；`p2.sh` 同步把 `caffeinate` 提到 86400s（无限等待时屏睡会导致 SCK 无帧）。实测 `--wait-ms 0` 在 46633 端口 10s 后正确打印心跳；单测 193/193 PASS；host 已用该模式在 46600 重启，等 Sequoia 侧重连。

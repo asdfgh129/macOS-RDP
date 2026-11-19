@@ -141,6 +141,7 @@ protocol 注入协调器、Swift 调 ObjC 纯函数/类），会话序列端到�
    **双机操作单见 `../docs/P2-CHECKLIST.md`，脚本是 `../P2-Dual/p2.sh`**
    （`preflight | host | client | summary`）。客户端侧用 `--connect <IP>` 指定对端，
    服务端端口已固定（`nw_listener_create` 会忽略端口，已改用 `nw_listener_create_with_port`）。
+   **跨公网实测后的下一步见 `../docs/P2-NEXT-PLAN.md`**（P2.1 重组容错+关键帧请求 → P2.2 虚拟屏会话接入 → P2.3 渲染）。
 
 ## 按 OS 记录
 

@@ -3,6 +3,8 @@
 本文是**今晚照着做**的操作单：两台机器、三十步以内、每步都有可核对的输出。
 所有脚本都在 `P2-Dual/`，二进制在 `M1-Skeleton/`。
 
+> 跨公网实测后的下一步安排见 `docs/P2-NEXT-PLAN.md`；本文只描述"怎么跑、怎么判、出错查什么"。
+
 ---
 
 ## 0. 角色与拓扑
@@ -37,6 +39,14 @@
 | 防火墙 | host 入站放行 UDP 46600（或映射后的外部端口）；macOS 自带防火墙可关或给 `stream_probe` 放行 | 见 §1.1 |
 
 端口统一用 **46600/UDP**（`P2_PORT` 可改，两端内部端口要一致；跨网段时 client 的 `--port` 用映射后的外部端口）。
+
+### 重编与 TCC（2026-11-19 跨公网实测）
+
+ad-hoc 签名下 TCC 按 **cdhash** 记录；每次 `build_stream_probe.sh` 都会换 cdhash，屏幕录制/辅助功能授权随之失效（preflight 变 `capture=0 ax=0`，SCK 报 `The user declined TCCs`）。远程 host 没有手动授权入口时：
+
+- 用**已获屏幕录制授权的 Terminal** 在 GUI 会话启动：把启动命令写进 `host.command`，再 `open -a Terminal /path/to/host.command`。`stream_probe` 作为 Terminal 的子进程继承屏幕录制授权。
+- sshd 的辅助功能通常是拒绝态，`--inject real` 仍不可用；先加 `--inject record` 跑结构指标。
+- 要走真注入，必须在 host 的「系统设置→隐私与安全性→辅助功能」里给 `stream_probe`（或 Terminal）授权；重编后要重新授权。
 
 ---
 
@@ -183,6 +193,11 @@ P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
 - client 侧**不需要任何 TCC 授权**（不采集、不注入）；Sequoia 上只需 Xcode CLT
   和网络可达。它的 3 块屏（含竖屏）与客户端窗口无关。
 - 窗口出现后**点一下窗口**再动鼠标：只有前台应用才会收到 `mouseMoved`。
+- **上屏分辨率上限（2026-11-19 Sequoia 15.5 实测）**：3440×1440 单帧渲染 **66–77 ms**
+  （Tahoe 同测试 10.4 ms），20fps 的 50 ms 预算会被打穿，表现为积压丢帧而不是链路丢包。
+  跨机首跑建议 host 以 1080p 编码：`stream_probe --host ... --width 1920 --height 1080`
+  （`p2.sh host` 目前不透传宽高；直接调用 `stream_probe` 或在 host 侧补参数）。
+  看到客户端 `framesDropped` 偏高时先核对 `lastRenderMs`，不要先怀疑网络。
 
 正常输出顺序：
 
@@ -215,6 +230,12 @@ P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
 | 客户端上屏 | ≥ 1 帧且 fps ≥ 0.8×目标 | 窗口不可见会被跳过（`renderSkippedOccluded`） |
 | 输入 | `inputInjected ≥ 5` 且 `cursorMovedPx > 0` | 真注入必须体现在主机光标上 |
 
+> `解码/发出 ≥ 0.95` 只有在**链路不丢包、客户端渲染能跟上目标帧率**时才有意义。
+> - 2026-11-19 跨公网（Tahoe host × Sequoia client）实测：host `sendFailures=0`，但公网 UDP 丢包 4–6%（2253→2151、3263→3202），而 `P1FrameReassembler` 要求**严格按序**：丢一个分片整帧作废并 `needsKeyframe=YES`，然后一直等下一个关键帧（host 每 2s 一个）。720p15 下 443 帧只解出 136（0.31），1080p20 下 375 帧只解出 54。
+> - 另注意 `framesDropped` 的语义是**等待关键帧期间丢弃的分片数**（`M1FrameReceiver.m` 里按 datagram 累加），会远大于发送帧数，不要当"帧数"读。
+> - 渲染端：Sequoia 上 3440×1440 实测 84.7 ms/帧，是独立瓶颈；720p 下单帧 16.6–41.6 ms，不是主要瓶颈。
+> 结论：跨机先看丢包与关键帧间隔，再谈帧率；该阈值目前只在 LAN/近零丢包路径上可期。
+
 延迟指标（记数字，不设硬门禁，A-02 仍开放）：
 
 | 指标 | 参考值（单机基线） | 备注 |
@@ -236,13 +257,16 @@ P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
 | host 打印的 IP 是内网地址、客户端连不上 | 没传 `P2_ADVERTISE` | host 加 `P2_ADVERTISE=公网IP:映射端口`，让打印的三项变成对外地址 |
 | 映射端口 ≠ 46600 但客户端仍连 46600 | client 没指定外部端口 | `./p2.sh client --host <公网IP> --port <外部端口> --fingerprint ...` |
 | 从 host 自己连公网 IP 不通 | 多数 NAT 不支持 hairpin，属预期现象 | 不要据此判断映射失败；从另一网段的 client 实测 |
+| 握手超时，host 抓包 UDP 46600 **0 包** | 边界只有 TCP 映射，或 CPE/ISP 过滤入站 UDP | 在路由器加 `外部 UDP 46600 → host内网IP:46600`；先核对内部目标 IP。**TCP 端口通不代表 UDP 通**（可分别抓包对照） |
 | 跨网段 12s 内握手超时 | 默认超时按同网段设的，偏短 | `P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000` |
 | SSH `Connection refused` | 远程登录没开 | `P2-Dual/enable_ssh.sh enable` |
 | SSH `Connection timed out` | 只映射了 UDP，没映射 TCP | 加 `TCP 46601 → 192.168.10.23:22` |
 | SSH 能登但采集失败 | 不在 GUI 会话 | `./gui-run.sh ./p2.sh host` |
 | 握手卡在 `preparing` 且无错误码 | 证书材料不可用（旧二进制 / 钥匙串 ACL 弹窗） | 看有没有 SecurityAgent 弹窗；重跑 `./gen_quic_identity.sh` 后重建 |
+| 握手永久 `preparing`，`sample` 停在 `SecKeyCreateSignature`，securityd 日志有 `unlocking for makeUnlocked` | 旧式临时钥匙串空闲自动上锁，签名时 securityd 拉 SecurityAgent 并阻塞（NEG-05） | 已在 `M1QuicTransport.m` 修：创建时静默续解 + 每次 `beginConnection` 前 `M1UnlockTempKeychain`；**不要**用 `SecKeychainSetSettings`，它自身要授权，会死锁 |
 | 端口和 `--port` 不一致 | **已修**：`nw_listener_create` 会忽略端口，改用 `nw_listener_create_with_port` | 本次已修，host 会打出真实端口 |
 | `capture=0` / 主机无帧 | 缺屏幕录制授权 | 勾选后**重启进程** |
+| `--preflight host` 由 `capture=1` 变 `capture=0`，日志 `The user declined TCCs` | 重编后 ad-hoc cdhash 变了，老授权对不上 | 在 GUI 里点「允许」，或按 GUI 方式启动（`open -a Terminal host.command`）以继承 Terminal 已有的屏幕录制授权；SSH 直启的进程拿不到 |
 | `ax=0` / 主机光标不动但 `inputReceived>0` | 缺辅助功能授权，`CGEventPost` 被静默丢弃 | 勾选；**先定稿再授权，重编会让授权失效**（按 cdhash 记） |
 | 主机有帧、客户端不显示 | 窗口被遮/不可见 → `renderSkippedOccluded` | 把窗口拿到最前 |
 | 画面在动但鼠标不动 | 客户端窗口不是前台应用 | 点一下窗口再动 |
