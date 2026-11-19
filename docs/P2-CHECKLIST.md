@@ -85,6 +85,38 @@ P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
 
 ---
 
+## 1.2 远程 SSH 驱动测试（可选，让 Sequoia 远程操作本机）
+
+想从 Sequoia 直接 SSH 进来跑 host、收结果时，需要额外做的三件事
+（**SSH 走 TCP，§1.1 那条 UDP 规则对它无效**）：
+
+| 项 | 内容 |
+|---|---|
+| 远程登录 | 本机「系统设置 → 通用 → 共享 → 远程登录」打开（当前是关闭的） |
+| 端口映射 | 防火墙上新增 **TCP `<外部端口，建议 46601>` → `192.168.10.23:22`** |
+| 密钥 | Sequoia 的公钥放进本机 `~/.ssh/authorized_keys`（600 权限） |
+
+一条命令完成前两项（脚本幂等，`status` 只读）：
+
+```bash
+cd P2-Dual
+./enable_ssh.sh status                 # 体检
+./enable_ssh.sh enable                 # 开远程登录（sudo）
+./enable_ssh.sh add-key '<公钥>'        # 放密钥
+./enable_ssh.sh harden                 # 确认密钥可登后再关密码登录
+```
+
+**两个必须知道的坑**（否则会误判成「采集坏了」）：
+
+1. SSH 会话不在 GUI 会话，`stream_probe` 的采集/注入需要 WindowServer —— 必须用
+   `./gui-run.sh ./p2.sh host` 把进程塞回 `gui/501` 再跑。
+2. 首次的「屏幕录制 / 辅助功能」授权弹窗在 SSH 里看不到，要先在屏幕前或屏幕共享里
+   点掉一次。
+
+完整说明（含反向隧道、Tailscale 备选、排错表）见 `docs/SSH-SETUP.md`。
+
+---
+
 ## 2. host 端（被控机）
 
 ```bash
@@ -202,6 +234,9 @@ P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
 | 映射端口 ≠ 46600 但客户端仍连 46600 | client 没指定外部端口 | `./p2.sh client --host <公网IP> --port <外部端口> --fingerprint ...` |
 | 从 host 自己连公网 IP 不通 | 多数 NAT 不支持 hairpin，属预期现象 | 不要据此判断映射失败；从另一网段的 client 实测 |
 | 跨网段 12s 内握手超时 | 默认超时按同网段设的，偏短 | `P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000` |
+| SSH `Connection refused` | 远程登录没开 | `P2-Dual/enable_ssh.sh enable` |
+| SSH `Connection timed out` | 只映射了 UDP，没映射 TCP | 加 `TCP 46601 → 192.168.10.23:22` |
+| SSH 能登但采集失败 | 不在 GUI 会话 | `./gui-run.sh ./p2.sh host` |
 | 握手卡在 `preparing` 且无错误码 | 证书材料不可用（旧二进制 / 钥匙串 ACL 弹窗） | 看有没有 SecurityAgent 弹窗；重跑 `./gen_quic_identity.sh` 后重建 |
 | 端口和 `--port` 不一致 | **已修**：`nw_listener_create` 会忽略端口，改用 `nw_listener_create_with_port` | 本次已修，host 会打出真实端口 |
 | `capture=0` / 主机无帧 | 缺屏幕录制授权 | 勾选后**重启进程** |

@@ -836,6 +836,8 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.21 | 控制端换成 Sequoia 15.5 那台时，两端必须同一 commit 且各自本地构建（部署目标 13.0）；client 侧无 TCC 前置，host 侧仍需屏幕录制+辅助功能。`--inject real` 的 CGEventPost 授权按二进制 code requirement 记，`stream_probe` 用固定签名标识 `com.m1.pipeline`，重编不掉授权 | `build_stream_probe.sh` / `docs/P2-CHECKLIST.md` §3 || C-17.21 | 控制端换成 Sequoia 15.5 那台时，两端必须同一 commit 且各自本地构建（部署目标 13.0）；client 侧无 TCC 前置，host 侧仍需屏幕录制+辅助功能。`--inject real` 的 CGEventPost 授权按二进制 code requirement 记，`stream_probe` 用固定签名标识 `com.m1.pipeline`，重编不掉授权 | `build_stream_probe.sh` / `docs/P2-CHECKLIST.md` §3 |
 | C-17.22 | 跨网段必须放宽等待窗口：host 等客户端 15s、client 握手 12s 都是同网段基线值，NAT/防火墙下容易假失败。`--wait-ms` / `--handshake-ms`（`P2_WAIT_MS` / `P2_HANDSHAKE_MS`）可配，本轮建议 60000/30000 | `stream_probe` / `p2.sh` |
 | C-17.23 | 从 host 本机经公网 IP 回环连自己失败**不能作为映射失效的证据**（NAT 通常不支持 hairpin）；本环境 UDP 出向 STUN 也超时，无法从内侧确认。唯一判据是另一网段 client 实际握手 | `docs/P2-CHECKLIST.md` §1.1 |
+| C-17.24 | 远程 SSH 接入**不引入第三方软件**，用系统自带 sshd：开「远程登录」+ `authorized_keys` + 一条 **TCP 映射**（建议外部 46601 → 192.168.10.23:22）。§1.1 的 UDP 46600 规则对 SSH 无效，这是「UDP 通了 SSH 连不上」的根因。加固只写 `/etc/ssh/sshd_config.d/200-p2-automation.conf`，`harden` 在 `authorized_keys` 为空时拒绝执行 | `P2-Dual/enable_ssh.sh` / `docs/SSH-SETUP.md` |
+| C-17.25 | SSH 会话不在 Aqua 会话，`stream_probe` 的 SCShareableContent/CGEventPost 依赖 WindowServer；远程驱动 host 必须用 `launchctl asuser 501 sudo -u bemin` 包一层（`P2-Dual/gui-run.sh`）。TCC 授权弹窗无法从 SSH 应答，首次仍需在 GUI/屏幕共享里点掉 | `P2-Dual/gui-run.sh` / `docs/SSH-SETUP.md` §6 |
 
 ### 代价与边界
 
