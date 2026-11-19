@@ -3,6 +3,10 @@
 目的：让另一网段那台 **Sequoia 15.5** 通过 SSH 登进本机，远程跑 `P2-Dual/p2.sh`、
 看日志、收 JSON，实现半自动双机验收。
 
+> **状态（2026-11-19 21:2x）：已打通。** 远程登录已开、Sequoia 公钥已写入
+> `~/.ssh/authorized_keys`（`SHA256:f3pQpQPFvqcLiPwpi0oZdUs8JGKpHDxKDV+osBk+uQA`），
+> 远程 SSH 登录正常，host 端已能由远程驱动。下面保留完整步骤作为复现与排错依据。
+>
 > **结论先说：不需要安装任何第三方软件。** macOS 自带 OpenSSH 服务端（当前
 > `OpenSSH_10.2p1`），缺的只是「打开开关 + 放密钥 + 放行 TCP 端口」三件事。
 

@@ -16,6 +16,9 @@ P0-TahoeProbe/diag2
 *.stderr.log
 P0-TahoeProbe/build*.log
 
+# 双机联调产物（每次运行一个新目录，不入库）
+P2-Dual/out/
+
 # macOS / Python 噪声
 .DS_Store
 __pycache__/
