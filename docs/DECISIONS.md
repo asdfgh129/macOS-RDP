@@ -828,6 +828,7 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.11 | 上屏正确性用**离屏自检**（喂已知图案、采样 `layer.contents`）而非只靠肉眼截图：颜色通道反转在截图里不容易发现 | `tools/render_selftest.m` |
 | C-17.14 | 端到端驱动分流：`cursor_move ax` 判定 `AXIsProcessTrusted`，有授权用真光标（`physical`），没有则客户端用 `--input-synth` 进程内投 `NSEvent`（`synth`）。无授权时光标位移动得动但 `mouseMoved` 一条都不到，只看光标会误判成客户端没采集 | `verify_m1b.sh` / `stream_probe` |
 | C-17.15 | 同一 `NSEvent` 会因「hit-test 视图 + tracking area owner 同体」被投两次，按**时间戳 + 窗口内坐标**去重，避免每次移动发 2 条上行 | `M1FrameView mouseMoved:` |
+| C-17.16 | 第三种驱动 `--manual SECS`：代码只发「现在动鼠标」的信号（响 3 声 + 窗口标题倒计时 + `[manual]` 横幅），由真人操作。理由：`physical` 需要「窗口前台且人不碰鼠标」的窗口期、`synth` 缺 OS 投递一跳，而这一跳只有真鼠标能覆盖。判据放宽为「横向跨度 ≥ 画面宽 10%」，不判落点。实测人的反应延迟约 7 s ⇒ 未收到任何事件时每 5 s 再提醒一次 | `stream_probe --manual` / `verify_m1b.sh M1B_DRIVER=manual` |
 
 ### 代价与边界
 

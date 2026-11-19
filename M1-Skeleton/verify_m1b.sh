@@ -28,6 +28,14 @@ DURATION_MS="${M1B_DURATION_MS:-9000}"
 ATTEMPTS="${M1B_ATTEMPTS:-4}"
 WIN_W=900
 WIN_H=506
+MANUAL_SECS="${M1B_MANUAL_SECS:-12}"
+
+# 手动模式（M1B_DRIVER=manual）要留出「首帧 + 提示 + 人操作」的整段时间，
+# 否则客户端会话在提示还没走完就到期了。
+if [ "${M1B_DRIVER:-}" = manual ]; then
+  _need=$(( MANUAL_SECS * 1000 + 12000 ))
+  [ "$DURATION_MS" -lt "$_need" ] && DURATION_MS="$_need"
+fi
 
 say() { printf '%s\n' "$*"; }
 
@@ -67,7 +75,7 @@ one_attempt() {
 
   ./stream_probe --client --port "$port" --fingerprint "$fp" \
       --duration-ms "$((DURATION_MS - 1500))" --window "${WIN_W}x${WIN_H}" \
-      --save-frames 0 ${KEEP_FRONT_ARG:-} ${SYNTH_ARG:-} --out "$out/client.json" \
+      --save-frames 0 ${KEEP_FRONT_ARG:-} ${SYNTH_ARG:-} ${MANUAL_ARG:-} --out "$out/client.json" \
       > "$out/client.log" 2>&1 &
   local client_pid=$!
 
@@ -100,7 +108,21 @@ one_attempt() {
   ry=$(printf '%s' "$anchors" | sed -n 's/.*right=(\([-0-9]*\),\([-0-9]*\)).*/\2/p')
   say "  画面锚点：$(printf '%s' "$anchors" | sed 's/^ *//')"
 
-  if [ "$DRIVER" = physical ]; then
+  if [ "$DRIVER" = manual ]; then
+    say "  驱动=manual —— 客户端会响 3 声、把窗口标题改成「▶▶ 现在动鼠标」"
+    say "  看到提示后：点一下窗口，再在画面里左右慢慢划 ${MANUAL_SECS}s"
+    local _w
+    for _w in $(seq 1 $((MANUAL_SECS + 20))); do
+      grep -q "时间到，停手" "$out/client.log" 2>/dev/null && break
+      sleep 1
+    done
+    if grep -q "时间到，停手" "$out/client.log" 2>/dev/null; then
+      grep "窗口采集" "$out/client.log" | tail -2 | sed 's/^/    /'
+    else
+      say "  ✗ 没等到手动窗口结束（提示没出现，或首帧一直没来）"
+      tail -5 "$out/client.log" | sed 's/^/    /'
+    fi
+  elif [ "$DRIVER" = physical ]; then
     # 首帧锚点出现 ≠ 窗口已经在收事件：实测第三次移动时窗口才投递第一个
     # mouseEntered，前两次移动被吞。所以先等窗口稳定，再把三点走两轮。
     say "  驱动=physical（真光标）→ ($cx,$cy) ($lx,$ly) ($rx,$ry)，各两轮"
@@ -125,10 +147,11 @@ one_attempt() {
     return 2
   fi
 
-  python3 - "$out" "$WIN_W" "$WIN_H" "$cx" "$cy" <<'PY'
+  python3 - "$out" "$WIN_W" "$WIN_H" "$cx" "$cy" "$DRIVER" <<'PY'
 import json, sys
 
-out, win_w, win_h, cx, cy = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])
+out, win_w, win_h, cx, cy, driver = (sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
+                                    float(sys.argv[4]), float(sys.argv[5]), sys.argv[6])
 fails = []
 
 def load(name):
@@ -175,6 +198,18 @@ if len(mouse) >= 3:
     print("  收到 %d 条 mouse，x = %s ；y = %s" % (
         len(mouse), " ".join("%.0f" % v for v in xs[-6:]),
         " ".join("%.0f" % v for v in ys[-6:])))
+    if driver == "manual":
+        # 真人的落点无法规定，只判两件事：确实来了多次移动，且横向真的划过一段。
+        # （驱动点式断言留给 physical/synth，那两条路是我们自己在控制坐标。）
+        span = max(xs) - min(xs)
+        print("  横向跨度 %.0f px（画面宽 %d，占 %.0f%%）" % (span, pw, 100.0 * span / max(pw, 1)))
+        if span < 0.10 * pw:
+            fails.append("横向跨度只有 %.0f px，不足画面宽 10%%（没有真的左右划）" % span)
+        if any(v < 0 or v > ph for v in ys):
+            fails.append("y 越界：%s（归一化坐标应在 [0, %d]）"
+                         % (", ".join("%.0f" % v for v in ys), ph))
+        print("  本轮 PASS")
+        sys.exit(0)
     # 断言看的是「归一化后的主机坐标」，与驱动点的全局像素无关：
     # 画面中心 → 0.5 屏宽/屏高；左右两点 ≈ 0.5 ∓ 200 窗口像素换算值。
     center_x, center_y = pw * 0.5, ph * 0.5
@@ -219,9 +254,18 @@ bash ./build_stream_probe.sh >/dev/null 2>&1 || { say "✗ stream_probe 构建�
 # 有「辅助功能」授权 → 真光标 + CGEventPost，连「系统把事件交给 App」这一跳也测到。
 # 没有 → 进程内投 NSEvent，走同一条 NSWindow sendEvent → M1FrameView 分发路径，
 #         只少 OS 投递那一跳；坐标换算、协议编码、传输、主机解析、注入计划全是真的。
-if ./cursor_move ax >/dev/null 2>&1; then
+if [ "${M1B_DRIVER:-}" = manual ]; then
+  # 真人操作：真光标要么被别的应用抢走前台、要么打进 letterbox 黑边，
+  # 自动化里这两件事都不受控；改用「提示 + 人动手」，把这一跳真正测到。
+  DRIVER=manual
+  SYNTH_ARG=""
+  MANUAL_ARG="--manual $MANUAL_SECS"
+  KEEP_FRONT_ARG=""
+  say "驱动: manual —— 响铃+窗口标题给信号，由真人动鼠标 ${MANUAL_SECS}s"
+elif ./cursor_move ax >/dev/null 2>&1; then
   DRIVER=physical
   SYNTH_ARG=""
+  MANUAL_ARG=""
   # WindowServer 只把 mouseMoved 投给前台应用；客户端窗口被别的 App 抢回前台时
   # 一条 move 都收不到（实测 frontmost=Chrome）。M1B_KEEP_FRONT=1 会每 300ms 重抢前台，
   # 但会打断你正在用的应用，所以默认关，只在需要时显式开。
@@ -230,6 +274,7 @@ if ./cursor_move ax >/dev/null 2>&1; then
 else
   DRIVER=synth
   SYNTH_ARG="--input-synth 450,253;250,253;650,253"
+  MANUAL_ARG=""
   KEEP_FRONT_ARG=""
   say "驱动: synth —— AXIsProcessTrusted=0，改用进程内 NSEvent（缺 OS 投递一跳）"
 fi

@@ -455,8 +455,58 @@ static void PrintUsage(void) {
         "  stream_probe --client --port N --fingerprint HEX [--duration-ms N]\n"
         "                    [--outdir DIR] [--save-frames N] [--out JSON]\n"
         "                    [--window [WxH]] [--keep-front] [--input-synth \"X,Y;X,Y;...\"]\n"
+        "                    [--manual SECS]\n"
         "  --input-synth: 进程内合成鼠标移动（内容坐标，左上原点），\n"
-        "                 用于驱动端没有辅助功能授权、无法投递系统事件时。\n");
+        "                 用于驱动端没有辅助功能授权、无法投递系统事件时。\n"
+        "  --manual:      不造事件，改为给出「立刻动鼠标」的提示（响铃 3 声 + 窗口标题 +\n"
+        "                 倒计时日志），由真人去操作，SECS 秒后提示停手。\n");
+}
+
+// 手动驱动提示：自动化里驱动不了「真人动鼠标」这一跳——真光标要么被前台应用抢走，
+// 要么打进 letterbox 黑边。这里反过来：代码只负责给出无歧义的开始/结束信号，
+// 由人真的去操作。信号三路冗余（响铃 / 窗口标题 / 日志）：操作的人可能在看窗口
+// 而不看终端，也可能终端被滚屏淹没。
+static void M1StartManualCue(NSWindow *win, M1FrameView *view,
+                             M1ControlSession *session, int secs) {
+    static BOOL started = NO;
+    if (started || secs <= 0 || !win || !view) return;  // 首帧回调与兜底定时器都会调，只认第一次
+    started = YES;
+
+    for (int i = 0; i < 3; i++) NSBeep();
+    win.title = [NSString stringWithFormat:
+                 @"▶▶ 现在动鼠标：点一下窗口，在画面里左右划 %d 秒", secs];
+    printf("\n[manual] ================ 开始：现在动鼠标 ================\n");
+    printf("[manual] ① 先点一下这个客户端窗口（要它成为前台应用，否则系统不投递移动事件）\n");
+    printf("[manual] ② 在画面区域里左右慢慢划，别停在上下黑边上\n");
+    printf("[manual] ③ %d 秒后自动结束（再响一声），窗口标题里有倒计时\n", secs);
+    printf("[manual] =====================================================\n");
+    fflush(stdout);
+
+    for (int s = 1; s <= secs; s++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(s * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            int left = secs - s;
+            // 实测反应延迟有 7s 左右（第一轮 18s 里前 7s 采集一直是 0 条）：
+            // 一条都没收到就每 5 秒再提醒一次，别让人错过那三声。
+            BOOL idle = (view.inputEventsEmitted == 0);
+            if (idle && left > 0 && (s % 5) == 0) {
+                NSBeep(); NSBeep();
+                printf("[manual] （还没收到任何移动——点一下窗口，在里面划两下）\n");
+            }
+            win.title = [NSString stringWithFormat:@"%@▶▶ 动鼠标（剩 %d 秒）· 已采集 %lu 条",
+                         idle ? @"？" : @"", left, (unsigned long)view.inputEventsEmitted];
+            printf("[manual] 剩 %2d 秒 · 窗口采集 %lu 条 · 已上行 %lu 条\n", left,
+                   (unsigned long)view.inputEventsEmitted,
+                   (unsigned long)session.inputEventsSent);
+            fflush(stdout);
+            if (left <= 0) {
+                NSBeep();
+                win.title = @"✓ 时间到，可以停手了（等收尾统计）";
+                printf("[manual] ================ 时间到，停手 ================\n");
+                fflush(stdout);
+            }
+        });
+    }
 }
 
 static NSData *JSONData(NSDictionary *dict) {
@@ -486,6 +536,7 @@ int main(int argc, char **argv) {
         NSString *synthSpec = nil;    // "X,Y;X,Y" 内容坐标（左上原点）
         BOOL windowTop = NO;
         BOOL keepFront = NO;
+        int manualSecs = 0;           // >0：不造事件，改为提示真人动鼠标 SECS 秒
 
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--host")) hostMode = YES;
@@ -516,6 +567,8 @@ int main(int argc, char **argv) {
                 injectMode = [NSString stringWithUTF8String:argv[++i]];
             else if (!strcmp(argv[i], "--input-synth") && i + 1 < argc)
                 synthSpec = [NSString stringWithUTF8String:argv[++i]];
+            else if (!strcmp(argv[i], "--manual") && i + 1 < argc)
+                manualSecs = atoi(argv[++i]);
             else if (!strcmp(argv[i], "--keep-front")) {
                 // 自动化验证用：WindowServer 只把 mouseMoved 投给「前台应用」，
                 // 窗口 visible/key/active 全 1 也可能被别的 App 抢回前台
@@ -800,6 +853,7 @@ int main(int argc, char **argv) {
         [client prepareReceiver];
         if (frameView) {
             __weak M1FrameView *weakView = frameView;
+            __weak StreamClientNode *weakClient = client;
             __block BOOL printedAnchors = NO;
             client.onPixelBuffer = ^(CVPixelBufferRef pb, uint32_t seq) {
                 [weakView presentPixelBuffer:pb];
@@ -823,6 +877,14 @@ int main(int argc, char **argv) {
                        "videoW=%.0f\n",
                        sCenter.x, topY - sCenter.y, sL.x, topY - sL.y,
                        sR.x, topY - sR.y, vr.size.width);
+                // 首帧真的上屏了才喊人动手：先等 0.8s 让首次 CA 提交完成，
+                // 否则窗口还在「启动中」，最早几下移动会被吞掉（实测）。
+                if (manualSecs > 0) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        M1StartManualCue(frameWindow, weakView, weakClient.session, manualSecs);
+                    });
+                }
             };
         }
 
@@ -852,6 +914,15 @@ int main(int argc, char **argv) {
                 else winSendFail += 1;
             };
             frameView.onCloseRequest = ^{ closedByUser = YES; [NSApp stop:nil]; };
+
+            if (manualSecs > 0) {
+                // 兜底：万一一帧都没解出来（黑屏/解码失败），25s 后也把提示打出来，
+                // 否则执行的人会一直干等一个永远不来的信号。
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    M1StartManualCue(frameWindow, frameView, client.session, manualSecs);
+                });
+            }
 
             // 合成鼠标驱动：这台机器上由 agent 拉起的命令行工具没有「辅助功能」授权
             // （AXIsProcessTrusted=0）。实测 CGWarpMouseCursorPosition 能改光标位置，
@@ -1049,7 +1120,9 @@ int main(int argc, char **argv) {
             json[@"maxRenderMs"] = @(round(frameView.maxRenderMs * 10) / 10.0);
             json[@"inputEmitted"] = @(frameView.inputEventsEmitted);
             json[@"inputSynthPosted"] = @(synthPosted);
-            json[@"inputDriver"] = synthSpec.length > 0 ? @"synth" : @"physical";
+            json[@"inputDriver"] = manualSecs > 0 ? @"manual"
+                                 : (synthSpec.length > 0 ? @"synth" : @"physical");
+            json[@"manualSecs"] = @(manualSecs);
             json[@"inputSent"] = @(client.session.inputEventsSent);
             json[@"inputDropped"] = @(client.session.inputEventsDropped);
             json[@"inputRejected"] = @(client.session.inputEventsRejected);

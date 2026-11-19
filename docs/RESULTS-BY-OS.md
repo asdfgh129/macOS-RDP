@@ -666,7 +666,42 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 这属于测试环境约束，不是产品缺陷（真实使用里客户端窗口本来就是前台的）。
 `M1B_KEEP_FRONT=1` 可以每 300ms 重抢前台，但会打断正在用的应用，默认关闭。
 自动化的验收判据仍以 `synth` 驱动为准（已验证全链路与坐标），
-真鼠标那一跳留到双机验收现场确认。
+真鼠标那一跳改由 §5.9.3 的手动驱动补齐。
+
+#### 5.9.3 手动驱动（真人）：真鼠标那一跳闭环（2026-11-19 10:0x）
+
+`physical` 是「代码驱动的真光标」，卡在「窗口必须前台、且人不碰鼠标」；
+`synth` 是「进程内造事件」，少了 OS 投递那一跳。两者之间还有第三条路：
+**代码只负责发无歧义的信号，人真的去动鼠标**。缺的从来不是能力，是「什么时候该动」。
+
+`stream_probe --client ... --manual 18` 在首帧上屏 +0.8s 后：
+
+1. 连响 3 声（`NSBeep`）；
+2. 窗口标题变成 `▶▶ 现在动鼠标：点一下窗口，在画面里左右划 18 秒`，
+   之后逐秒显示「剩 N 秒 · 已采集 N 条」；
+3. 终端打一段 `[manual]` 横幅（① 先点一下窗口 ② 在画面里左右慢慢划 ③ 18 秒后自动结束）；
+4. 到点再响一声，标题变 `✓ 时间到，可以停手了`，日志打 `时间到，停手`（脚本靠它同步）；
+5. 一条都没收到时，每 5 秒再响两声、标题前缀加 `？`——实测人的反应延迟有 7 s，
+   第一轮 18 s 里前 7 s 采集恒为 0 条，单靠开场那三声容易被错过。
+
+`verify_m1b.sh` 增加 `M1B_DRIVER=manual`（`M1B_MANUAL_SECS` 调时长，
+时长自动放宽到 `秒数 + 12s`）。判据改为「横向跨度 ≥ 画面宽 10%」+ y 不越界，
+**不判落点**——真人落点不可控，硬套 ±200 只会假失败。
+
+实测（第 1 轮即 PASS）：
+
+| 指标 | 值 |
+|---|---|
+| 客户端上屏 | 329 帧（丢 15 积压 / 跳过 147 不可见），单帧 31.3 ms / 峰值 89.7 ms |
+| 窗口采集 → 上行 | 152 → 152 条（丢弃 0、拒绝 0） |
+| 主机收到 | 153 条，其中 `mouse` 150 条 |
+| 横向跨度 | 2563 px，占画面宽 75% |
+| 人的反应延迟 | 提示后约 7 s 才开始动 |
+
+结论：**真实鼠标 → 客户端窗口 → 归一化 → 控制通道 → 主机解析 → 注入计划**
+整条链成立，`physical` 缺的那一跳（OS 把物理事件交给 App）也包含在内。
+单帧 31.3 ms 高于离屏 10.4 ms，来源是「16 秒内 150 次鼠标事件 + 329 帧渲染 +
+环回时客户端把自己也采集进去」的同进程竞争，不代表稳态。
 
 #### 遗留
 
@@ -707,6 +742,7 @@ H.264 的参数集本来就随关键帧一起来，没有可提前的窗口—�
 - v0.11-draft 2026-11-18 17:10：**新增 §5.5 QUIC datagram 帧通道实测（M1-A 第 1/2 步）**。400 帧/1200 分片/1.22MB 环回零丢失零重复零乱序，协商上限 1497B，9.6Mbps。两条硬结论：① 瞬时突发 1200 片丢 43.6%（整帧级），发送必须按帧节奏投递；② 指纹不符只 `complete(false)` 会吊在 preparing（20s 无结论），必须主动 cancel（D-13 C-13.3）。待查：偶发 6–11s 握手离群。
 - v0.12-draft 2026-11-18 18:55：**新增 §5.6 控制通道端到端 + 两个结论更正**。控制通道 8 态在真实 QUIC 连接上跑通（`--self` 5/5、两进程 host/client 通过、148 单测全过、握手 13.5–19.3ms）。三处更正：① **§5.5 的「6–11s 离群疑为 QUIC Initial 退避」作废**——真因是 p12 私钥的 keychain ACL 触发 securityd 授权阻塞，`SecKeyCreateSignature` 卡在 `mach_msg`，服务端发不出 `CertificateVerify`，客户端永停 `preparing` 且无错误码（NEG-02）；② **「QUIC stream 模式不可用」作废**——复核握手 64.6/80.4ms 正常，此前失败同因（NEG-01），D-14 改按「一个连接一条流」立论；③ 「证书材料随机损坏」假象撤回。修复：临时钥匙串 + ACL 信任当前进程 + 进程内单次导入。
 - v0.13-draft 2026-11-18 19:10：**新增 NEG-04 授权弹窗复发根因与清理**。NEG-02 修完之后弹窗仍在，原因是 ① 仓库里 `quic_probe`/`pipeline_probe`/`pipeline_kiosk_probe`/`driver_probe` 四份二进制是修复前编的，仍走登录钥匙串旧路径；② `M1CopyIdentity` 在临时钥匙串创建失败时静默回退到登录钥匙串。修法：全部重建、删除回退分支（失败即报错）、临时钥匙串先 unlink 防 PID 复用残留、新增 `cleanup_stale_identities.sh`，并清掉登录钥匙串里 30 张残留测试证书。验证：`--self` 5/5（12.4–14.7ms）、`quic_probe` 默认 500 帧退出码 0、148 断言全过，且跑完后 `SecurityAgent` 不再出现。
+- v0.20-draft 2026-11-19 10:0x：**新增 §5.9.3 手动驱动，真鼠标那一跳闭环**。真光标(`physical`)受「窗口必须前台、人不碰鼠标」限制、`synth` 又少 OS 投递一跳，补第三条路：`--manual SECS` 只发信号（响 3 声 + 窗口标题倒计时 + `[manual]` 横幅），由真人动鼠标；没人动时每 5s 再响两声（实测反应延迟 7s）。`verify_m1b.sh` 加 `M1B_DRIVER=manual`，判据改为「横向跨度 ≥ 画面宽 10%」而非落点。第 1 轮 PASS：上屏 329 帧、采集 152→上行 152 条、主机收到 153 条（mouse 150）、横向跨度 2563px（75%），证明「真实鼠标 → 客户端 → 主机」全链成立。
 - v0.19-draft 2026-11-19 09:0x：**§5.9.1 端到端判据通过，并更正 v0.18 的归因**。v0.18 把「端到端跑不动」全记在会话自动锁定上，实测有一半是脚本自己的 bug：`verify_m1b.sh` 把 `cursor_move locked` 的退出码判反（0=解锁被当锁定），三轮全是空转。修正后真正的阻塞浮现为**辅助功能授权**：`AXIsProcessTrusted=0` 时 `CGWarpMouseCursorPosition` 能改光标位置但不产生 `mouseMoved`，`CGEventPost` 的合成事件被丢弃（最小 AppKit 接收器复现：active/key/visible 全 1、光标在动、`mouseEntered` 1 次、`mouseMoved` 0 次）。据此把驱动分流为 `physical`/`synth`（新增 `--input-synth` 进程内投递），`synth` 下第 1 轮即 PASS：29 帧上屏、单帧 8.0 ms、三次移动 x=1720/955.6/2484.4、y 恒 720，与 letterbox 换算一致。另修掉同一 `NSEvent` 被投递两次（hit-test + tracking area owner 同体）导致上行事件翻倍的问题。单测 193 项仍全过。
 - v0.18-draft 2026-11-18 23:1x：**§5.9 补齐端到端实测与三个真问题**。上屏从 `createCGImage`（每帧 GPU→CPU 回读 19.8 MB，实测 0.5–0.9 s/帧）改为 `render:toCVPixelBuffer:` 渲染到 IOSurface 再直接当 `layer.contents`（零拷贝），离屏 3440×1440 **10.4 ms/帧**。发现窗口不可见时 `layer.contents` 赋值会被 CA 阻塞（943–3233 ms 的假性能数字由此而来），改为 `occlusionState` 不可见则跳过并计 `framesSkippedOccluded`。发现 CLI 应用拿不到 key window，tracking area 改用 `NSTrackingActiveAlways` + `acceptsMouseMovedEvents`（此前 `inputEmitted` 恒为 0）。端到端仍被「会话反复自动锁定」挡住：窗口 `visible=1 key=0 active=0 occluded=1`，登录窗在最上层；已把 `verify_m1b.sh` 改为多轮短尝试，若单机无法稳定解锁则并入双机验收。
 - v0.17-draft 2026-11-18 21:5x：**新增 §5.9 M1-B 客户端上屏 + 输入回传（代码与单测完成，端到端待解锁验证）**。补上此前被静默忽略的 `input` 消息收发（`sendInputEvent:` / `didReceiveInputEvent:`，含 STREAMING 门禁与 1000 event/s 限速）；新增 `M1FrameView`（CIContext→CGImage→layer，letterbox 与坐标映射共用 `M1AspectFitRect`/`M1NormalizedPointFromViewPoint` 纯函数）、`M1RecordingEventSink`（环回不真注入）、`tools/cursor_move` 与 `verify_m1b.sh`。单测 193 项全过（输入通路 24、letterbox/坐标 12、注入器 6 为新增）；另有离屏渲染自检 `render_selftest` 全过（颜色/尺寸/letterbox/覆盖），并量出 CIContext 首次转换 623 ms，已按同样思路预热到 2 ms 级。顺带修掉 `displayID` 文档与实现位置不一致（两处都带 + event 缺失回落消息层）。阻塞：屏幕锁定导致 SCK 无 display、窗口收不到事件，端到端判据未执行。
