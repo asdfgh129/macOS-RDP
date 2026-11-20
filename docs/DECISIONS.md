@@ -844,6 +844,7 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.29 | `p2.sh host` 启动前检查端口占用：p2.sh 被杀不会带走 `stream_probe` 子进程，残留进程会让下一次启动报 `监听失败：48` | `P2-Dual/p2.sh` |
 | C-17.30 | 跨网段联调**两端必须同一 commit 且各自重建**：本轮上一次 `-9858` 与本轮成功之间的唯一实质差异就是 client 侧更新到同一 commit，握手即通过。排障顺序应先对齐 commit，再查 TLS/MTU | `docs/P2-CHECKLIST.md` §3 / 本轮 v0.29 |
 | C-17.31 | P2.2 的「client 解码尺寸 = 请求规格」判据**只对独占会话成立**：client 用 `--spec WxH`（`P2_SPEC`）请求，host 在 `session-start` 里据此建虚拟屏；镜像模式不建屏、解码物理屏原始尺寸，尺寸不符不算失败。client JSON 记 `requestedWidth/Height/specMatch`，`p2.sh summary` 仅在 `sessionMode` 以 `exclusive` 开头时据此判 FAIL；`specMatch` 缺失按 FAIL 处理以强制两端 commit 对齐 | `stream_probe.m` / `P2-Dual/p2.sh` / `docs/P2-CHECKLIST.md` §4 |
+| C-17.32 | `render_selftest` 的 letterbox 期望矩形必须用**独立公式**算，不能调被测的 `M1AspectFitRect`（自证循环）。档位至少覆盖两种受限方向：16:9 源在近 16:9 视图里**高度顶满**、超宽 3440×1440 在同样视图里**宽度顶满**。耗时是离屏纯转换基线（不含窗口合成），作回归护栏而非上屏性能结论，性能结论只认跨机 client `lastRenderMs` | `M1-Skeleton/tools/render_selftest.m` / 本轮 v0.33 |
 
 ### 代价与边界
 

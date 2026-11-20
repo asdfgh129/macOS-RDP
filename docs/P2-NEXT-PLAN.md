@@ -71,9 +71,9 @@
 
 | 步骤 | 内容 | 文件 |
 |---|---|---|
-| 3.1 | 渲染路径去 `CIContext→CGImage` 中转，改 IOSurface 直贴 layer；目标 Sequoia 1080p **≥24fps**、单帧 <40ms | `M1-Skeleton/src/M1FrameView.m` |
-| 3.2 | `render_selftest` 增加 1080p/720p 档基线与 color/letterbox 回归 | `M1-Skeleton/tools/render_selftest.m` |
-| 3.3 | 回归矩阵入档：{720p15, 1080p20} × {LAN, WAN}，每条记录标注 OS build 与机器（参照 `RESULTS-BY-OS` §1） | `docs/RESULTS-BY-OS.md` |
+| 3.1 | ✅ 已完成（早前落地）：`M1FrameView` 已是 `CIContext render:toCVPixelBuffer:`（IOSurface 承载）+ `layer.contents = IOSurface` 零拷贝上屏，无 CGImage 回读；本轮 1080p 离屏单帧 13.9ms（预算 41.7ms）。Sequoia 真实窗口 ≥24fps 仍需跨机实测 | `M1-Skeleton/src/M1FrameView.m` |
+| 3.2 | ✅ 完成（2026-11-20）：`render_selftest` 重构为 `RunCase` 多档位，覆盖 640×360 / 720p / 1080p / 3440×1440，每档校验 color/尺寸/IOSurface/letterbox + 耗时；letterbox 期望独立公式计算（不复用被测函数），两种受限方向都覆盖。本机 ALL PASS | `M1-Skeleton/tools/render_selftest.m` |
+| 3.3 | 待跨机实测（用户本轮暂不测试）：回归矩阵 {720p15, 1080p20} × {LAN, WAN} 入档，每条标注 OS build 与机器 | `docs/RESULTS-BY-OS.md` |
 
 **完成判据**：1080p20 跨机跑满 20fps 且上屏队列 0 积压；`A-02` 只在拿到 glass-to-glass 实测后关闭（相机同框方案见 `P2-CHECKLIST` §7）。
 

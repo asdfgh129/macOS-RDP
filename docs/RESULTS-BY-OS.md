@@ -950,6 +950,7 @@ CPE 的入站规则从 TCP 改成 UDP 后，**首次跨公网端到端跑通**�
 
 ## 7. 变更记录
 
+- v0.33-draft 2026-11-20 09:4x：**P2.3.2 渲染自检多档位回归（Tahoe 26.5.2 / Macmini8,1 本机离屏）**。`render_selftest` 由写死的 640×360 + 3440×1440 重构为 `RunCase` 四档：640×360 / 1280×720 / 1920×1080 / 3440×1440，每档校验 color（左红右蓝、R/B 不互换）、输出尺寸=源、IOSurface-backed、letterbox 几何（独立公式算期望，覆盖高度受限与宽度受限两种方向）、单帧耗时护栏。本机 ALL PASS，离屏单帧：**VGA 5.8ms / 720p 8.6ms / 1080p 13.9ms / 3440×1440 32.5ms**（max 32.5ms，0 丢帧）。这是**纯 CIContext 转换成本**，不含窗口合成与 GPU 提交阻塞，不能当跨机上屏帧率结论（Sequoia 1080p ≥24fps 仍待实测）。据此确认 P2.3.1 IOSurface 直贴已落地、无 CGImage 回读。
 - v0.32-draft 2026-11-20 08:5x：**补齐 P2.2 的规格断言**。client 新增 `requestedWidth/Height/specMatch`（`--spec WxH` / `P2_SPEC`），控制台打印「规格断言」；`p2.sh summary` 仅在 `sessionMode` 为独占时把尺寸不符判 FAIL，镜像模式不参与判定（镜像不建屏）。新增 `P2_SPEC` 环境变量透传。另补 `P2_WIDTH`/`P2_HEIGHT` 透传 host 编码输出尺寸（此前只有直接调 `stream_probe --host --width/--height` 才能降分辨率，`p2.sh` 不透传）——环回验证 host 输出 1280×720、client 解码 1280×720、40/40 帧；`usage` 同步补上这两个参数。环回验证三条路径：镜像模式请求 1280×720/解码 3440×1440 → 断言 FAIL 但 summary PASS（符合预期）；伪造独占 + 不符 → summary FAIL；伪造独占 + 一致 → summary PASS。单测 **207/207 PASS**。仍未测：Tahoe host 跑本轮独占代码、全禁物理屏 + C-09、跨公网 P2.1 门禁复测。
 - v0.31-draft 2026-11-19 22:5x：**P2.1/P2.2 首轮落地（Sequoia 本机）**。重组器 v3（位图+帧期限+乱序容错）、帧级指标、keyframe-request 全链路（客户端 1s 重试、主机 900ms 合并）；720p 丢片矩阵 0%=1.00、0.1%=0.955、1%=0.13、5%=0。P2.2 修掉 Sequoia 上误用 Tahoe 保守建屏导致的残留槽位镜像死锁，`--exclusive --keep-main` 冒烟 PASS（虚拟屏 4128835、31/31、恢复成功）；控制间隔门禁改为仅统计 STREAMING 之后。详见 §5.14。
 - v0.1-draft 2026-11-18：首次建立按 OS 分离的结论表；把 Sequoia 与 Tahoe 的 V-01/V-03/V-04 结论拆开，明确禁止跨版本外推。
