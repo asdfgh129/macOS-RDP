@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.31-draft |
-| 日期 | 2026-11-19 |
+| 版本 | v0.36-draft |
+| 日期 | 2026-11-20 |
 | 原则 | **结论绑定具体 OS build 与机器，禁止跨版本外推**。同一判据在 Sequoia 与 Tahoe 分别记录，未测就写未测。 |
 | 上位文档 | `docs/DESIGN.md` §8、`docs/DECISIONS.md` |
 
@@ -936,6 +936,107 @@ CPE 的入站规则从 TCP 改成 UDP 后，**首次跨公网端到端跑通**�
 
 ---
 
+### 5.15 P2.1 公网门禁复测 + Tahoe kiosk 冒烟（2026-11-20 19:5x–20:1x）
+
+代码基线 `ff7f922`（两端同一提交，均已重编）。host = Tahoe 26.5.2 / 25F84（Macmini8,1，公网 `112.5.32.34:46600`），client = Sequoia 15.5 / 24F74（Macmini8,1，本机）。镜像模式、`P2_INJECT=record`。host 经 Terminal 启动（`stream_probe` 本身无屏幕录制授权，SSH 直跑 capture=0；Terminal 有授权）。
+
+**三轮门禁结果（`p2.sh summary`，WAN 阈值 0.85）**
+
+| # | 规格 | 解码/发出 | awaitingKeyframe | 关键帧请求 | RTT | 帧丢弃 | 备注 |
+|---|---|---|---|---|---|---|---|
+| 1 | 1280×720@15 / 35s | 281/516 = 0.545 | 14000ms（40.0%） | 23/23 | 4348ms / 12 | 17.8% | 本机同时开着屏幕共享，渲染 272.7ms、接收队列最长 1149ms，数据受污染 |
+| 2 | 1280×720@15 / 35s | 96/517 = 0.186 | 26743ms（76.4%） | 35/35 | 3212ms / 10 | 55.2% | 屏幕共享最小化后重跑，渲染 3.1ms；`fragmentsSent 3118 / 收到 3056`（≈2.0% 片丢失） |
+| 3 | 640×360@15 / 30s | 284/443 = 0.641 | 8746ms（29.2%） | 17/17 | 3207ms / 10 | 14.4% | 降低 IDR 体积对照；`1057 / 1027`（≈2.8%） |
+
+三轮共同点：握手 54–102ms、`sendFailures=0`、控制最大间隔 ≈1.05s、状态序列两端一致；**关键帧请求全部到达主机**（host `keyframeRequestsReceived` 与 client 发出数一致），host `keyframes` 分别为 30/23（含 2s 周期与请求强制 IDR），说明请求→编码器路径生效。三轮 `keyframeRequestRttMs` 都 ≈3.2s，呈"多次 IDR 重试"形态。
+
+**链路对照测量（同一条 WAN 路径，Python UDP 直发，host 侧计数）**
+
+| 形态 | 结果 |
+|---|---|
+| ICMP 60 × 0.2s | 60/60，RTT 7–55ms |
+| UDP 1150B：100pps ×2000 + 400pps ×4000 | 6000/6000 |
+| UDP 尺寸扫描：1150/1200/1250B 各 800 @200pps | 2400/2400 |
+| UDP 突发：90 片 × 300 轮（每 100ms 一轮，1150B） | 27000/27000（≈2.5Mbps） |
+
+**结论（v0.36）**
+- **公网路径本身 0 丢包**（含 IDR 形态的突发）；应用层看到的 ≈2–3% 片丢失发生在 **QUIC datagram 收发层**，不是 NAT/ISP/MTU。`sendDatagram` 同步返回成功、`sendErr=0`，说明丢弃发生在 `nw_connection_send` 之后（异步失败/流控/接收回调未及时续读）。**下一步先给 `M1QuicTransport` 增加 tx 异步错误、rx 回调间隙、队列深度计数，并把重组/解码移出接收回调队列**，再决定是否需要 FEC；不要在未定位这 2–3% 前直接加 FEC。
+- 该丢失率对当前"整帧齐全才交付 + 丢片即请求 IDR"的设计是致命放大：IDR 28–87 片，2–3% 片丢失使大多数 IDR 残缺，恢复靠反复请求；RTT 稳定在 ≈3.2s。0.85 门禁在本轮链路/传输条件下未通过，按计划记录，不调整阈值。
+- 渲染已排除：干净轮次 3.1ms/帧、积压 1 帧；第一轮的 272.7ms 完全由本机屏幕共享会话造成。
+
+**P2.2 Tahoe kiosk 冒烟（`--keep-main`，半禁屏）**
+- `pipeline_kiosk_probe --preflight`：守护进程就绪、`预检通过`（rc=0）。
+- 半禁屏冒烟：虚拟屏 `4128835`（1280×720）、采集 1280×720、首帧 `/tmp/kiosk-keepmain.png` 有画面（菜单栏+桌面壁纸）；结束打印「恢复成功」，总耗时 38.9s；之后 `activeDisplayCount=2`、未锁屏。判定 `DEGRADED`（静态虚拟屏 0.5fps）只反映按变化送帧，不作为性能结论。
+- **仍未做**：去掉 `--keep-main` 的全禁物理屏 + C-09 端到端（有黑屏/WindowServer 风险，需现场确认）。
+
+**操作注意**：远端仅 SSH 不可用——屏幕锁屏时 SCK 取不到桌面内容，需先唤醒并解锁；本次经 SSH 隧道 5901→远端 5900 用「屏幕共享」解锁。Session 断开后远端会重新锁屏，屏幕共享需保持连接（最小化即可，CPU 0.3%）。
+
+---
+
+### 5.16 P2.1 定向补片（frame-nack）：公网门禁 PASS（2026-11-20 20:4x–21:2x）
+
+代码基线 `ff7f922` + 未提交的 NACK 改动（两端均已重编）。环境同 §5.15：host = Tahoe 26.5.2 / 25F84（Macmini8,1，公网 `112.5.32.34:46600`），client = Sequoia 15.5 / 24F74（本机），镜像模式、`P2_INJECT=record`、`p2.sh host/client` 经 Terminal 启动。
+
+**设计：客户端补片 NACK + 主机定向重发**
+
+| 环节 | 行为 | 参数 |
+|---|---|---|
+| 客户端检测 | 部分帧超过 `repairRequestMs` 未进展（或重试到期）时，从位图取缺失下标（≤64） | 60 ms |
+| 上行请求 | 走可靠控制通道发 `{"type":"frame-nack", frameSeq, fragCount, indices[]}`；限速 5 ms/次 | — |
+| 主机重发 | 分片缓存按帧保留最近 64 帧，只重发缺失分片，经 `sendPriorityDatagram:` 插到发送队列最前 | `M1_FRAG_CACHE=64` |
+| 重试 | 同帧最多 3 次、间隔 120 ms；收到新分片即重置 | 120 ms × 3 |
+| 帧期限 | 补片后期限改为 `max(repairGraceMs, frameDeadlineMs)`，基准取「最后进展 / 补片请求」较晚者 | 250 ms |
+| 兜底 | 超过期限仍不全 → 判丢并请求关键帧；在飞 IDR 保护窗口内抑制重复请求 | 500 ms |
+| 重组窗口 | 在飞帧上限 8 → 12，给补片留头寸 | `M1_FRAME_WINDOW` |
+
+统计新增：client `repairRequests / repairRequestsSent / repairRttMs / frameNacksSent`，host `frameNacksReceived / frameNacksRepaired / frameNacksMissed / fragmentsResent`。
+
+**三轮结果（`p2.sh summary`，WAN 阈值 0.85）**
+
+| 轮次 | 形态 | 采集/编码/发出 | 解码/发出 | 丢帧率 | awaitingKeyframe | NACK | 关键帧请求 | 控制间隔 | 判定 |
+|---|---|---|---|---|---|---|---|---|---|
+| J | 720p15 / 40s，桌面有活动 | 587/586/586 | 526/586 = **0.898** | 4.0% | 3635ms（9.1%） | 60 发，修复 RTT 12ms/53，主机重发 99 片 | 6/6 | 1091ms | **PASS** |
+| K | 同上，桌面静止 | 99/98/98 | 73/98 = 0.745 | 15.3% | 5236ms（13.1%） | 17 发 | — | 1053ms | 不计（采集仅 98 帧，样本不足，见下） |
+| L | 同上 + 远程动画窗口 | 592/591/591 | **591/591 = 1.000** | **0.0%** | 119ms（0.3%） | **119/119 命中、0 未命中**，重发 241 片 | 0 | 1108ms | **PASS** |
+
+三轮共同点：握手 62–69 ms、`sendFailures=0`、状态链完整、渲染解码失败 0。J 的丢帧尾部是数次 `gap-after-repair` 后的级联；L 无关键帧请求，说明补片已把丢片在帧期限内补齐。
+
+**结论（v0.37）**
+- 定向补片在不改协议阈值的前提下把 WAN 门禁从 0.186–0.641 拉到 **0.898–1.000**，等待关键帧 9.1%→0.3%，控制间隔 <1.2s。**不调 WAN 0.85 阈值**。
+- 补片只重发缺失分片（L 轮 119 次请求共 241 片），代价远低于整帧 IDR（IDR 28–87 片且要等编码器），修复 RTT 12ms；无补片时同样的 2–3% 片丢失会触发 1.5–3.5s 的 IDR 重建。
+- 仍待推进（P2.3）：L 轮平均渲染 73.2ms/帧、J 轮 806.7ms（窗口遮挡/积压干扰），上屏 329/526 帧，渲染是下一瓶颈；本轮不归因到协议层。
+
+**操作注意（新增）**
+- 采集按内容变化送帧：桌面静止时 40s 只有 99 帧（K），不能拿来判门禁。测试时在 host 跑 `/tmp/anim.swift`（全屏彩条动画，75s；经 `open /tmp/anim.command` 启动，首次 swift 编译约 10s），L 轮即由此取得 591 帧。
+- host 锁屏会阻断 preflight（`CGSSessionScreenIsLocked=1`）；SSH 下无法解锁——CGEvent 无辅助功能授权会被登录窗丢弃，AppleScript 的 TCC 弹窗在锁屏下不可见；需人工解锁一次。
+
+---
+
+### 5.17 P2.2 独占会话 + C-09 跨机实测（2026-11-20 21:0x–21:4x）
+
+环境同 §5.15/§5.16。host 以 `P2_EXCLUSIVE=1` 经 Terminal 启动（`stream_probe --exclusive`：建虚拟屏→禁全部物理屏→C-09 校验→用虚拟屏采集），client 传 `P2_SPEC` 做尺寸断言。为制造画面变化，host 上运行 `/tmp/anim.swift`（主屏自适应彩条窗口）。
+
+**结果（WAN，40s）**
+
+| 轮次 | 形态/规格 | 采集/编码/发出 | 客户端解码/发出 | 丢帧率 | awaitingKeyframe | 补片 | 关键帧请求 | 渲染/帧 | 判定 |
+|---|---|---|---|---|---|---|---|---|---|
+| A | **独占** 1280×720@15 | 529/528/528 | **511/528 = 0.968** | 0.8% | 2883ms（7.2%） | 134 帧命中 / 0 未命中 | 2/2 | 25.9ms | **PASS** |
+| B | 独占 1920×1080@20，动画后启动 | **43**/43/43 | 6/43 | 5/6 帧（收齐仅 6） | — | 8 帧命中 / 0 未命中 | 1/1 | 31.6ms | FAIL（采集侧） |
+| C | 独占 1920×1080@20，动画先启动 | **30**/29/29 | 6/29 | 同上 | — | 7 帧命中 / 0 未命中 | 1/1 | — | FAIL（采集侧） |
+| D | 镜像 1920×1080@20（对照） | **778**/777/777 | 216/777 = 0.278 | 38.0% | 26249ms（65.6%） | 65 帧命中 / 0 未命中 | 35/35 | 64.9ms | FAIL（渲染瓶颈） |
+
+**C-09 证据（A/B/C 三轮一致）**：`sessionMode=exclusive`、`c09Status=verified`、`virtualDisplayIDs=[4128835]`、`activeDisplayIDsAfterDisable=[4128835]`（仅虚拟屏）、`sessionRecovered=true`；结束后 host 打印「已恢复物理屏并销毁虚拟屏」，复测 `preflight host` 显示 `active=2`。客户端的 `请求规格/解码尺寸` 均一致（720p 轮 1280×720 → 1280×720）。
+
+**结论（v0.38）**
+- **P2.2 核心判据成立**：720p15 独占 + C-09 在 Tahoe host × Sequoia client 跨公网端到端 PASS；客户端解码 0.968、丢帧 0.8%、控制间隔 1.38s、补片 134/134 命中。物理屏会话期间仅虚拟屏 active，结束后恢复。
+- **1080p 独占受采集侧阻塞**：同一 host、同一动画窗口，虚拟屏 1920×1080 时 SCK 只送出 30–44 帧/40s（≈0.8–1.1fps），客户端只能解出 6 帧；而镜像 1920×1080 采集 778 帧（≈19.4fps）。⇒ 是**零物理屏 + 1080p 虚拟屏的 SCK 送帧退化**（A-08 变体），不是传输/补片问题。
+- **1080p20 客户端渲染仍超预算**：镜像对照 `lastRenderMs=64.9ms`（50ms 预算），导致 65.6% 时间在等关键帧、丢帧 38%；与独占无关，属 P2.3 渲染瓶颈。补片在这轮仍是 65/65 全命中、0 未命中。
+- 不调阈值；1080p 独占/20fps 需先解决虚拟屏采集帧率与客户端渲染，再作为门禁档位。
+
+**操作注意**：独占轮次中动画窗口若在禁屏前已存在，可能留在被禁物理屏上，虚拟屏只剩静态桌面（B/C 均 1fps 级）；即便独占后再启动（A）720p 正常，1080p 仍退化，故 B/C 的差异不是窗口位置能解释的。每轮结束用 `preflight host` 核对 `active` 屏数。
+
+---
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe |
@@ -950,6 +1051,9 @@ CPE 的入站规则从 TCP 改成 UDP 后，**首次跨公网端到端跑通**�
 
 ## 7. 变更记录
 
+- v0.38-draft 2026-11-20 21:4x：**P2.2 独占 + C-09 跨机实测，见 §5.17**。720p15 独占（Tahoe host × Sequoia client，WAN）：`c09Status=verified`、`activeDisplayIDsAfterDisable=[4128835]`、`sessionRecovered=true`，客户端解码 511/528=0.968、丢帧 0.8%、等待关键帧 7.2%、补片 134/134 命中，**PASS**；结束后物理屏恢复（active=2）。1080p20 独占两轮均被采集侧卡住：虚拟屏 1920×1080 时 SCK 只送 30–44 帧/40s，而镜像 1080p 同机采集 778 帧（19.4fps）⇒ 零物理屏 + 1080p 虚拟屏的送帧退化（A-08 变体），非传输问题。镜像 1080p 对照另暴露客户端渲染 64.9ms/帧（50ms 预算），解码率 0.278、丢帧 38%，归 P2.3。阈值未调整。
+- v0.37-draft 2026-11-20 21:2x：**P2.1 定向补片（frame-nack）落地，公网门禁 PASS，见 §5.16**。客户端重组器对停滞帧发 `frame-nack`（缺失分片下标，≤64，走可靠控制通道，限速 5ms）；主机 64 帧分片缓存定向重发，经 `sendPriorityDatagram:` 插队；同帧重试 120ms × 3，补片后帧期限改 `max(repairGrace 250ms, frameDeadline 120ms)`，IDR 在飞 500ms 抑制重复请求；在飞帧窗口 8→12。WAN 720p15/40s：J 轮解码 526/586=**0.898**、丢帧 4.0%、等待关键帧 9.1%、NACK 修复 RTT 12ms；L 轮（host 加动画窗口）**591/591=1.000**、丢帧 0%、等待 0.3%、119/119 补片全部命中、0 次关键帧请求。`p2.sh summary` 两轮均 PASS，阈值未调整。单测 207/207 PASS。附操作坑：采集按内容变化送帧（静止桌面 40s 仅 98 帧），测试需在 host 跑动画窗口；host 锁屏阻断 preflight，需人工解锁。
+- v0.36-draft 2026-11-20 20:0x：**P2.1 公网门禁复测（FAIL）+ Tahoe kiosk 冒烟（PASS），见 §5.15**。三轮 WAN（720p×2、640×360×1）解码/发出 0.186–0.641，等待关键帧 29–76%，关键帧 RTT 稳定 ≈3.2s；`sendFailures=0`、请求全部到达编码器、渲染干净轮 3.1ms/帧。同路径 ICMP 60/60、UDP 6000/6000、尺寸扫描 2400/2400、90 片突发 27000/27000 全收——**公网路径 0 丢包，应用层 ≈2–3% 片丢失发生在 QUIC datagram 层**（同步 send 返回成功、`sendErr=0`）；IDR 28–87 片使残缺 IDR 放大成 3s 级停顿。下一步先给 transport 加收/发计数与回调背压治理，再评估 FEC，不调整 WAN 0.85 阈值。P2.2：Tahoe `pipeline_kiosk_probe --keep-main` 冒烟通过（虚拟屏 4128835、1280×720、首帧有画面、恢复成功、2 屏恢复）；全禁物理屏 + C-09 仍未跑。操作记录：远端锁屏会阻断 SCK，需屏幕共享（SSH 隧道）解锁并保持会话。
 - v0.35-draft 2026-11-20 10:1x：**补齐 P2.1 唯一未落地的观测指标 `keyframeRequestRttMs`**（纯开发，未跑实时测试）。`M1FrameReceiver` 新增 `noteKeyframeRequestSent()`：仅客户端成功把 keyframe-request 送上控制通道才记起点，同一等待周期的重复请求不重置；收到关键帧并完整重组时结算 RTT，记录最近值与样本数。口径为「首个成功请求 → 关键帧重组到达」，不含 VT 解码/上屏。`stream_probe` client JSON/控制台新增 `keyframeRequestRttMs / keyframeRequestRttSamples`，`p2.sh summary` 增加展示行但**不设门禁**。验证：build_stream_probe 无 warning、单测 207/207 PASS、summary 合成夹具正确显示 `412 ms / 3 次`。不改任何已测结论。
 - v0.34-draft 2026-11-20 09:5x：**纯开发轮次——独占会话退出保护 + C-09 证据 + 联调门禁补齐**（未跑实时测试，按用户安排留到晚上）。① `stream_probe.m` 补三处 `endExclusive()`：等待客户端超时、`--inject` 非法、`--wait-ms 0` 单次接入失败；无限等待失败还会清掉 `virtualDisplayID`，防止下一次拿旧屏 ID 采集。② host JSON 新增 `virtualDisplayIDs / activeDisplayIDsAfterDisable / c09Status / sessionPhase / sessionRecovered / sessionEnded`，两端 JSON 新增 `streamDurationMs`；client 未传 `--spec` 时记 `effectiveWidth/Height/effectiveSpecMatch`（session-ready 里 host 实际建的屏规格），独占模式据此断言解码尺寸。keep-main 明确记 `skipped-keep-main`，不能谎报 C-09 通过。③ `p2.sh host` 新增 `P2_EXCLUSIVE / P2_KEEP_MAIN / P2_SIM_LOSS / P2_SIM_REORDER` 透传；`summary` 解码门禁按 LAN 0%=0.98 / LAN 0.1%=0.90 / WAN=0.85 / ≥1% 只记趋势分层，新增帧丢弃率、等待关键帧占比（分母 `streamDurationMs`）、keyframe-request 到达、独占 C-09 与恢复证据判定。验证：build_stream_probe 无 warning、单测 207/207 PASS、summary 12 组合成夹具（正常/三种超限/WAN 两档/0.1% 两档/独占 C-09 缺失与恢复失败/keyframe 未到达/实际屏规格一致与不一致/显式 spec 优先）全部符合预期。工程加固，**不改任何已测结论**。
 - v0.33-draft 2026-11-20 09:4x：**P2.3.2 渲染自检多档位回归（Tahoe 26.5.2 / Macmini8,1 本机离屏）**。`render_selftest` 由写死的 640×360 + 3440×1440 重构为 `RunCase` 四档：640×360 / 1280×720 / 1920×1080 / 3440×1440，每档校验 color（左红右蓝、R/B 不互换）、输出尺寸=源、IOSurface-backed、letterbox 几何（独立公式算期望，覆盖高度受限与宽度受限两种方向）、单帧耗时护栏。本机 ALL PASS，离屏单帧：**VGA 5.8ms / 720p 8.6ms / 1080p 13.9ms / 3440×1440 32.5ms**（max 32.5ms，0 丢帧）。这是**纯 CIContext 转换成本**，不含窗口合成与 GPU 提交阻塞，不能当跨机上屏帧率结论（Sequoia 1080p ≥24fps 仍待实测）。据此确认 P2.3.1 IOSurface 直贴已落地、无 CGImage 回读。

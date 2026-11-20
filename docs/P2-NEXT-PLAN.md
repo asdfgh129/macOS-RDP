@@ -47,7 +47,7 @@
 | 5% | 0/117 | IDR 存活率 ≈1e-8，不可达 |
 
 - 单测全过（含新增重组/乱序/重复/超时/限速用例）。
-- **进度（2026-11-20）**：步骤 1.1–1.5 全部落地，含 `keyframeRequestRttMs / keyframeRequestRttSamples`（仅观测、不设门禁）；单测 207/207 PASS。**仍未做**：今晚的公网门禁复测。
+- **进度（2026-11-20 晚）**：步骤 1.1–1.5 全部落地，含 `keyframeRequestRttMs / keyframeRequestRttSamples`（仅观测、不设门禁）；单测 207/207 PASS。首次公网复测 FAIL（解码 0.19–0.55，等待关键帧 29–76%）；同路径 ICMP/UDP（含 90 片突发 27000/27000）0 丢包 ⇒ ≈2–3% 片丢失在 QUIC datagram 层。随后实现 **定向补片 NACK**（客户端 `frame-nack` + 主机分片缓存定向重发 + 120ms×3 重试 + IDR 在飞抑制），WAN 复测 **PASS**：J 轮 526/586=0.898、L 轮 591/591=1.000、丢帧 0%、等待关键帧 0.3%、补片 119/119 命中、`sendFailures=0`。详见 `RESULTS-BY-OS.md` §5.16。
 - 环回 720p15/30s：**0% ≥0.98、0.1% ≥0.90**；`awaitingKeyframeMs` 占比 <10%；请求确实到达编码器（host key 计数 > 周期基线）。
 - 1% 与 5% 只作趋势记录，不作门禁；5% 的 0.95 判据在无 FEC 下不可实现，已删除。
 - 跨公网 720p15/30s：解码/发出 **≥0.85**（前提是端到端丢片率 ≲0.1%），`sendFailures=0`，控制间隔 <3s。
@@ -67,7 +67,7 @@
 - `--exclusive` 启动后：host 打印新建虚拟屏 displayID；会话期间 `CGGetActiveDisplayList` 只返回该虚拟屏（C-09）；client 解码尺寸等于请求规格；结束物理屏恢复、无 WindowServer 断言。
 - 物理屏全程无画面泄露（现场截图只有黑屏/锁屏）。
 - 若 2.3 在 Tahoe 失败：保留 `--mirror`，把失败写进 `RESULTS-BY-OS`，不宣称独占成立。
-- **进度（2026-11-20 更新）**：client 规格断言已落地（`--spec`/`P2_SPEC` → `specMatch`；未传 `--spec` 时用 `session-ready` 的 `effectiveWidth/Height/effectiveSpecMatch`，`summary` 仅独占模式判 FAIL），环回三条路径验证通过；`p2.sh` 已能透传 `--exclusive/--keep-main/--sim-loss/--sim-reorder`，host JSON 落 C-09 证据，`summary` 对独占模式核对 C-09 与恢复结果；退出路径（握手超时/非法注入/无限等待单次失败）均补了 `endExclusive()`。**仍未做**：实机全禁物理屏 + C-09、Tahoe host 本轮代码、跨公网复测（按用户安排晚上测）。
+- **进度（2026-11-20 晚）**：client 规格断言已落地（`--spec`/`P2_SPEC` → `specMatch`；未传 `--spec` 时用 `session-ready` 的 `effectiveWidth/Height/effectiveSpecMatch`，`summary` 仅独占模式判 FAIL），环回三条路径验证通过；`p2.sh` 已能透传 `--exclusive/--keep-main/--sim-loss/--sim-reorder`，host JSON 落 C-09 证据，`summary` 对独占模式核对 C-09 与恢复结果；退出路径（握手超时/非法注入/无限等待单次失败）均补了 `endExclusive()`。**2026-11-20 晚跨机实测**：全禁物理屏 + C-09 **720p15 PASS**——`c09Status=verified`、`activeDisplayIDsAfterDisable` 仅虚拟屏、`sessionRecovered=true`、解码 0.968、丢帧 0.8%，结束后物理屏恢复；**1080p20 独占 FAIL（采集侧）**——1080p 虚拟屏下 SCK 只送 30–44 帧/40s，而镜像 1080p 采集 778 帧（19.4fps），属 A-08 变体；同轮镜像对照还暴露客户端 1080p 渲染 64.9ms/帧（P2.3）。详见 `RESULTS-BY-OS.md` §5.17。**仍未做**：1080p 独占的采集帧率治理。
 - **进度（2026-11-19，Sequoia 本机）**：`--exclusive --keep-main` 冒烟 PASS——虚拟屏 `4128835`、采集 1280×720、client 31/31、控制间隔 1005ms、结束恢复成功。顺带修掉 Sequoia 误用 Tahoe 保守建屏导致的残留槽位镜像死锁（`M1RDPDriver` 改按 `P0OSPolicy()` 分流）。**未做**：全禁物理屏 + C-09（需现场确认可黑屏）、Tahoe host 本轮代码、client 解码尺寸断言。
 
 ### P2.3 渲染与记录收尾
@@ -85,7 +85,7 @@
 ## 3. 不做 / 延后
 
 - 光标独立通道（FR-10）、音频、剪贴板、多屏、断线重连：P2 后。
-- FEC / 分片重传：环回 1% 实测仅 0.13（IDR 存活率 ≈2.7%，须反复重试），1% 丢片率下的可用性依赖它；按 P2.1-FEC 单独立项评估（XOR/RS 分片 + 可选 NACK）。
+- FEC：定向补片（NACK + 分片缓存重发）已落地并在 WAN 门禁通过（§5.16）；仅在 ≥1% 丢片率仍不达标时再评估 FEC（XOR/RS 分片）。
 - 控制端本地虚拟屏：不在设计内；控制端只出规格、不改本机显示配置。
 - 调整 `summary` 的阈值：改为 LAN(0%)=0.98、LAN(0.1%)=0.90、WAN(目标 ≤0.1% 丢片)=0.85；1% 档不设门禁，避免用阈值掩盖无 FEC 的物理上限。
 
