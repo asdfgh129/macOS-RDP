@@ -4,7 +4,7 @@
 `P2-CHECKLIST.md`（怎么判、出错查什么）与 `P2-NEXT-PLAN.md`（为什么做）。
 本单只回答：**今晚按顺序做什么、做到哪条算过**。
 
-- 目标 commit：`7864855`（两端必须一致，各自重编）
+- 代码基线：`7864855`（P2 工程改动全部在此）；文档 HEAD：`e1d6ff8`（仅新增本操作单与文档链接，**无代码差异**）。两端拉到同一提交即可，暂时停在 `7864855` 也能开测。
 - Tahoe host：Macmini8,1 / 26.5.2，内网 `192.168.10.23`，公网 `112.5.32.34:46600`
 - 控制端：Sequoia 15.5 那台
 - 证书指纹（身份 p12 未换，不变）：
@@ -16,9 +16,10 @@
 
 ```bash
 # 两台机器都执行
-git -C <macOS-RDP> pull                 # 都到 7864855
+git -C <macOS-RDP> pull                 # 两端拉到同一提交
 cd <macOS-RDP>/M1-Skeleton && bash build_stream_probe.sh
-git -C <macOS-RDP> log -1 --oneline     # 确认 7864855
+git -C <macOS-RDP> log -1 --oneline     # 记录实际 commit，回报结果时带上
+git -C <macOS-RDP> diff --stat 7864855 -- M1-Skeleton P2-Dual   # 应为空：代码与基线一致
 ```
 
 **重编后 TCC 会失效**（ad-hoc cdhash 变了）。host 端先自检：
