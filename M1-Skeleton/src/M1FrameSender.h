@@ -55,6 +55,22 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) M1FrameSenderStats *stats;
 - (void)resetStats;
 
+// 跨公网防丢：同一分片重复投递 N 份。接收端把重复分片当冗余忽略，
+// 丢一份不影响整帧。关键帧分片多，单帧「至少丢一片」的概率被放大，可按链路提高。
+// 默认 1（不改变 LAN 环回行为）。发送端统计的 fragmentsSent 含副本。
+@property (nonatomic, assign) NSUInteger keyframeCopies;
+@property (nonatomic, assign) NSUInteger pframeCopies;
+
+// 定向补片：缓存最近发送帧的分片，收到 frame-nack 时只重发缺失的那几片。
+//   按帧数淘汰（默认 64 帧）；0 关闭缓存，重发请求一律返回 0。
+//   重发走同一 sink（受传输层节拍/窗口约束），计入 fragmentsSent。
+@property (nonatomic, assign) NSUInteger fragmentCacheFrames;
+@property (nonatomic, readonly) uint64_t fragmentsResent;
+// 返回实际重发的分片数；该帧不在缓存里返回 0（调用方回退到关键帧请求）。
+- (NSUInteger)resendFragmentsForFrameSeq:(uint32_t)frameSeq
+                                 indices:(NSIndexSet *)indices
+                                   error:(NSError * _Nullable * _Nullable)error;
+
 @end
 
 NS_ASSUME_NONNULL_END

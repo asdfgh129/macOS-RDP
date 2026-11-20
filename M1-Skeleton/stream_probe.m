@@ -88,6 +88,24 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 #pragma mark - 单端节点
 
+// 控制链路专用 sink：控制包插到传输队列最前，不与整帧分片一起排队。
+// 补片请求晚到几百毫秒就等于没发——接收端早已按期限判丢。
+@interface M1PriorityDatagramSink : NSObject <M1DatagramSink>
+@property (nonatomic, strong) M1QuicTransport *transport;
++ (instancetype)sinkForTransport:(M1QuicTransport *)transport;
+@end
+
+@implementation M1PriorityDatagramSink
++ (instancetype)sinkForTransport:(M1QuicTransport *)transport {
+    M1PriorityDatagramSink *s = [M1PriorityDatagramSink new];
+    s.transport = transport;
+    return s;
+}
+- (BOOL)sendDatagram:(NSData *)datagram error:(NSError **)error {
+    return [self.transport sendPriorityDatagram:datagram error:error];
+}
+@end
+
 @interface StreamNode : NSObject <M1QuicTransportDelegate, M1ControlLinkDelegate,
                                  M1ControlSessionDelegate, M1DatagramSink>
 
@@ -118,6 +136,9 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
                                                                               NSError **error);
 // Host 侧：收到 keyframe-request（控制收包队列上调用）。
 @property (nonatomic, copy, nullable) void (^onKeyframeRequest)(void);
+// Host 侧：收到 frame-nack（控制收包队列上调用），应只重发缺失分片。
+@property (nonatomic, copy, nullable) void (^onFrameNack)(uint32_t frameSeq, uint16_t fragCount,
+                                                          NSIndexSet *indices);
 // 单次接入失败（握手/会话错误）时回调：独占模式必须在这里恢复显示，
 // 否则 --wait-ms 0 会清掉错误继续等下一次，把机器留在禁屏态。
 @property (nonatomic, copy, nullable) void (^onAttemptFailed)(void);
@@ -209,7 +230,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 - (void)attachSessionTo:(M1QuicTransport *)conn {
     self.streamConn = conn;
-    self.link = [[M1ControlLink alloc] initWithSink:conn];
+    self.link = [[M1ControlLink alloc] initWithSink:[M1PriorityDatagramSink sinkForTransport:conn]];
     self.link.delegate = self;
     self.channel = [[M1ControlChannel alloc] initWithSink:self.link];
 
@@ -411,6 +432,13 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     if (self.onKeyframeRequest) self.onKeyframeRequest();
 }
 
+- (void)controlSession:(M1ControlSession *)session
+ didRequestFragmentsForFrame:(uint32_t)frameSeq
+             fragCount:(uint16_t)fragCount
+               indices:(NSIndexSet *)indices {
+    if (self.onFrameNack) self.onFrameNack(frameSeq, fragCount, indices);
+}
+
 - (NSArray<NSDictionary *> *)controlSession:(M1ControlSession *)session
                  prepareDisplaysForSessionStart:(NSDictionary *)message
                                        error:(NSError **)error {
@@ -443,6 +471,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 @property (nonatomic, assign) uint64_t keyframeRequests;        // 缺口 episode 数（接收端回调）
 @property (nonatomic, assign) uint64_t keyframeRequestsSent;    // 实际过线的请求数
 @property (nonatomic, assign) uint64_t keyframeRequestFailures; // 非限流原因的发送失败
+@property (nonatomic, assign) uint64_t repairRequests;          // 接收端发起的补片请求（含限流失败）
+@property (nonatomic, assign) uint64_t repairRequestsSent;      // 实际过线的补片请求
 @property (nonatomic, assign) double firstFrameMs;
 @property (nonatomic, assign) double lastFrameMs;
 @property (nonatomic, assign) uint32_t lastSavedSeq;
@@ -518,6 +548,20 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
                 self.keyframeRequestFailures += 1;
             }
         }];
+    // 缺 1~3 片时先走定向补片：只让 Host 重发这几片，通常一个 RTT 内收尾，
+    // 比等下一个 IDR（WAN 实测 kfRtt 800ms+）快一个量级。
+    self.receiver.onNeedRepair = ^(uint32_t frameSeq, uint16_t fragCount,
+                                   NSIndexSet *missingIndices, BOOL keyframe) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        (void)keyframe;
+        self.repairRequests += 1;
+        NSError *nackErr = nil;
+        if ([self.session requestFragmentsForFrameSeq:frameSeq fragCount:fragCount
+                                              indices:missingIndices error:&nackErr]) {
+            self.repairRequestsSent += 1;
+        }
+    };
 }
 
 // 等帧队列排空（否则统计偏小）
@@ -556,11 +600,25 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 // 诊断：把传输层 / 链路层统计和控制包到达时间线打出来。
 // 「心跳是否被推流挤掉」只能靠这两组数据判断——单看最大间隔无法区分
 // 「发送端就没发出去」和「发出去了但在链路上丢了」。
+static void AddTransportStats(NSMutableDictionary *json, M1QuicTransportStats *ts) {
+    json[@"transportSent"] = @(ts.datagramsSent);
+    json[@"transportReceived"] = @(ts.datagramsReceived);
+    json[@"transportSendErrors"] = @(ts.sendErrors);
+    json[@"transportSendQueued"] = @(ts.sendQueued);
+    json[@"transportSendQueueDrops"] = @(ts.sendQueueDrops);
+    json[@"transportSendInFlightMax"] = @(ts.sendInFlightMax);
+    json[@"transportSendCompletionAvgMs"] = @(round(ts.sendCompletionAvgMs * 10) / 10.0);
+    json[@"transportSendCompletionMaxMs"] = @(round(ts.sendCompletionMaxMs * 10) / 10.0);
+}
+
 static void PrintFlowStats(StreamNode *n, const char *tag) {
     M1QuicTransportStats *ts = n.streamConn.stats;
-    printf("  %s 传输: sent=%llu recv=%llu sendErr=%llu | 链路: sent=%lu delivered=%lu "
+    printf("  %s 传输: sent=%llu recv=%llu sendErr=%llu queued=%llu qdrop=%llu "
+           "inFlightMax=%llu txDone=%.1f/%.1fms | 链路: sent=%lu delivered=%lu "
            "retrans=%lu dup=%lu ooo=%lu acks=%lu\n",
            tag, ts.datagramsSent, ts.datagramsReceived, ts.sendErrors,
+           ts.sendQueued, ts.sendQueueDrops, ts.sendInFlightMax,
+           ts.sendCompletionAvgMs, ts.sendCompletionMaxMs,
            (unsigned long)n.link.sentMessages, (unsigned long)n.link.deliveredMessages,
            (unsigned long)n.link.retransmits, (unsigned long)n.link.duplicatesSeen,
            (unsigned long)n.link.heldOutOfOrder, (unsigned long)n.link.acksReceived);
@@ -1076,6 +1134,24 @@ int main(int argc, char **argv) {
                     if (errCount <= 3) printf("  [管线错误] %s\n",
                                               e.localizedDescription.UTF8String);
                 }];
+            // 跨公网下行实测 ~2–3% 随机丢片：IDR 72 片时几乎每帧都缺片，
+            // 被「整帧齐全才交付」放大成反复等待关键帧。
+            // P2.1 起缺片优先走定向补片（frame-nack），整帧副本默认关掉：
+            // 副本会推高在途带宽，反而让补片和在途 IDR 一起堵在拥塞窗口里。
+            {
+                const char *kc = getenv("M1_FRAG_COPIES_KEY");
+                const char *pc = getenv("M1_FRAG_COPIES_P");
+                NSUInteger kCopies = (NSUInteger)MAX(1, kc ? atoi(kc) : 1);
+                NSUInteger pCopies = (NSUInteger)MAX(1, pc ? atoi(pc) : 1);
+                pipe.sender.keyframeCopies = kCopies;
+                pipe.sender.pframeCopies = pCopies;
+                const char *cacheEnv = getenv("M1_FRAG_CACHE");
+                NSUInteger cacheFrames = cacheEnv ? (NSUInteger)MAX(0, atoi(cacheEnv)) : 64;
+                pipe.sender.fragmentCacheFrames = cacheFrames;
+                printf("  分片冗余：关键帧 %lu 份 / P 帧 %lu 份；补片缓存 %lu 帧\n",
+                       (unsigned long)kCopies, (unsigned long)pCopies,
+                       (unsigned long)cacheFrames);
+            }
             if (![pipe start:&err]) {
                 printf("✗ 管线启动失败: %s\n", err.localizedDescription.UTF8String);
                 endExclusive();
@@ -1091,6 +1167,18 @@ int main(int argc, char **argv) {
                 if (now - lastForcedKeyframe < 0.9) return;
                 lastForcedKeyframe = now;
                 [pipe requestKeyframe];
+            };
+            // frame-nack 落到分片缓存：只重发客户端缺的那几片。
+            // 未命中缓存（超出窗口/缓存关闭）就什么都不做——客户端补片窗口到期后
+            // 自己会改走 keyframe-request，不需要在这里重复判定。
+            __block uint64_t nackRepaired = 0, nackMissed = 0, nackFragments = 0;
+            host.onFrameNack = ^(uint32_t frameSeq, uint16_t fragCount, NSIndexSet *indices) {
+                (void)fragCount;
+                NSError *rsErr = nil;
+                NSUInteger n = [pipe.sender resendFragmentsForFrameSeq:frameSeq
+                                                               indices:indices error:&rsErr];
+                if (n > 0) { nackRepaired += 1; nackFragments += n; }
+                else { nackMissed += 1; }
             };
 
             // ---- 输入回传（M1-B）----
@@ -1216,6 +1304,9 @@ int main(int argc, char **argv) {
                    captureID);
             printf("  关键帧请求：收到 %lu 次\n",
                    (unsigned long)host.session.keyframeRequestsReceived);
+            printf("  补片请求：收到 %lu 次，命中重发 %llu 帧/%llu 片，未命中 %llu\n",
+                   (unsigned long)host.session.frameNacksReceived,
+                   nackRepaired, nackFragments, nackMissed);
             if (simLossPct > 0 || simReorderPct > 0) {
                 printf("  注入故障：丢片 %llu 个，乱序交换 %llu 次（%.1f%% / %.1f%%）\n",
                        host.simFragmentsDropped, host.simReordered, simLossPct, simReorderPct);
@@ -1236,6 +1327,10 @@ int main(int argc, char **argv) {
             json[@"framesEncoded"] = @(ps.framesEncoded);
             json[@"framesCaptured"] = @(ps.framesCaptured);
             json[@"fragmentsSent"] = @(ps.fragmentsSent);
+            json[@"fragCopiesKey"] = @(pipe.sender.keyframeCopies);
+            json[@"fragCopiesP"] = @(pipe.sender.pframeCopies);
+            json[@"fragCacheFrames"] = @(pipe.sender.fragmentCacheFrames);
+            json[@"fragmentsResent"] = @(pipe.sender.fragmentsResent);
             json[@"payloadBytes"] = @(ps.payloadBytesSent);
             json[@"keyframes"] = @(ps.keyframes);
             json[@"sendFailures"] = @(ps.sendFailures);
@@ -1258,6 +1353,11 @@ int main(int argc, char **argv) {
                 json[@"sessionEnded"] = @(exclusiveEnded);
             }
             json[@"keyframeRequestsReceived"] = @(host.session.keyframeRequestsReceived);
+            json[@"frameNacksReceived"] = @(host.session.frameNacksReceived);
+            json[@"frameNacksRepaired"] = @(nackRepaired);
+            json[@"frameNackFragmentsResent"] = @(nackFragments);
+            json[@"frameNacksMissed"] = @(nackMissed);
+            AddTransportStats(json, host.streamConn.stats);
             json[@"simLossPct"] = @(simLossPct);
             json[@"simReorderPct"] = @(simReorderPct);
             json[@"simFragmentsDropped"] = @(host.simFragmentsDropped);
@@ -1547,12 +1647,20 @@ int main(int argc, char **argv) {
         printf("\n--- client 结果 ---\n");
         printf("  receiver: datagrams=%llu completed=%llu decoded=%llu dropped=%llu "
                "discardedFrags=%llu decodeFail=%llu keyReq=%llu keyReqSent=%llu "
-               "awaitKeyframe=%.0fms kfRtt=%.0fms/%llu malformed=%llu\n",
+               "repair=%llu repairSent=%llu repairRtt=%.0fms/%llu awaitKeyframe=%.0fms "
+               "kfRtt=%.0fms/%llu malformed=%llu\n",
                rs.datagramsReceived, rs.framesCompleted, rs.framesDecoded,
                rs.framesDropped, rs.fragmentsDiscarded, rs.decodeFailures,
                rs.keyframeRequests, client.keyframeRequestsSent,
+               rs.repairRequests, client.repairRequestsSent,
+               rs.repairRttMs, rs.repairRttSamples,
                rs.awaitingKeyframeMs, rs.keyframeRequestRttMs,
                rs.keyframeRequestRttSamples, rs.malformedDatagrams);
+        printf("  丢帧归因: 关键帧 %llu / P帧 %llu\n",
+               rs.droppedKeyframes, rs.droppedPFrames);
+        for (NSString *detail in rs.recentDropDetails) {
+            printf("    丢帧: %s\n", detail.UTF8String);
+        }
         double firstFrameLatency = (client.firstFrameMs > 0 && client.streamStartMs > 0)
             ? client.firstFrameMs - client.streamStartMs : 0;
         printf("  解码尺寸 %dx%d  解码帧率 %.1f fps  首帧延迟 %.0f ms\n",
@@ -1602,12 +1710,20 @@ int main(int argc, char **argv) {
         json[@"framesCompleted"] = @(rs.framesCompleted);
         json[@"framesDecoded"] = @(rs.framesDecoded);
         json[@"framesDropped"] = @(rs.framesDropped);
+        json[@"droppedKeyframes"] = @(rs.droppedKeyframes);
+        json[@"droppedPFrames"] = @(rs.droppedPFrames);
+        json[@"dropDetails"] = rs.recentDropDetails ?: @[];
         json[@"fragmentsDiscarded"] = @(rs.fragmentsDiscarded);
         json[@"awaitingKeyframeMs"] = @(round(rs.awaitingKeyframeMs));
         json[@"decodeFailures"] = @(rs.decodeFailures);
         json[@"keyframeRequests"] = @(rs.keyframeRequests);
         json[@"keyframeRequestsSent"] = @(client.keyframeRequestsSent);
         json[@"keyframeRequestFailures"] = @(client.keyframeRequestFailures);
+        json[@"repairRequests"] = @(rs.repairRequests);
+        json[@"repairRequestsSent"] = @(client.repairRequestsSent);
+        json[@"frameNacksSent"] = @(client.session.frameNacksSent);
+        json[@"repairRttMs"] = @(round(rs.repairRttMs));
+        json[@"repairRttSamples"] = @(rs.repairRttSamples);
         json[@"keyframeRequestRttMs"] = @(round(rs.keyframeRequestRttMs));
         json[@"keyframeRequestRttSamples"] = @(rs.keyframeRequestRttSamples);
         json[@"malformed"] = @(rs.malformedDatagrams);
@@ -1658,6 +1774,7 @@ int main(int argc, char **argv) {
             json[@"inputDropped"] = @(client.session.inputEventsDropped);
             json[@"inputRejected"] = @(client.session.inputEventsRejected);
         }
+        AddTransportStats(json, client.streamConn.stats);
         json[@"outdir"] = outdir;
         if (outPath.length > 0) {
             NSData *d = JSONData(json);

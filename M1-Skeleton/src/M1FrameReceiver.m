@@ -61,9 +61,15 @@ static BOOL M1SplitAVCC(NSData *payload,
 @property (nonatomic, assign) uint64_t framesCompleted;
 @property (nonatomic, assign) uint64_t framesDecoded;
 @property (nonatomic, assign) uint64_t framesDropped;
+@property (nonatomic, assign) uint64_t droppedKeyframes;
+@property (nonatomic, assign) uint64_t droppedPFrames;
+@property (nonatomic, copy) NSArray<NSString *> *recentDropDetails;
 @property (nonatomic, assign) uint64_t fragmentsDiscarded;
 @property (nonatomic, assign) uint64_t decodeFailures;
 @property (nonatomic, assign) uint64_t keyframeRequests;
+@property (nonatomic, assign) uint64_t repairRequests;
+@property (nonatomic, assign) double repairRttMs;
+@property (nonatomic, assign) uint64_t repairRttSamples;
 @property (nonatomic, assign) double awaitingKeyframeMs;
 @property (nonatomic, assign) double keyframeRequestRttMs;
 @property (nonatomic, assign) uint64_t keyframeRequestRttSamples;
@@ -96,9 +102,15 @@ static BOOL M1SplitAVCC(NSData *payload,
     atomic_uint_fast64_t _framesCompleted;
     atomic_uint_fast64_t _framesDecoded;
     atomic_uint_fast64_t _framesDropped;
+    atomic_uint_fast64_t _droppedKeyframes;
+    atomic_uint_fast64_t _droppedPFrames;
+    NSArray<NSString *> *_recentDropDetails;   // @synchronized(self) 保护
     atomic_uint_fast64_t _fragmentsDiscarded;
     atomic_uint_fast64_t _decodeFailures;
     atomic_uint_fast64_t _keyframeRequests;
+    atomic_uint_fast64_t _repairRequests;
+    _Atomic double _repairRttMs;
+    atomic_uint_fast64_t _repairRttSamples;
     _Atomic double _awaitingKeyframeMs;
     _Atomic double _lastDecodeLatencyMs;
     _Atomic double _decoderCreateMs;
@@ -165,6 +177,21 @@ static double gPrewarmMs = -1;
         _onFrame = [onFrame copy];
         _onNeedKeyframe = [onNeedKeyframe copy];
         _reassembler = [[P1FrameReassembler alloc] init];
+        // 有定向补片后，停滞帧会占用在飞窗口一段时间；窗口太小时后来帧的分片
+        // 会被整批拒绝，补完一帧反而在更后面留下无法补的缺口。12 帧在 15~20fps
+        // 下约 0.6~0.8s，覆盖补片重问的最长等待，仍远小于重排序需求。
+        _reassembler.maxFramesInFlight = 12;
+        const char *winEnv = getenv("M1_FRAME_WINDOW");
+        if (winEnv) _reassembler.maxFramesInFlight = (NSUInteger)MAX(1, atoi(winEnv));
+        __weak M1FrameReceiver *weakSelf = self;
+        _reassembler.onMissingFragments = ^(uint32_t frameSeq, uint16_t fragCount,
+                                            NSIndexSet *missingIndices, BOOL keyframe) {
+            M1FrameReceiver *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            atomic_fetch_add(&strongSelf->_repairRequests, 1);
+            void (^repair)(uint32_t, uint16_t, NSIndexSet *, BOOL) = strongSelf.onNeedRepair;
+            if (repair) repair(frameSeq, fragCount, missingIndices, keyframe);
+        };
         // 初始不在「等关键帧」状态：重组器本身只交付关键帧，这里从 NO 起步，
         // 第一个数据包就能触发一次 keyframe-request（客户端常在中途接入）。
         _awaitingKeyframe = NO;
@@ -182,6 +209,9 @@ static double gPrewarmMs = -1;
         atomic_init(&_fragmentsDiscarded, 0);
         atomic_init(&_decodeFailures, 0);
         atomic_init(&_keyframeRequests, 0);
+        atomic_init(&_repairRequests, 0);
+        atomic_store(&_repairRttMs, 0.0);
+        atomic_init(&_repairRttSamples, 0);
         atomic_init(&_awaitingKeyframeMs, 0.0);
         atomic_store(&_lastDecodeLatencyMs, 0.0);
         atomic_store(&_decoderCreateMs, 0.0);
@@ -221,7 +251,15 @@ static double gPrewarmMs = -1;
     NSData *body = [datagram subdataWithRange:NSMakeRange(P1FrameHeaderSize, h.payloadLen)];
     NSArray<P1ReassembledFrame *> *frames = [_reassembler acceptHeader:h payload:body error:NULL];
     atomic_store(&_framesDropped, (uint64_t)_reassembler.droppedFrames);
+    atomic_store(&_droppedKeyframes, (uint64_t)_reassembler.droppedKeyframes);
+    atomic_store(&_droppedPFrames, (uint64_t)_reassembler.droppedPFrames);
     atomic_store(&_fragmentsDiscarded, (uint64_t)_reassembler.fragmentsDiscarded);
+    atomic_store(&_repairRttMs, _reassembler.lastRepairRttMs);
+    atomic_store(&_repairRttSamples, (uint64_t)_reassembler.repairRttSamples);
+    NSArray<NSString *> *drops = _reassembler.recentDropDetails;
+    if (drops.count > 0) {
+        @synchronized (self) { _recentDropDetails = [drops copy]; }
+    }
 
     // 等待关键帧期间按 1s 重试：WAN 上 IDR 有几百个分片、传输本身就要
     // 一两秒，重试过快只会不断打断在途 IDR。
@@ -232,7 +270,10 @@ static double gPrewarmMs = -1;
             _awaitingKeyframe = YES;
             _awaitingSinceMs = now;
         }
-        if (first || now - _lastKeyframeRequestMs > 1000.0) {
+        // 在途 IDR 只要还在增长就不请求新的：大 IDR 在窄带链路上要传一两秒，
+        // 1s 重试会在它传完之前再塞一个 IDR 进来，两个都收不齐（实测互相打断）。
+        BOOL activeKeyframe = [_reassembler hasActiveKeyframeAtMs:now withinMs:500.0];
+        if (!activeKeyframe && (first || now - _lastKeyframeRequestMs > 1000.0)) {
             _lastKeyframeRequestMs = now;
             atomic_fetch_add(&_keyframeRequests, 1);
             if (_onNeedKeyframe) _onNeedKeyframe();
@@ -422,6 +463,9 @@ static double gPrewarmMs = -1;
         _formatDesc = NULL;
     }
     [_reassembler reset];
+    atomic_store(&_droppedKeyframes, 0);
+    atomic_store(&_droppedPFrames, 0);
+    @synchronized (self) { _recentDropDetails = @[]; }
     _awaitingKeyframe = NO;
     _awaitingSinceMs = 0;
     _lastKeyframeRequestMs = 0;
@@ -434,6 +478,9 @@ static double gPrewarmMs = -1;
     atomic_store(&_framesDropped, 0);
     atomic_store(&_fragmentsDiscarded, 0);
     atomic_store(&_keyframeRequests, 0);
+    atomic_store(&_repairRequests, 0);
+    atomic_store(&_repairRttMs, 0.0);
+    atomic_store(&_repairRttSamples, 0);
     atomic_store(&_awaitingKeyframeMs, 0.0);
 }
 
@@ -453,9 +500,17 @@ static double gPrewarmMs = -1;
     s.framesCompleted = atomic_load(&_framesCompleted);
     s.framesDecoded = atomic_load(&_framesDecoded);
     s.framesDropped = atomic_load(&_framesDropped);
+    s.droppedKeyframes = atomic_load(&_droppedKeyframes);
+    s.droppedPFrames = atomic_load(&_droppedPFrames);
+    @synchronized (self) {
+        s.recentDropDetails = _recentDropDetails ?: @[];
+    }
     s.fragmentsDiscarded = atomic_load(&_fragmentsDiscarded);
     s.decodeFailures = atomic_load(&_decodeFailures);
     s.keyframeRequests = atomic_load(&_keyframeRequests);
+    s.repairRequests = atomic_load(&_repairRequests);
+    s.repairRttMs = atomic_load(&_repairRttMs);
+    s.repairRttSamples = atomic_load(&_repairRttSamples);
     double awaiting = atomic_load(&_awaitingKeyframeMs);
     if (_awaitingKeyframe) awaiting += M1RxNowMs() - _awaitingSinceMs;
     s.awaitingKeyframeMs = awaiting;

@@ -63,9 +63,23 @@ typedef NS_ENUM(NSInteger, M1QuicState) {
 @property (nonatomic, readonly) uint64_t datagramsReceived;
 @property (nonatomic, readonly) uint64_t bytesReceived;
 @property (nonatomic, readonly) uint64_t sendErrors;
+// 发送侧背压观测：QUIC datagram 没有应用层确认，只能看「调用 send 到完成回调」的
+// 时延判断内部队列是否积压。窗口满时数据报先排队（datagramsSent 已计入）。
+@property (nonatomic, readonly) uint64_t sendQueued;          // 进入排队（在飞窗口满）的次数
+@property (nonatomic, readonly) uint64_t sendQueueDrops;      // 排队溢出被拒的次数
+@property (nonatomic, readonly) uint64_t sendInFlightMax;     // 在飞峰值
+@property (nonatomic, readonly) uint64_t sendCompletionSamples;
+@property (nonatomic, readonly) double sendCompletionMaxMs;   // 完成回调最大时延
+@property (nonatomic, readonly) double sendCompletionAvgMs;
 @end
 
 @interface M1QuicTransport : NSObject <M1DatagramSink>
+
+// 高优先级投递：插到发送队列最前，不排在整帧分片之后。
+// 控制通道（心跳/关键帧请求/补片请求）用它——这些包只有几包/秒，
+// 但排在几十上百个帧分片后面时，到达接收端已经超过任何合理的判丢窗口。
+// 仍经过节拍器（≤一个节拍间隔）与队列上限。
+- (BOOL)sendPriorityDatagram:(NSData *)datagram error:(NSError * _Nullable * _Nullable)error;
 
 #pragma mark - 客户端
 

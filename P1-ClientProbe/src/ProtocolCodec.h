@@ -96,9 +96,19 @@ NSArray<NSData *> * _Nullable P1FragmentPayload(NSData *payload,
 @property (nonatomic, readonly, copy) NSData *payload;
 @end
 
+// 定向补片回调：某帧停止推进、首次超期时把缺失分片下标交出。
+//   missingIndices 为缺失片下标（升序，个数 ≤ maxRepairFragments）；
+//   keyframe 表示该帧是否关键帧。回调在 acceptHeader 的调用线程上同步执行，
+//   实现方必须非阻塞（只做控制消息入队）。
+typedef void (^P1MissingFragmentsHandler)(uint32_t frameSeq, uint16_t fragCount,
+                                          NSIndexSet *missingIndices, BOOL keyframe);
+
 // 分片重组 v3：按 displayID + frameSeq 位图累积，容忍乱序与重复；
 // 一个帧自首片到达起超过 frameDeadlineMs 仍未收齐即判丢（其后帧一并作废），
 // 置 needsKeyframe 并只接受关键帧重启。收齐的帧按 frameSeq 顺序交付。
+//
+// v4 增加定向补片：首次超期时先回调 onMissingFragments 并延长 repairGraceMs，
+// 让发送端只重发缺失片；补片仍没到才按上面的规则判丢。
 @interface P1FrameReassembler : NSObject
 
 // 交入一个分片（header 与 payload 已分开解析）。
@@ -114,11 +124,35 @@ NSArray<NSData *> * _Nullable P1FragmentPayload(NSData *payload,
                                           error:(NSError * _Nullable * _Nullable)error;
 
 @property (nonatomic) double frameDeadlineMs;      // 默认 120ms
+// 停滞多久就发补片请求。要比 frameDeadlineMs 早，给补片留出往返时间；
+// 提前请求的代价只是多一个可能白发的 NACK（重复分片本来就会被忽略）。
+@property (nonatomic) double repairRequestMs;      // 默认 60ms
+// 发出补片请求后的额外等待窗口；补片到齐即继续交付，否则到期判丢。
+@property (nonatomic) double repairGraceMs;        // 默认 250ms
+// 补片没到时的重问间隔与次数上限：重发的分片本身也可能再丢一次，
+// 一次 NACK 石沉大海就整帧判死、退回 1.5s 的关键帧重建，代价太大。
+@property (nonatomic) double repairRetryMs;        // 默认 120ms
+@property (nonatomic) NSUInteger maxRepairAttempts; // 默认 3
+// 单次补片请求的缺失片上限；超过说明缺口太大，直接走关键帧重建更划算。
+@property (nonatomic) NSUInteger maxRepairFragments; // 默认 32
+@property (nonatomic, copy, nullable) P1MissingFragmentsHandler onMissingFragments;
+@property (nonatomic, readonly) NSUInteger repairRequests;   // 已发出的补片请求数
+// 最近一次「补片请求发出 → 该帧收齐」的耗时；补片本身丢了不算采样。
+@property (nonatomic, readonly) double lastRepairRttMs;
+@property (nonatomic, readonly) NSUInteger repairRttSamples;
 @property (nonatomic) NSUInteger maxFramesInFlight; // 默认 4，同时也是 seq 超前窗口
 @property (nonatomic, readonly) BOOL needsKeyframe;        // 需要向 Host 请求关键帧
 @property (nonatomic, readonly) NSUInteger droppedFrames;  // 已判定丢弃的整帧数
+@property (nonatomic, readonly) NSUInteger droppedKeyframes;  // 其中关键帧（丢片导致收不齐）
+@property (nonatomic, readonly) NSUInteger droppedPFrames;    // 其中 P 帧
+// 最近 16 次丢帧的细节（seq/key/收到片数/缺失分片下标），用于区分
+// 「WAN 随机丢片」与「发送突发把 QUIC 队列灌满」。
+@property (nonatomic, readonly, copy) NSArray<NSString *> *recentDropDetails;
 @property (nonatomic, readonly) NSUInteger fragmentsDiscarded; // 随之丢弃的分片数（含重复/迟到）
 @property (nonatomic, readonly) uint32_t lastCompletedSeq;
+// 是否有关键帧仍在推进（最近 withinMs 内收到新分片）。接收端用它避免在
+// 在途 IDR 还在增长时再请求一个新 IDR，否则连环 IDR 会互相打断。
+- (BOOL)hasActiveKeyframeAtMs:(double)nowMs withinMs:(double)windowMs;
 - (void)reset;
 
 @end

@@ -27,9 +27,15 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) uint64_t framesCompleted;    // 重组收齐并按序交付的帧
 @property (nonatomic, readonly) uint64_t framesDecoded;      // 成功解出画面
 @property (nonatomic, readonly) uint64_t framesDropped;      // 帧级：期限判丢 + 无参数集/解码前置失败
+@property (nonatomic, readonly) uint64_t droppedKeyframes;      // 因缺片收不齐而被丢弃的关键帧数
+@property (nonatomic, readonly) uint64_t droppedPFrames;        // 同上，P 帧数
+@property (nonatomic, readonly, copy) NSArray<NSString *> *recentDropDetails; // 最近 16 条丢帧细节
 @property (nonatomic, readonly) uint64_t fragmentsDiscarded; // 随丢帧/重复/迟到一起丢弃的分片数
 @property (nonatomic, readonly) uint64_t decodeFailures;
 @property (nonatomic, readonly) uint64_t keyframeRequests;   // 请求关键帧的「次数」（缺口 episode）
+@property (nonatomic, readonly) uint64_t repairRequests;     // 定向补片请求数（缺 1~3 片时优先于关键帧）
+@property (nonatomic, readonly) double repairRttMs;            // 最近一次补片请求→收齐的耗时
+@property (nonatomic, readonly) uint64_t repairRttSamples;
 @property (nonatomic, readonly) double awaitingKeyframeMs;   // 处于等关键帧状态的总时长
 // 最近一次「首个成功请求发出 → 后续关键帧完整重组到达」的耗时。
 // 不含 VT 解码/上屏；0 表示本轮没有完成的采样。
@@ -64,6 +70,13 @@ NS_ASSUME_NONNULL_BEGIN
 // 客户端成功把 keyframe-request 送上控制通道时调用；限流/发送失败不要调用。
 // 同一等待周期内只以首个成功请求作为 RTT 起点，重复请求不重置。
 - (void)noteKeyframeRequestSent;
+
+// 定向补片回调：某帧缺片停滞时先交出缺失片下标，由上层经控制通道请求 Host
+// 只重发这几片。为 nil（或返回不处理）时，重组器在补片窗口后照旧判丢并请求关键帧。
+// 回调在 acceptDatagram 的调用线程上，必须非阻塞。
+@property (nonatomic, copy, nullable) void (^onNeedRepair)(uint32_t frameSeq, uint16_t fragCount,
+                                                           NSIndexSet *missingIndices,
+                                                           BOOL keyframe);
 
 // 丢弃解码器与重组状态。分辨率变化或重连时调用。
 - (void)reset;

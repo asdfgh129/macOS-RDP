@@ -69,6 +69,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) int32_t pixelHeight;
 @property (nonatomic, readonly) uint32_t nextFrameSeq;
 @property (nonatomic, readonly) M1FramePipelineStats *stats;
+// 发送器：跨公网时用于开启分片冗余（见 M1FrameSender.keyframeCopies）。
+@property (nonatomic, readonly) M1FrameSender *sender;
 
 @end
 

@@ -270,6 +270,9 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 @property (nonatomic, assign) BOOL keyframe;
 @property (nonatomic, assign) BOOL carriesParamSets;
 @property (nonatomic, assign) double lastProgressMs;   // 最近一次收到新分片的时刻
+@property (nonatomic, assign) BOOL repairEmitted;      // 本帧是否已请求过定向补片
+@property (nonatomic, assign) NSUInteger repairAttempts;  // 已请求次数（含重问）
+@property (nonatomic, assign) double repairRequestedAtMs;
 @property (nonatomic, assign) NSUInteger receivedCount;
 @property (nonatomic, assign) NSUInteger totalBytes;
 @property (nonatomic, strong) NSMutableArray *slots;
@@ -285,7 +288,13 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     uint32_t _nextSeq;             // 下一个应交出的 frameSeq
     BOOL _needsKeyframe;
     NSUInteger _droppedFrames;
+    NSUInteger _droppedKeyframes;
+    NSUInteger _droppedPFrames;
     NSUInteger _fragmentsDiscarded;
+    NSUInteger _repairRequests;
+    double _lastRepairRttMs;
+    NSUInteger _repairRttSamples;
+    NSMutableArray<NSString *> *_dropDetails;
     uint32_t _lastCompletedSeq;
     BOOL _haveDisplay;
     uint32_t _activeDisplay;
@@ -295,6 +304,11 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 - (instancetype)init {
     if ((self = [super init])) {
         _frameDeadlineMs = 120.0;
+        _repairRequestMs = 60.0;
+        _repairGraceMs = 250.0;
+        _repairRetryMs = 120.0;
+        _maxRepairAttempts = 3;
+        _maxRepairFragments = 32;
         _maxFramesInFlight = 4;
         [self reset];
     }
@@ -310,17 +324,63 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     _nextSeq = 0;
     _needsKeyframe = YES;
     _droppedFrames = 0;
+    _droppedKeyframes = 0;
+    _droppedPFrames = 0;
     _fragmentsDiscarded = 0;
+    _repairRequests = 0;
+    _lastRepairRttMs = 0;
+    _repairRttSamples = 0;
+    _dropDetails = [NSMutableArray array];
     _lastCompletedSeq = 0;
     _haveDisplay = NO;
     _activeDisplay = 0;
     _gapSinceMs = 0;
 }
 
+- (NSUInteger)droppedKeyframes { return _droppedKeyframes; }
+- (NSUInteger)droppedPFrames { return _droppedPFrames; }
+- (NSArray<NSString *> *)recentDropDetails { return [_dropDetails copy]; }
+- (NSUInteger)repairRequests { return _repairRequests; }
+- (double)lastRepairRttMs { return _lastRepairRttMs; }
+- (NSUInteger)repairRttSamples { return _repairRttSamples; }
+
+- (BOOL)hasActiveKeyframeAtMs:(double)nowMs withinMs:(double)windowMs {
+    for (P1PartialFrame *p in _partials.allValues) {
+        if (p.keyframe && nowMs - p.lastProgressMs <= windowMs) return YES;
+    }
+    return NO;
+}
+
 #pragma mark 内部
 
+// 丢帧原因要能回答两个问题：丢的是不是关键帧、缺的是不是尾部连续分片。
+// 随机丢片缺片位置分散；发送突发灌满 QUIC 队列时通常成片缺在尾部。
+- (void)noteDropOfPartial:(P1PartialFrame *)p reason:(NSString *)reason {
+    if (p.keyframe) _droppedKeyframes++;
+    else _droppedPFrames++;
+    if (_dropDetails.count >= 16) return;
+    NSMutableString *missing = [NSMutableString string];
+    NSUInteger missCount = 0;
+    for (NSUInteger i = 0; i < p.slots.count; i++) {
+        if (p.slots[i] == (id)[NSNull null]) {
+            missCount++;
+            if (missCount <= 8) [missing appendFormat:@"%lu ", (unsigned long)i];
+        }
+    }
+    [_dropDetails addObject:[NSString stringWithFormat:
+        @"seq=%u key=%d recv=%lu/%lu miss=%lu [%@] %@",
+        p.frameSeq, p.keyframe, (unsigned long)p.receivedCount,
+        (unsigned long)p.fragCount, (unsigned long)missCount,
+        [missing stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceCharacterSet]], reason]];
+}
+
 - (void)dropPartial:(P1PartialFrame *)p countAsFrame:(BOOL)countAsFrame {
-    if (countAsFrame) _droppedFrames++;
+    if (countAsFrame) {
+        _droppedFrames++;
+        [self noteDropOfPartial:p reason:(p.repairEmitted ? @"deadline-after-repair"
+                                                         : @"deadline-before-repair")];
+    }
     _fragmentsDiscarded += p.receivedCount;
     [_partials removeObjectForKey:@(p.frameSeq)];
 }
@@ -329,7 +389,16 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 - (void)declareLoss {
     for (P1PartialFrame *p in _partials.allValues) {
         _droppedFrames++;
+        [self noteDropOfPartial:p reason:(p.repairEmitted ? @"gap-after-repair" : @"gap")];
         _fragmentsDiscarded += p.receivedCount;
+    }
+    for (P1ReassembledFrame *f in _ready.allValues) {
+        if (f.keyframe) _droppedKeyframes++;
+        else _droppedPFrames++;
+        if (_dropDetails.count < 16) {
+            [_dropDetails addObject:[NSString stringWithFormat:
+                @"seq=%u key=%d ready-dropped gap", f.frameSeq, f.keyframe]];
+        }
     }
     _droppedFrames += _ready.count;
     [_partials removeAllObjects];
@@ -343,10 +412,15 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 - (void)restartAtKeyframeSeq:(uint32_t)seq {
     NSUInteger lost = 0;
     for (P1PartialFrame *p in _partials.allValues) {
+        [self noteDropOfPartial:p reason:@"pre-keyframe"];
         _fragmentsDiscarded += p.receivedCount;
         lost++;
     }
-    lost += _ready.count;
+    for (P1ReassembledFrame *f in _ready.allValues) {
+        if (f.keyframe) _droppedKeyframes++;
+        else _droppedPFrames++;
+        lost++;
+    }
     _droppedFrames += lost;
     [_partials removeAllObjects];
     [_ready removeAllObjects];
@@ -358,12 +432,75 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 
 // 帧期限判据是「停止推进」而不是「总耗时」：大帧（WAN 上的 IDR）可以合法地
 // 持续收上几百毫秒，只要不断有新分片进来；真正缺片后 120ms 内没有新分片即判丢。
-- (void)evictExpiredAt:(double)nowMs {
-    NSMutableArray<P1PartialFrame *> *dead = [NSMutableArray array];
-    for (P1PartialFrame *p in _partials.allValues) {
-        if (nowMs - p.lastProgressMs > self.frameDeadlineMs) [dead addObject:p];
+//
+// v4：首次超期先不判死，把缺失片下标交给发送端做定向重发，并给一个 repairGraceMs
+// 的补片窗口。整帧重发（尤其是 IDR 的 70+ 片）在 WAN 上代价太高且会与在途帧抢带宽，
+// 一两片缺失时只补那几片通常一个 RTT 内就能收尾。
+- (NSIndexSet *)missingIndicesOfPartial:(P1PartialFrame *)p {
+    NSMutableIndexSet *missing = [NSMutableIndexSet indexSet];
+    for (NSUInteger i = 0; i < p.slots.count; i++) {
+        if (p.slots[i] == (id)[NSNull null]) [missing addIndex:i];
     }
-    if (dead.count == 0) return;
+    return missing;
+}
+
+- (void)evictExpiredAt:(double)nowMs {
+    NSMutableArray<P1PartialFrame *> *expired = [NSMutableArray array];
+    for (P1PartialFrame *p in _partials.allValues) {
+        // 补片请求要比判丢早：WAN 上 NACK 往返 + 重发要 100ms 量级，
+        // 等判丢那一刻才请求，补片必然晚于任何一个合理的等待窗口。
+        // 重发的分片也可能再丢，所以按 repairRetryMs 重问，最多 maxRepairAttempts 次。
+        BOOL stalled = nowMs - p.lastProgressMs > self.repairRequestMs;
+        BOOL retryDue = p.repairAttempts > 0 && p.repairAttempts < MAX(1, self.maxRepairAttempts) &&
+                        nowMs - p.repairRequestedAtMs >= self.repairRetryMs;
+        if (self.onMissingFragments && (stalled || retryDue) &&
+            (!p.repairEmitted || retryDue)) {
+            NSIndexSet *missing = [self missingIndicesOfPartial:p];
+            if (missing.count > 0 && missing.count <= MAX(1, self.maxRepairFragments)) {
+                p.repairEmitted = YES;
+                p.repairAttempts += 1;
+                p.repairRequestedAtMs = nowMs;
+                _repairRequests++;
+                self.onMissingFragments(p.frameSeq, p.fragCount, missing, p.keyframe);
+            }
+        }
+        // 补片窗口从「最近一次请求」起算：每次重问都把期限往后推一个窗口，
+        // 但重问次数有上限，所以一个死帧最多占住链路几百毫秒。
+        double deadline = p.repairEmitted
+            ? MAX(self.repairGraceMs, self.frameDeadlineMs)
+            : self.frameDeadlineMs;
+        double ref = p.repairEmitted ? MAX(p.lastProgressMs, p.repairRequestedAtMs)
+                                     : p.lastProgressMs;
+        if (nowMs - ref > deadline) [expired addObject:p];
+    }
+    if (expired.count == 0) return;
+
+    NSMutableArray<P1PartialFrame *> *dead = [NSMutableArray array];
+    BOOL emitted = NO;
+    for (P1PartialFrame *p in expired) {
+        if (!p.repairEmitted && self.onMissingFragments) {
+            NSIndexSet *missing = [self missingIndicesOfPartial:p];
+            if (missing.count > 0 && missing.count <= MAX(1, self.maxRepairFragments)) {
+                p.repairEmitted = YES;
+                p.repairAttempts += 1;
+                p.repairRequestedAtMs = nowMs;
+                _repairRequests++;
+                self.onMissingFragments(p.frameSeq, p.fragCount, missing, p.keyframe);
+                emitted = YES;
+                continue;
+            }
+        }
+        [dead addObject:p];
+    }
+    if (emitted) {
+        // 同批超期多半是同一段链路抖动造成的：已经发出补片请求，就先别让
+        // 同批的其他帧立刻宣告整链丢失（declareLoss 会连补片中的帧一起清掉）。
+        for (P1PartialFrame *p in dead) {
+            p.repairEmitted = YES;
+            p.lastProgressMs = nowMs;
+        }
+        return;
+    }
     for (P1PartialFrame *p in dead) [self dropPartial:p countAsFrame:YES];
     [self declareLoss];
 }
@@ -521,6 +658,10 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     frame.carriesParamSets = p.carriesParamSets;
     frame.payload = whole;
     [_partials removeObjectForKey:@(seq)];
+    if (p.repairEmitted && p.repairRequestedAtMs > 0 && nowMs > p.repairRequestedAtMs) {
+        _lastRepairRttMs = nowMs - p.repairRequestedAtMs;
+        _repairRttSamples++;
+    }
 
     if (_needsKeyframe && !frame.keyframe) {
         _droppedFrames++;

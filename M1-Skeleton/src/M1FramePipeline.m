@@ -113,6 +113,7 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
 - (int32_t)pixelWidth { return _capture ? _capture.pixelWidth : _stoppedWidth; }
 - (int32_t)pixelHeight { return _capture ? _capture.pixelHeight : _stoppedHeight; }
 - (uint32_t)nextFrameSeq { return _sender.nextFrameSeq; }
+- (M1FrameSender *)sender { return _sender; }
 
 - (BOOL)start:(NSError **)error {
     if (error) *error = nil;

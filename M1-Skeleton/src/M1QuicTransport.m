@@ -8,6 +8,7 @@
 #import <Security/Security.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <os/lock.h>
+#import <mach/mach_time.h>
 #import <string.h>
 
 NSString * const M1QuicErrorDomain = @"M1Quic";
@@ -264,10 +265,27 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
 @property (nonatomic, assign) uint64_t datagramsReceived;
 @property (nonatomic, assign) uint64_t bytesReceived;
 @property (nonatomic, assign) uint64_t sendErrors;
+@property (nonatomic, assign) uint64_t sendQueued;
+@property (nonatomic, assign) uint64_t sendQueueDrops;
+@property (nonatomic, assign) uint64_t sendInFlightMax;
+@property (nonatomic, assign) uint64_t sendCompletionSamples;
+@property (nonatomic, assign) double sendCompletionMaxMs;
+@property (nonatomic, assign) double sendCompletionTotalMs;
 @end
 
 @implementation M1QuicTransportStats
+- (double)sendCompletionAvgMs {
+    return self.sendCompletionSamples > 0
+        ? self.sendCompletionTotalMs / (double)self.sendCompletionSamples : 0;
+}
 @end
+
+static double M1QuicMonotonicMs(void) {
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    return (double)mach_absolute_time() * tb.numer / tb.denom / 1e6;
+}
 
 #pragma mark - 传输
 
@@ -299,6 +317,19 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
 @property (nonatomic, assign) BOOL verifyPeer;
 @property (nonatomic, copy, nullable) NSString *host;
 @property (nonatomic, assign) uint16_t port;
+
+// 发送背压：QUIC datagram 在拥塞窗口/内部队列满时会被静默丢弃（RFC 9221 允许），
+// 应用层只看到 sendErr=0。IDR 一帧几十个分片连发最容易触发，表现为整帧收不齐、
+// 客户端反复等关键帧。这里用「在飞窗口 + 完成回调驱动泵」把突发摊平：
+// 完成回调代表 QUIC 已消化一个 datagram，再放行下一个，天然跟随链路速率。
+@property (nonatomic, strong) NSLock *sendLock;
+@property (nonatomic, strong) NSMutableArray<NSData *> *sendPending;
+@property (nonatomic, strong) dispatch_queue_t sendPumpQueue;
+@property (nonatomic, assign) NSUInteger sendInFlight;
+@property (nonatomic, assign) NSUInteger sendWindow;
+@property (nonatomic, assign) NSUInteger sendPendingLimit;
+@property (nonatomic, assign) double sendPacePps;      // 0 = 仅靠窗口自时钟
+@property (nonatomic, assign) double sendNextSlotMs;
 @end
 
 @implementation M1QuicTransport
@@ -364,6 +395,15 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
     _connectTimeoutMs = 3000;
     _maxConnectAttempts = 2;
     _connectAttempts = 0;
+
+    _sendLock = [NSLock new];
+    _sendPending = [NSMutableArray array];
+    _sendPumpQueue = dispatch_queue_create("m1.quic.sendpump", DISPATCH_QUEUE_SERIAL);
+    const char *win = getenv("M1_QUIC_SEND_WINDOW");
+    _sendWindow = win ? (NSUInteger)MAX(0, atoi(win)) : 8;
+    const char *pps = getenv("M1_QUIC_PACE_PPS");
+    _sendPacePps = pps ? MAX(0.0, atof(pps)) : 0.0;
+    _sendPendingLimit = 4096;
 }
 
 #pragma mark 参数构造
@@ -683,6 +723,10 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
         self.conn = nil;
     }
     [self.acceptedConnection cancel];
+    [self.sendLock lock];
+    [self.sendPending removeAllObjects];
+    self.sendInFlight = 0;
+    [self.sendLock unlock];
     if (self.state != M1QuicStateFailed) self.state = M1QuicStateCancelled;
     [self.readyCond lock];
     [self.readyCond broadcast];
@@ -721,30 +765,156 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
         return NO;
     }
 
+    NSData *payload = [datagram copy];
+    [self.sendLock lock];
+    if (self.sendPending.count >= self.sendPendingLimit) {
+        self.stats.sendQueueDrops += 1;
+        [self.sendLock unlock];
+        if (error) {
+            *error = M1QuicErr(M1QuicErrorSendFailed, @"发送队列已满（链路长时间不消化）");
+        }
+        return NO;
+    }
+    if (self.sendPending.count > 0 || (self.sendWindow > 0 && self.sendInFlight >= self.sendWindow)) {
+        self.stats.sendQueued += 1;
+    }
+    [self.sendPending addObject:payload];
+    [self.sendLock unlock];
+
+    self.stats.datagramsSent += 1;
+    self.stats.bytesSent += len;
+    dispatch_async(self.sendPumpQueue, ^{ [self pumpSends]; });
+    return YES;
+}
+
+- (BOOL)sendPriorityDatagram:(NSData *)datagram error:(NSError **)error {
+    if (self.conn == nil || self.state != M1QuicStateReady) {
+        if (error) *error = M1QuicErr(M1QuicErrorNotReady, @"连接未就绪，拒绝投递");
+        return NO;
+    }
+    NSUInteger len = datagram.length;
+    if (len == 0) {
+        if (error) *error = M1QuicErr(M1QuicErrorSendFailed, @"空 datagram");
+        return NO;
+    }
+    if (self.maxDatagramPayload > 0 && len > self.maxDatagramPayload) {
+        if (error) *error = M1QuicErr(M1QuicErrorSendFailed,
+            [NSString stringWithFormat:@"超过协商上限：%lu > %lu",
+             (unsigned long)len, (unsigned long)self.maxDatagramPayload]);
+        return NO;
+    }
+
+    NSData *payload = [datagram copy];
+    [self.sendLock lock];
+    if (self.sendPending.count >= self.sendPendingLimit) {
+        self.stats.sendQueueDrops += 1;
+        [self.sendLock unlock];
+        if (error) {
+            *error = M1QuicErr(M1QuicErrorSendFailed, @"发送队列已满（链路长时间不消化）");
+        }
+        return NO;
+    }
+    [self.sendPending insertObject:payload atIndex:0];
+    [self.sendLock unlock];
+
+    self.stats.datagramsSent += 1;
+    self.stats.bytesSent += len;
+    dispatch_async(self.sendPumpQueue, ^{ [self pumpSends]; });
+    return YES;
+}
+
+- (void)sendFinished {
+    [self.sendLock lock];
+    if (self.sendInFlight > 0) self.sendInFlight -= 1;
+    [self.sendLock unlock];
+    dispatch_async(self.sendPumpQueue, ^{ [self pumpSends]; });
+}
+
+// 只在 sendPumpQueue 上执行：窗口/节拍允许时取一个 datagram 交给 QUIC，
+// 完成回调再触发下一轮。突发因此被摊成链路能消化的速率，避免内部队列溢出静默丢包。
+- (void)pumpSends {
+    for (;;) {
+        NSData *next = nil;
+        nw_connection_t conn = nil;
+        double waitMs = 0;
+        [self.sendLock lock];
+        if (self.state != M1QuicStateReady || self.conn == nil) {
+            [self.sendPending removeAllObjects];
+            self.sendInFlight = 0;
+            [self.sendLock unlock];
+            return;
+        }
+        BOOL windowOpen = (self.sendWindow == 0 || self.sendInFlight < self.sendWindow);
+        if (windowOpen && self.sendPending.count > 0) {
+            double now = M1QuicMonotonicMs();
+            if (self.sendPacePps > 0 && now + 0.05 < self.sendNextSlotMs) {
+                waitMs = self.sendNextSlotMs - now;
+            } else {
+                next = self.sendPending.firstObject;
+                [self.sendPending removeObjectAtIndex:0];
+                conn = self.conn;
+                self.sendInFlight += 1;
+                if (self.sendInFlight > self.stats.sendInFlightMax) {
+                    self.stats.sendInFlightMax = self.sendInFlight;
+                }
+                if (self.sendPacePps > 0) {
+                    double slot = 1000.0 / self.sendPacePps;
+                    self.sendNextSlotMs = MAX(now, self.sendNextSlotMs) + slot;
+                }
+            }
+        }
+        [self.sendLock unlock];
+
+        if (next) {
+            [self transmitDatagram:next on:conn];
+            continue;
+        }
+        if (waitMs > 0) {
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(waitMs * NSEC_PER_MSEC)),
+                           self.sendPumpQueue, ^{ [weakSelf pumpSends]; });
+        }
+        return;
+    }
+}
+
+- (void)transmitDatagram:(NSData *)datagram on:(nw_connection_t)conn {
+    NSUInteger len = datagram.length;
+    if (!conn || len == 0) {
+        [self sendFinished];
+        return;
+    }
     void *buf = malloc(len);
     if (!buf) {
-        if (error) *error = M1QuicErr(M1QuicErrorSendFailed, @"malloc 失败");
-        return NO;
+        [self sendFinished];
+        dispatch_async(self.queue, ^{ self.stats.sendErrors += 1; });
+        return;
     }
     memcpy(buf, datagram.bytes, len);
     dispatch_data_t content = dispatch_data_create(buf, len, self.queue,
                                                    DISPATCH_DATA_DESTRUCTOR_FREE);
-
+    double startMs = M1QuicMonotonicMs();
     __weak typeof(self) weakSelf = self;
     // is_complete=YES ⇒ 一次 send 就是一个 datagram 边界；不关闭连接的 message context。
-    nw_connection_send(self.conn, content, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true,
+    nw_connection_send(conn, content, NW_CONNECTION_DEFAULT_MESSAGE_CONTEXT, true,
                        ^(nw_error_t e) {
-        if (!e) return;
         M1QuicTransport *strong = weakSelf;
         if (!strong) return;
+        double elapsedMs = M1QuicMonotonicMs() - startMs;
         dispatch_async(strong.queue, ^{
-            strong.stats.sendErrors += 1;
+            if (e) {
+                strong.stats.sendErrors += 1;
+                M1QLOG("send error %s", M1DescribeNWError(e).UTF8String);
+            }
+            strong.stats.sendCompletionSamples += 1;
+            strong.stats.sendCompletionTotalMs += elapsedMs;
+            if (elapsedMs > strong.stats.sendCompletionMaxMs) {
+                strong.stats.sendCompletionMaxMs = elapsedMs;
+            }
+            [strong sendFinished];
         });
     });
-
-    self.stats.datagramsSent += 1;
-    self.stats.bytesSent += len;
-    return YES;
 }
 
 - (void)receiveNext {

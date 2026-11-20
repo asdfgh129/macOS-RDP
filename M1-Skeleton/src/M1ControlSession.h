@@ -83,6 +83,15 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 //   回调在控制收包队列上；不能阻塞（码流线程可能正在等这个决定）。
 - (void)controlSessionDidRequestKeyframe:(M1ControlSession *)session;
 
+// Host 侧：收到 Client 的 frame-nack，应只重发该帧缺失的分片（定向补片）。
+//   frameSeq/fragCount 来自客户端重组器；indices 为缺失片下标（已校验升序、<fragCount）。
+//   回调在控制收包队列上；不能阻塞。发送端没有该帧缓存时可不处理，
+//   客户端补片窗口到期后会改走 keyframe-request。
+- (void)controlSession:(M1ControlSession *)session
+ didRequestFragmentsForFrame:(uint32_t)frameSeq
+             fragCount:(uint16_t)fragCount
+               indices:(NSIndexSet *)indices;
+
 // Host 侧：收到客户端输入事件。
 //   · 只在 STREAMING 态回调（PROTOCOL §3.1）；
 //   · 事件已过 P1InputCodec 校验（kind/坐标/键码/flags 合法）与 1000 event/s 限速；
@@ -133,8 +142,18 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 //   非 STREAMING 返回 NO（INVALID_STATE），限流返回 NO（RATE_LIMITED）。
 - (BOOL)requestKeyframeWithError:(NSError * _Nullable * _Nullable)error;
 
+// Client：帧重组停滞时请求 Host 定向补片（只重发缺失分片）。
+//   限流 5ms/次（同批多帧可能同时停滞；重组器每帧只请求一次）；indices 最多 64 个且必须 < fragCount。
+//   非 STREAMING 返回 NO（INVALID_STATE），限流/参数错返回 NO（RATE_LIMITED/PROTOCOL）。
+- (BOOL)requestFragmentsForFrameSeq:(uint32_t)frameSeq
+                          fragCount:(uint16_t)fragCount
+                            indices:(NSIndexSet *)indices
+                              error:(NSError * _Nullable * _Nullable)error;
+
 @property (nonatomic, readonly) NSUInteger keyframeRequestsSent;      // Client 实际发出
 @property (nonatomic, readonly) NSUInteger keyframeRequestsReceived;  // Host 收到并回调
+@property (nonatomic, readonly) NSUInteger frameNacksSent;            // Client 发出的补片请求
+@property (nonatomic, readonly) NSUInteger frameNacksReceived;        // Host 收到并回调
 
 @end
 
