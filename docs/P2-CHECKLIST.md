@@ -218,6 +218,40 @@ P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
 
 ---
 
+### 3.1 P2.1 跨公网门禁复测（2026-11-20）
+
+本机 host 已以 **720p15 / P2_WAIT_MS=0 / M1_QUIC_DEBUG=1** 启动，
+输出目录 `P2-Dual/out/remote-p21-1120/`，等 Sequoia 侧 client 接入。
+
+host 三项（指纹不变）：
+
+```
+IP   : 112.5.32.34
+端口 : 46600
+指纹 : 3305dec4c356fadda287fdbe069bd10d8d4088aac57ba08108e7fb39433b1604
+```
+
+Sequoia 侧（先 `git pull` 并重编到同一 commit `647d36e`）：
+
+```bash
+cd <macOS-RDP>/P2-Dual
+git -C .. pull && bash ../M1-Skeleton/build_stream_probe.sh
+M1_QUIC_DEBUG=1 P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 P2_SECONDS=35 \
+  ./p2.sh client --host 112.5.32.34 --port 46600 \
+  --fingerprint 3305dec4c356fadda287fdbe069bd10d8d4088aac57ba08108e7fb39433b1604
+```
+
+判定（P2.1 门禁见 §4）：解码/发出 **≥0.85**、`sendFailures=0`、
+`awaitingKeyframeMs` 占比 <10%、控制间隔 <3s。把两端 JSON 汇总：
+
+```bash
+./p2.sh summary <host.json> <client.json>
+```
+
+> 镜像模式不建虚拟屏，client 不需要传 `--spec`/`P2_SPEC`；尺寸断言不参与判定。
+
+---
+
 ## 4. 判定阈值
 
 结构性指标（`./p2.sh summary host.json client.json` 会自动判 PASS/FAIL）：
