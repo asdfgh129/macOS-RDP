@@ -58,13 +58,13 @@
 
 | 步骤 | 内容 | 文件 |
 |---|---|---|
-| 2.1 | `stream_probe --host --spec WxH [--exclusive]`：走 `M1SessionCoordinator` 建虚拟屏→禁物理屏→C-09 校验→用返回的 displayID 建 `M1FramePipeline`；结束恢复物理屏。默认仍为 `--mirror`（采物理主屏），保住现有诊断路径 | `stream_probe.m`、`M1SessionCoordinator.{h,m}` |
+| 2.1 | ✅ 2026-11-20 23:3x 收口：`stream_probe --host` **默认**走 `M1SessionCoordinator`，按客户端 `session-start specs` 建虚拟屏→禁物理屏→C-09 校验→用返回的 displayID 建 `M1FramePipeline`，结束恢复；`--mirror` 保留为诊断开关（采物理主屏，旧默认），`--exclusive` 仍接受（兼容） | `stream_probe.m`、`M1SessionCoordinator.{h,m}` |
 | 2.2 | 客户端把请求规格随 `session-start{specs[]}` 发出，窗口按比例 letterbox；不建任何本地虚拟屏（设计上虚拟屏在被控端） | `stream_probe.m`、`M1ControlSession.m` |
 | 2.3 | 前置冒烟：两台机分别跑 `pipeline_kiosk_probe`（本机、无网络），确认建屏/禁屏/采集/恢复；Tahoe 先用 `--keep-main` 半禁屏作对照 | `pipeline_kiosk_probe.m` |
 | 2.4 | 失败处置：A-08（Tahoe 零物理屏下 SCK 送帧不稳定）复发时，记录 OS/机型并回退镜像模式，不阻塞 P2.1 结论 | — |
 
 **完成判据**
-- `--exclusive` 启动后：host 打印新建虚拟屏 displayID；会话期间 `CGGetActiveDisplayList` 只返回该虚拟屏（C-09）；client 解码尺寸等于请求规格；结束物理屏恢复、无 WindowServer 断言。
+- host 默认启动（按规格建屏）后：打印新建虚拟屏 displayID；会话期间 `CGGetActiveDisplayList` 只返回该虚拟屏（C-09）；client 解码尺寸等于请求规格；结束物理屏恢复、无 WindowServer 断言。
 - 物理屏全程无画面泄露（现场截图只有黑屏/锁屏）。
 - 若 2.3 在 Tahoe 失败：保留 `--mirror`，把失败写进 `RESULTS-BY-OS`，不宣称独占成立。
 - **进度（2026-11-20 晚）**：client 规格断言已落地（`--spec`/`P2_SPEC` → `specMatch`；未传 `--spec` 时用 `session-ready` 的 `effectiveWidth/Height/effectiveSpecMatch`，`summary` 仅独占模式判 FAIL），环回三条路径验证通过；`p2.sh` 已能透传 `--exclusive/--keep-main/--sim-loss/--sim-reorder`，host JSON 落 C-09 证据，`summary` 对独占模式核对 C-09 与恢复结果；退出路径（握手超时/非法注入/无限等待单次失败）均补了 `endExclusive()`。**2026-11-20 晚跨机实测**：全禁物理屏 + C-09 **720p15 PASS**——`c09Status=verified`、`activeDisplayIDsAfterDisable` 仅虚拟屏、`sessionRecovered=true`、解码 0.968、丢帧 0.8%，结束后物理屏恢复；**1080p20 独占 FAIL（采集侧）**——1080p 虚拟屏下 SCK 只送 30–44 帧/40s，而镜像 1080p 采集 778 帧（19.4fps），属 A-08 变体；同轮镜像对照还暴露客户端 1080p 渲染 64.9ms/帧（P2.3）。详见 `RESULTS-BY-OS.md` §5.17。**仍未做**：1080p 独占的采集帧率治理。

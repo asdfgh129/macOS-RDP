@@ -27,7 +27,8 @@
 #   P2_INJECT=real      host 的注入方式：real（真注入，需辅助功能授权）/ record
 #   P2_WINDOW=1280x720  client 窗口尺寸
 #   P2_SPEC=1280x720    client 请求 host 的推流规格（独占模式下解码尺寸必须与之相同）
-#   P2_EXCLUSIVE=1      host 建虚拟屏并禁物理屏（P2.2；需先跑 kiosk 冒烟）
+#   P2_EXCLUSIVE=1      host 建虚拟屏并禁物理屏（现已是默认；保留兼容）
+#   P2_MIRROR=1         host 采物理主屏（诊断用；旧默认）
 #   P2_KEEP_MAIN=1      独占时保留物理主屏（诊断模式，不满足 C-09）
 #   P2_SIM_LOSS=0.1     host 发送端模拟丢片百分比（环回复现 WAN）
 #   P2_SIM_REORDER=1    host 发送端模拟乱序交换百分比
@@ -106,7 +107,8 @@ host)
   WH_ARG=""
   [ -n "${P2_WIDTH:-}" ] && [ -n "${P2_HEIGHT:-}" ] && WH_ARG="--width $P2_WIDTH --height $P2_HEIGHT"
   MODE_ARG=""
-  [ "${P2_EXCLUSIVE:-0}" = 1 ] && MODE_ARG="--exclusive"
+  [ "${P2_MIRROR:-0}" = 1 ] && MODE_ARG="$MODE_ARG --mirror"
+  [ "${P2_EXCLUSIVE:-0}" = 1 ] && MODE_ARG="$MODE_ARG --exclusive"
   [ "${P2_KEEP_MAIN:-0}" = 1 ] && MODE_ARG="$MODE_ARG --keep-main"
   SIM_ARG=""
   [ -n "${P2_SIM_LOSS:-}" ] && SIM_ARG="$SIM_ARG --sim-loss $P2_SIM_LOSS"

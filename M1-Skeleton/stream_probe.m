@@ -725,7 +725,8 @@ static void PrintUsage(void) {
         "  stream_probe --host [--port N] [--port-file PATH] [--duration-ms N]\n"
         "                    [--display ID] [--fps N] [--out JSON] [--spec WxH]\n"
         "                    [--width N] [--height N]       # 编码输出尺寸（镜像模式降分辨率用）\n"
-        "                    [--exclusive [--keep-main]] # 建虚拟屏并禁物理屏（keep-main=保留主屏的安全模式）\n"
+        "                    [--keep-main]               # 诊断：保留物理主屏，不满足 C-09\n"
+        "                    [--mirror]                  # 诊断：采物理主屏（默认是按客户端规格建虚拟屏+禁物理屏）\n"
         "                    [--sim-loss PCT] [--sim-reorder PCT] # 发送端丢片/乱序模拟\n"
         "                    [--advertise HOST[:PORT]]   # 跨网段/NAT：防火墙映射后的对外端点\n"
         "                    [--wait-ms N]               # host 等客户端 / client 等 STREAMING（默认 15000；0 = 一直等）\n"
@@ -837,7 +838,7 @@ int main(int argc, char **argv) {
         NSString *advertiseSpec = nil;          // host 对外端点（NAT/防火墙映射后）
         NSString *preflightRole = nil;          // host / client：只做本机能力自检后退出
         int32_t specW = 0, specH = 0;           // 客户端请求的推流规格（host 建虚拟屏用）
-        BOOL exclusive = NO;                    // host：建虚拟屏并禁物理屏（D-04/D-08）
+        BOOL exclusive = YES;                   // host：默认按客户端规格建虚拟屏并禁物理屏（D-04/D-08）
         BOOL keepMain = NO;                      // 诊断：保留物理主屏，不满足 C-09
         double simLossPct = 0, simReorderPct = 0; // host 发送端故障注入
 
@@ -879,6 +880,7 @@ int main(int argc, char **argv) {
                 }
             }
             else if (!strcmp(argv[i], "--exclusive")) exclusive = YES;
+            else if (!strcmp(argv[i], "--mirror")) exclusive = NO;  // 诊断：采物理主屏（旧默认）
             else if (!strcmp(argv[i], "--keep-main")) keepMain = YES;
             else if (!strcmp(argv[i], "--sim-loss") && i + 1 < argc)
                 simLossPct = atof(argv[++i]);
