@@ -65,6 +65,8 @@ static BOOL M1SplitAVCC(NSData *payload,
 @property (nonatomic, assign) uint64_t droppedPFrames;
 @property (nonatomic, copy) NSArray<NSString *> *recentDropDetails;
 @property (nonatomic, assign) uint64_t fragmentsDiscarded;
+@property (nonatomic, copy) NSString *discardBreakdown;
+@property (nonatomic, copy) NSString *debugState;
 @property (nonatomic, assign) uint64_t decodeFailures;
 @property (nonatomic, assign) uint64_t keyframeRequests;
 @property (nonatomic, assign) uint64_t repairRequests;
@@ -506,6 +508,8 @@ static double gPrewarmMs = -1;
         s.recentDropDetails = _recentDropDetails ?: @[];
     }
     s.fragmentsDiscarded = atomic_load(&_fragmentsDiscarded);
+    s.discardBreakdown = _reassembler.discardBreakdown;
+    s.debugState = _reassembler.debugState;
     s.decodeFailures = atomic_load(&_decodeFailures);
     s.keyframeRequests = atomic_load(&_keyframeRequests);
     s.repairRequests = atomic_load(&_repairRequests);

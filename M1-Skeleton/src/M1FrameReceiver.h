@@ -31,6 +31,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) uint64_t droppedPFrames;        // 同上，P 帧数
 @property (nonatomic, readonly, copy) NSArray<NSString *> *recentDropDetails; // 最近 16 条丢帧细节
 @property (nonatomic, readonly) uint64_t fragmentsDiscarded; // 随丢帧/重复/迟到一起丢弃的分片数
+@property (nonatomic, readonly, copy) NSString *discardBreakdown; // wipe/ahead/winFull/stale 明细
+@property (nonatomic, readonly, copy) NSString *debugState;          // 重组器内部状态快照
 @property (nonatomic, readonly) uint64_t decodeFailures;
 @property (nonatomic, readonly) uint64_t keyframeRequests;   // 请求关键帧的「次数」（缺口 episode）
 @property (nonatomic, readonly) uint64_t repairRequests;     // 定向补片请求数（缺 1~3 片时优先于关键帧）

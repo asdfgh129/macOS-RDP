@@ -1680,8 +1680,9 @@ int main(int argc, char **argv) {
                rs.repairRttMs, rs.repairRttSamples,
                rs.awaitingKeyframeMs, rs.keyframeRequestRttMs,
                rs.keyframeRequestRttSamples, rs.malformedDatagrams);
-        printf("  丢帧归因: 关键帧 %llu / P帧 %llu\n",
-               rs.droppedKeyframes, rs.droppedPFrames);
+        printf("  丢帧归因: 关键帧 %llu / P帧 %llu  分片丢弃去向: %s\n",
+               rs.droppedKeyframes, rs.droppedPFrames, rs.discardBreakdown.UTF8String);
+        printf("  重组状态: %s\n", rs.debugState.UTF8String);
         for (NSString *detail in rs.recentDropDetails) {
             printf("    丢帧: %s\n", detail.UTF8String);
         }
@@ -1738,6 +1739,8 @@ int main(int argc, char **argv) {
         json[@"droppedPFrames"] = @(rs.droppedPFrames);
         json[@"dropDetails"] = rs.recentDropDetails ?: @[];
         json[@"fragmentsDiscarded"] = @(rs.fragmentsDiscarded);
+        json[@"discardBreakdown"] = rs.discardBreakdown ?: @"";
+        json[@"reassemblerState"] = rs.debugState ?: @"";
         json[@"awaitingKeyframeMs"] = @(round(rs.awaitingKeyframeMs));
         json[@"decodeFailures"] = @(rs.decodeFailures);
         json[@"keyframeRequests"] = @(rs.keyframeRequests);

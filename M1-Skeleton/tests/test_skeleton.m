@@ -816,6 +816,35 @@ static void TestFrameRepair(void) {
         OK(!rx.needsKeyframe, "gap-repair-no-keyframe-after-repair");
         OK(nacks == 1, "gap-repair-single-request-used");
     }
+
+    // --- 接收端：窗口外持续来包（追不上）→ 转关键帧重建，不能静默丢掉整段流 ---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        [tx sendPayload:MakePayload(3000, 1) displayID:1 flags:P1FrameFlagKeyframe error:NULL];
+        NSArray<NSData *> *f0 = [sink.datagrams copy];
+        [sink.datagrams removeAllObjects];
+        [tx sendPayload:MakePayload(3000, 2) displayID:1 flags:0 error:NULL];
+        [tx sendPayload:MakePayload(3000, 3) displayID:1 flags:0 error:NULL];
+        [tx sendPayload:MakePayload(3000, 4) displayID:1 flags:0 error:NULL];
+        NSArray<NSData *> *far = [sink.datagrams subarrayWithRange:
+                                 NSMakeRange(6, 3)];    // 只取 seq3：窗口=1 时永远超窗
+
+        P1FrameReassembler *rx = [[P1FrameReassembler alloc] init];
+        rx.maxFramesInFlight = 1;
+        double t = 1000;
+        for (NSData *d in f0) { (void)RepairFeed(rx, d, t); t += 10; }
+        for (int i = 0; i < 21; i++) {                    // 63 片：不到阈值
+            for (NSData *d in far) { (void)RepairFeed(rx, d, t); }
+            t += 20;
+        }
+        OK(!rx.needsKeyframe && rx.droppedFrames == 0, "ahead-below-threshold-survives");
+        for (NSData *d in far) { (void)RepairFeed(rx, d, t); }
+        OK(rx.needsKeyframe, "ahead-catchup-needs-keyframe");
+        OK(rx.droppedFrames >= 1, "ahead-catchup-drops");
+        OK([rx.discardBreakdown containsString:@"ahead=64"], "ahead-catchup-breakdown");
+    }
+
 }
 
 #pragma mark - 控制通道（分帧 / 粘包 / 拆包）

@@ -152,6 +152,11 @@ typedef void (^P1MissingFragmentsHandler)(uint32_t frameSeq, uint16_t fragCount,
 // 「WAN 随机丢片」与「发送突发把 QUIC 队列灌满」。
 @property (nonatomic, readonly, copy) NSArray<NSString *> *recentDropDetails;
 @property (nonatomic, readonly) NSUInteger fragmentsDiscarded; // 随之丢弃的分片数（含重复/迟到）
+// fragmentsDiscarded 的去向：wipe=随判丢/关键帧重启作废，ahead=超前超出窗口，
+// winFull=在飞槽位已满拒开新帧，stale=迟到/重复/等关键帧期间的非关键帧分片。
+@property (nonatomic, readonly, copy) NSString *discardBreakdown;
+// 诊断快照：nextSeq/在飞 partial 数/卡住帧的收片进度，定位「超前窗口整段拒收」用。
+@property (nonatomic, readonly, copy) NSString *debugState;
 @property (nonatomic, readonly) uint32_t lastCompletedSeq;
 // 是否有关键帧仍在推进（最近 withinMs 内收到新分片）。接收端用它避免在
 // 在途 IDR 还在增长时再请求一个新 IDR，否则连环 IDR 会互相打断。

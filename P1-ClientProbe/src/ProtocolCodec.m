@@ -291,6 +291,11 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     NSUInteger _droppedKeyframes;
     NSUInteger _droppedPFrames;
     NSUInteger _fragmentsDiscarded;
+    NSUInteger _discardWipe;
+    NSUInteger _discardAhead;
+    NSUInteger _aheadRejects;          // 自上次交付以来被超前窗口拒收的分片数
+    NSUInteger _discardWindowFull;
+    NSUInteger _discardStale;
     NSUInteger _repairRequests;
     double _lastRepairRttMs;
     NSUInteger _repairRttSamples;
@@ -329,6 +334,11 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     _droppedKeyframes = 0;
     _droppedPFrames = 0;
     _fragmentsDiscarded = 0;
+    _discardWipe = 0;
+    _discardAhead = 0;
+    _aheadRejects = 0;
+    _discardWindowFull = 0;
+    _discardStale = 0;
     _repairRequests = 0;
     _lastRepairRttMs = 0;
     _repairRttSamples = 0;
@@ -343,6 +353,34 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 
 - (NSUInteger)droppedKeyframes { return _droppedKeyframes; }
 - (NSUInteger)droppedPFrames { return _droppedPFrames; }
+- (NSString *)debugState {
+    P1PartialFrame *np = _partials[@(_nextSeq)];
+    uint32_t minSeq = UINT32_MAX, maxSeq = 0;
+    for (NSNumber *k in _partials) {
+        if (k.unsignedIntValue < minSeq) minSeq = k.unsignedIntValue;
+        if (k.unsignedIntValue > maxSeq) maxSeq = k.unsignedIntValue;
+    }
+    for (NSNumber *k in _ready) {
+        if (k.unsignedIntValue < minSeq) minSeq = k.unsignedIntValue;
+        if (k.unsignedIntValue > maxSeq) maxSeq = k.unsignedIntValue;
+    }
+    NSString *npDesc = np ? [NSString stringWithFormat:@"fc=%u recv=%lu key=%d att=%lu missing=%lu",
+                             np.fragCount, (unsigned long)np.receivedCount, np.keyframe ? 1 : 0,
+                             (unsigned long)np.repairAttempts,
+                             (unsigned long)[self missingIndicesOfPartial:np].count]
+                          : @"none";
+    return [NSString stringWithFormat:
+            @"haveNext=%d next=%u kf=%d partials=%lu ready=%lu inflight=%u..%u nextPartial[%@]",
+            _haveNext ? 1 : 0, _nextSeq, _needsKeyframe ? 1 : 0,
+            (unsigned long)_partials.count, (unsigned long)_ready.count,
+            minSeq == UINT32_MAX ? 0 : minSeq, maxSeq, npDesc];
+}
+
+- (NSString *)discardBreakdown {
+    return [NSString stringWithFormat:@"wipe=%lu ahead=%lu winFull=%lu stale=%lu",
+            (unsigned long)_discardWipe, (unsigned long)_discardAhead,
+            (unsigned long)_discardWindowFull, (unsigned long)_discardStale];
+}
 - (NSArray<NSString *> *)recentDropDetails { return [_dropDetails copy]; }
 - (NSUInteger)repairRequests { return _repairRequests; }
 - (double)lastRepairRttMs { return _lastRepairRttMs; }
@@ -386,6 +424,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
                                                          : @"deadline-before-repair")];
     }
     _fragmentsDiscarded += p.receivedCount;
+    _discardWipe += p.receivedCount;
     [_partials removeObjectForKey:@(p.frameSeq)];
 }
 
@@ -395,6 +434,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
         _droppedFrames++;
         [self noteDropOfPartial:p reason:(p.repairEmitted ? @"gap-after-repair" : @"gap")];
         _fragmentsDiscarded += p.receivedCount;
+        _discardWipe += p.receivedCount;
     }
     for (P1ReassembledFrame *f in _ready.allValues) {
         if (f.keyframe) _droppedKeyframes++;
@@ -407,6 +447,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     _droppedFrames += _ready.count;
     [_partials removeAllObjects];
     [_ready removeAllObjects];
+    _aheadRejects = 0;
     _needsKeyframe = YES;
     _haveNext = NO;
     _gapSinceMs = 0;
@@ -416,10 +457,12 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 
 // 关键帧到达：先清掉关键帧之前的残留（它们已无参考价值），再以该帧为新的顺序起点。
 - (void)restartAtKeyframeSeq:(uint32_t)seq {
+    _aheadRejects = 0;
     NSUInteger lost = 0;
     for (P1PartialFrame *p in _partials.allValues) {
         [self noteDropOfPartial:p reason:@"pre-keyframe"];
         _fragmentsDiscarded += p.receivedCount;
+        _discardWipe += p.receivedCount;
         lost++;
     }
     for (P1ReassembledFrame *f in _ready.allValues) {
@@ -570,6 +613,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 }
 
 - (void)drainInto:(NSMutableArray<P1ReassembledFrame *> *)out {
+    if (_ready[@(_nextSeq)] != nil) _aheadRejects = 0;   // 顺序推进了就不算追不上
     while (_haveNext) {
         P1ReassembledFrame *f = _ready[@(_nextSeq)];
         if (!f) break;
@@ -613,7 +657,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
         _haveDisplay = YES;
         _activeDisplay = header.displayID;
     } else if (header.displayID != _activeDisplay) {
-        _fragmentsDiscarded++;
+        _fragmentsDiscarded++; _discardStale++;
         [self checkGapDeadlineAt:nowMs];
         return delivered;
     }
@@ -622,24 +666,38 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 
     // 缺口期间只接受关键帧（参考链已断，P 帧解不出可用画面）。
     if (_needsKeyframe && !isKey) {
-        _fragmentsDiscarded++;
+        _fragmentsDiscarded++; _discardStale++;
         [self checkGapDeadlineAt:nowMs];
         return delivered;
     }
 
     uint32_t seq = header.frameSeq;
     if (_haveNext && seq < _nextSeq) {          // 已交付帧的迟到分片
-        _fragmentsDiscarded++;
+        _fragmentsDiscarded++; _discardStale++;
         [self checkGapDeadlineAt:nowMs];
         return delivered;
     }
     if (_ready[@(seq)] != nil) {                // 已收齐待交付帧的重复分片
-        _fragmentsDiscarded++;
+        _fragmentsDiscarded++; _discardStale++;
         [self checkGapDeadlineAt:nowMs];
         return delivered;
     }
     if (_haveNext && seq > _nextSeq + (uint32_t)self.maxFramesInFlight) {
-        _fragmentsDiscarded++;                  // 超前太远，拒绝为它开盘
+        _fragmentsDiscarded++; _discardAhead++; // 超前太远，拒绝为它开盘
+        _aheadRejects++;
+        // nextSeq 若已经追不上（窗口外持续来包），静默丢弃会让整段流锁死：
+        // 这些分片没有 partial，补片无从发起，也永远等不到关键帧。持续超前
+        // 拒收即视为整链已断，立刻走关键帧重建，把锁死换成一次 ~1s 的重启。
+        if (_aheadRejects >= 64) {
+            if (_dropDetails.count < 16) {
+                [_dropDetails addObject:[NSString stringWithFormat:
+                    @"seq=%u ahead-catchup next=%u rejects=%lu", seq, _nextSeq,
+                    (unsigned long)_aheadRejects]];
+            }
+            _droppedFrames++;
+            [self declareLoss];
+            return delivered;
+        }
         [self checkGapDeadlineAt:nowMs];
         return delivered;
     }
@@ -647,7 +705,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     P1PartialFrame *p = _partials[@(seq)];
     if (!p) {
         if (_partials.count >= self.maxFramesInFlight) {
-            _fragmentsDiscarded++;
+            _fragmentsDiscarded++; _discardWindowFull++;
             [self checkGapDeadlineAt:nowMs];
             return delivered;
         }
@@ -675,7 +733,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     }
 
     if (p.slots[header.fragIdx] != [NSNull null]) {   // 重复分片
-        _fragmentsDiscarded++;
+        _fragmentsDiscarded++; _discardStale++;
         [self checkGapDeadlineAt:nowMs];
         return delivered;
     }
@@ -709,6 +767,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     if (_needsKeyframe && !frame.keyframe) {
         _droppedFrames++;
         _fragmentsDiscarded += p.receivedCount;
+        _discardStale += p.receivedCount;
         [self checkGapDeadlineAt:nowMs];
         return delivered;
     }
@@ -722,6 +781,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     if (frame.frameSeq < _nextSeq) {            // 迟到整帧
         _droppedFrames++;
         _fragmentsDiscarded += p.receivedCount;
+        _discardStale += p.receivedCount;
         [self checkGapDeadlineAt:nowMs];
         return delivered;
     }
