@@ -186,7 +186,7 @@ P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
 
 **控制端用 Sequoia 15.5（前天那台）的注意事项：**
 
-- 两端必须同一 commit（本轮是 `9101589` 之后）：`git pull` 后在 Sequoia 上
+- 两端必须同一 commit（以当前 HEAD 为准）：`git pull` 后在 Sequoia 上
   自己跑 `bash M1-Skeleton/build_stream_probe.sh`。构建参数是
   `-mmacosx-version-min=13.0`，Tahoe 上编出的二进制也能在 15.5 上跑；
   但**更稳的做法是两端各自从同一 commit 本地编译**（TCC/框架缓存按 OS 分开）。
@@ -195,8 +195,8 @@ P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
 - 窗口出现后**点一下窗口**再动鼠标：只有前台应用才会收到 `mouseMoved`。
 - **上屏分辨率上限（2026-11-19 Sequoia 15.5 实测）**：3440×1440 单帧渲染 **66–77 ms**
   （Tahoe 同测试 10.4 ms），20fps 的 50 ms 预算会被打穿，表现为积压丢帧而不是链路丢包。
-  跨机首跑建议 host 以 1080p 编码：`stream_probe --host ... --width 1920 --height 1080`
-  （`p2.sh host` 目前不透传宽高；直接调用 `stream_probe` 或在 host 侧补参数）。
+  跨机首跑建议控制端请求 1080p：独占会话下用 `P2_SPEC=1920x1080 ./p2.sh client ...`
+  （host 在 `session-start` 里据此建虚拟屏）；镜像模式采物理屏原始分辨率，不接受规格。
   看到客户端 `framesDropped` 偏高时先核对 `lastRenderMs`，不要先怀疑网络。
 
 正常输出顺序：
@@ -231,6 +231,7 @@ P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
 | 主机 `sendFailures` | = 0 | 非 0 说明分片数/MTU 有问题 |
 | 控制通道最大间隔 | < 3000 ms | 心跳 1s，超过 3 倍即被视频挤掉 |
 | 客户端上屏 | ≥ 1 帧且 fps ≥ 0.8×目标 | 窗口不可见会被跳过（`renderSkippedOccluded`） |
+| 请求规格/解码尺寸 | 独占会话必须一致 | `P2_SPEC=WxH` 请求；镜像模式不判定，详见下方 |
 | 输入 | `inputInjected ≥ 5` 且 `cursorMovedPx > 0` | 真注入必须体现在主机光标上 |
 
 > 阈值分层依据（2026-11-19，Sequoia 15.5 本机环回，720p15）：
@@ -243,6 +244,11 @@ P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 \
 > | 5% | 0/117 | 存活率 ≈1e-8，无 FEC 不可达 |
 >
 > - 重组器 v3 已支持乱序/重复/帧期限，但**丢片仍必须请求关键帧**（H.264 参考链断裂，不假装能恢复）；`keyframe-request` 已打通到编码器，主机侧 900ms 合并、客户端 1s 重试。
+>
+> **规格断言的适用范围（2026-11-20）**：client 记 `requestedWidth/requestedHeight/specMatch`，
+> `summary` 只在 host 的 `sessionMode` 为 `exclusive` / `exclusive-keep-main` 时检查；
+> 镜像模式即使尺寸不同也不会 FAIL（镜像不建屏，尺寸由物理屏决定）。`specMatch`
+> 字段缺失时按 FAIL 处理——通常是 client 还是旧二进制，需 `git pull` 后重建。
 > - 1% 以上要达标需 FEC/分片重传（P2.1-FEC，见 `docs/P2-NEXT-PLAN.md` §3）；`p2.sh` 的阈值可用 `P2_MIN_DECODE_RATIO=0.90` 覆盖。
 > - 渲染端：Sequoia 上 3440×1440 实测 84.7 ms/帧，是独立瓶颈；720p 下单帧 16.6–41.6 ms，不是主要瓶颈。
 > - 控制间隔只在 `STREAMING` 之后统计；P2.2 建虚拟屏（约 10s）不计入门禁。

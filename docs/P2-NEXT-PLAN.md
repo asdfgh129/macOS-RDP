@@ -64,6 +64,7 @@
 - `--exclusive` 启动后：host 打印新建虚拟屏 displayID；会话期间 `CGGetActiveDisplayList` 只返回该虚拟屏（C-09）；client 解码尺寸等于请求规格；结束物理屏恢复、无 WindowServer 断言。
 - 物理屏全程无画面泄露（现场截图只有黑屏/锁屏）。
 - 若 2.3 在 Tahoe 失败：保留 `--mirror`，把失败写进 `RESULTS-BY-OS`，不宣称独占成立。
+- **进度（2026-11-20 更新）**：client 规格断言已落地（`--spec`/`P2_SPEC` → `specMatch`，`summary` 仅独占模式判 FAIL），环回三条路径验证通过；**仍未做**全禁物理屏 + C-09、Tahoe host 本轮代码、跨公网复测。
 - **进度（2026-11-19，Sequoia 本机）**：`--exclusive --keep-main` 冒烟 PASS——虚拟屏 `4128835`、采集 1280×720、client 31/31、控制间隔 1005ms、结束恢复成功。顺带修掉 Sequoia 误用 Tahoe 保守建屏导致的残留槽位镜像死锁（`M1RDPDriver` 改按 `P0OSPolicy()` 分流）。**未做**：全禁物理屏 + C-09（需现场确认可黑屏）、Tahoe host 本轮代码、client 解码尺寸断言。
 
 ### P2.3 渲染与记录收尾

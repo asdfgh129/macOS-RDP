@@ -1490,6 +1490,14 @@ int main(int argc, char **argv) {
             ? client.firstFrameMs - client.streamStartMs : 0;
         printf("  解码尺寸 %dx%d  解码帧率 %.1f fps  首帧延迟 %.0f ms\n",
                client.decodedWidth, client.decodedHeight, decodeFps, firstFrameLatency);
+        // P2.2 判据：独占模式下 host 按 client 请求的规格建虚拟屏，解码尺寸必须一致。
+        // 镜像模式不建屏，请求规格仅作记录，所以这里只打印、不参与判定（判定在 p2.sh summary）。
+        if (specW > 0 && specH > 0) {
+            BOOL specMatch = (client.decodedWidth == specW && client.decodedHeight == specH);
+            printf("  规格断言: 请求 %dx%d / 解码 %dx%d → %s%s\n", specW, specH,
+                   client.decodedWidth, client.decodedHeight, specMatch ? "PASS" : "FAIL",
+                   specMatch ? "" : "（若 host 是镜像模式，此项不参与判定）");
+        }
         printf("  解码器：进程预热 %.0f ms，真实建会话 %.0f ms\n",
                rs.decoderPrewarmMs, rs.decoderCreateMs);
         printf("  控制包 %llu / 帧包 %llu / 未分流 %llu\n",
@@ -1535,6 +1543,11 @@ int main(int argc, char **argv) {
         json[@"malformed"] = @(rs.malformedDatagrams);
         json[@"decodedWidth"] = @(client.decodedWidth);
         json[@"decodedHeight"] = @(client.decodedHeight);
+        if (specW > 0 && specH > 0) {
+            json[@"requestedWidth"] = @(specW);
+            json[@"requestedHeight"] = @(specH);
+            json[@"specMatch"] = @(client.decodedWidth == specW && client.decodedHeight == specH);
+        }
         json[@"decodeFps"] = @(round(decodeFps * 10) / 10.0);
         json[@"lastDecodeLatencyMs"] = @(round(rs.lastDecodeLatencyMs * 10) / 10.0);
         json[@"firstFrameLatencyMs"] = @(round(firstFrameLatency));

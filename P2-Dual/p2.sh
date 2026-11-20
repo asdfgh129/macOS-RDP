@@ -24,6 +24,7 @@
 #   P2_FPS=20           目标帧率
 #   P2_INJECT=real      host 的注入方式：real（真注入，需辅助功能授权）/ record
 #   P2_WINDOW=1280x720  client 窗口尺寸
+#   P2_SPEC=1280x720    client 请求 host 的推流规格（独占模式下解码尺寸必须与之相同）
 #   P2_WAIT_MS=15000    等客户端/等 STREAMING 的超时；跨网段建议 60000，
 #                         设 0 表示一直等（host 无人值守，直到 client 接入）
 #   P2_HANDSHAKE_MS=12000 客户端握手超时；跨网段建议 30000
@@ -131,7 +132,8 @@ host)
 
 client)
   need_bin
-  PEER=""; FP=""
+  PEER=""; FP=""; SPEC_ARG=""
+  [ -n "${P2_SPEC:-}" ] && SPEC_ARG="--spec $P2_SPEC"
   while [ $# -gt 0 ]; do
     case "$1" in
       --host) PEER="$2"; shift 2 ;;
@@ -146,7 +148,8 @@ client)
   do_preflight client "$PEER"
   say "client：连 ${PEER}:${PORT}，窗口 ${WIN}，接收 ${SECS}s"
   say "输出：$OUT"
-  ./stream_probe --client --connect "$PEER" --port "$PORT" --fingerprint "$FP" \
+  # shellcheck disable=SC2086
+  ./stream_probe --client --connect "$PEER" --port "$PORT" --fingerprint "$FP" $SPEC_ARG \
       --handshake-ms "$HANDSHAKE_MS" --wait-ms "$WAIT_MS" \
       --duration-ms "$((SECS * 1000))" --window "$WIN" \
       --save-frames 0 --out "$OUT/client.json" 2>&1 | tee "$OUT/client.log"
@@ -171,6 +174,10 @@ def load(p):
 
 h, c = load(sys.argv[1]), load(sys.argv[2])
 plans = h.get("inputPlans")
+req_w, req_h = c.get("requestedWidth"), c.get("requestedHeight")
+spec_requested = bool(req_w and req_h)
+req_text = f"{req_w}x{req_h}" if spec_requested else "未请求"
+got_text = f"{c.get('decodedWidth')}x{c.get('decodedHeight')}"
 rows = [
     ("握手",            "%.1f ms" % c.get("handshakeMs", 0)),
     ("主机采集/编码/发出", "%s / %s / %s" % (h.get("framesCaptured"), h.get("framesEncoded"), h.get("framesSent"))),
@@ -180,6 +187,8 @@ rows = [
     ("客户端分片丢弃/等待关键帧", "%s 片 / %s ms" % (c.get("fragmentsDiscarded"), c.get("awaitingKeyframeMs"))),
     ("关键帧请求 发出/主机收到", "%s / %s" % (c.get("keyframeRequestsSent"), h.get("keyframeRequestsReceived"))),
     ("客户端上屏",        "%s 帧（跳过 %s 不可见）" % (c.get("framesRendered"), c.get("renderSkippedOccluded"))),
+    ("请求规格/解码尺寸",  "%s → %s（%s）" % (req_text, got_text,
+        "一致" if c.get("specMatch") else "未一致/未判定")),
     ("首帧延迟",          "主机 %s ms / 客户端 %s ms" % (h.get("firstFrameLatencyMs"), c.get("firstFrameLatencyMs"))),
     ("解码/渲染 单帧",     "%s ms / %s ms" % (c.get("lastDecodeLatencyMs", "?"), c.get("lastRenderMs"))),
     ("控制通道最大间隔",   "%s ms" % c.get("maxControlGapMs")),
@@ -208,6 +217,12 @@ else:
 if h.get("sendFailures", 0): fails.append(f"主机发送失败 {h['sendFailures']} 次")
 if h.get("malformed") or c.get("malformed"): fails.append("有畸形分片")
 if (c.get("maxControlGapMs") or 0) > 3000: fails.append("控制通道间隔 > 3s（心跳被挤）")
+# P2.2：仅独占会话要求解码尺寸等于 client 请求规格；镜像模式不建屏，不参与此判定。
+# specMatch 缺失按 FAIL 处理，迫使两端对齐 commit（旧二进制没有该字段）。
+if spec_requested and str(h.get("sessionMode", "")).startswith("exclusive"):
+    if not c.get("specMatch"):
+        fails.append(f"解码尺寸 {got_text} ≠ 请求规格 {req_text}（P2.2 会话形态不成立；"
+                     "若客户端是旧二进制请重新编译）")
 print()
 if fails:
     print("  判定 FAIL: " + "；".join(fails))
