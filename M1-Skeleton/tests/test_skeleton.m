@@ -547,6 +547,277 @@ static void TestFrameSender(void) {
     }
 }
 
+#pragma mark - 定向补片（frame-nack 修复）
+
+static NSArray<P1ReassembledFrame *> *RepairFeed(P1FrameReassembler *rx, NSData *dgram, double t) {
+    P1FrameHeader h = {0};
+    if (!P1UnpackFrameHeader(dgram, &h, NULL)) return @[];
+    NSData *body = [dgram subdataWithRange:NSMakeRange(P1FrameHeaderSize, h.payloadLen)];
+    return [rx acceptHeader:h payload:body nowMs:t error:NULL];
+}
+
+static void TestFrameRepair(void) {
+    printf("=== frame repair (frame-nack) ===\n");
+
+    // --- 发送端：只重发请求的下标；未知帧/越界/空集合不误发 ---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        NSError *err = nil;
+        OK([tx sendPayload:MakePayload(3000, 5) displayID:1 flags:0 error:&err], "nack-tx-send");
+        OK(sink.datagrams.count == 3, "nack-tx-three-frags");
+        [sink.datagrams removeAllObjects];
+
+        OK([tx resendFragmentsForFrameSeq:0 indices:[NSIndexSet indexSetWithIndex:1] error:&err] == 1,
+           "nack-resend-one");
+        OK(sink.datagrams.count == 1, "nack-resend-one-dgram");
+        if (sink.datagrams.count == 1) {
+            P1FrameHeader h = {0};
+            P1UnpackFrameHeader(sink.datagrams[0], &h, NULL);
+            OK(h.fragIdx == 1 && h.frameSeq == 0, "nack-resend-correct-index");
+        }
+        OK(tx.fragmentsResent == 1, "nack-resend-stat");
+
+        NSMutableIndexSet *set = [NSMutableIndexSet indexSet];
+        [set addIndex:0];
+        [set addIndex:2];
+        [set addIndex:99];
+        [sink.datagrams removeAllObjects];
+        OK([tx resendFragmentsForFrameSeq:0 indices:set error:&err] == 2,
+           "nack-resend-skips-out-of-range");
+        OK(sink.datagrams.count == 2, "nack-resend-two-dgrams");
+
+        OK([tx resendFragmentsForFrameSeq:42 indices:[NSIndexSet indexSetWithIndex:0] error:&err] == 0,
+           "nack-resend-unknown-frame");
+        OK([tx resendFragmentsForFrameSeq:0 indices:[NSIndexSet indexSet] error:&err] == 0,
+           "nack-resend-empty-indices");
+    }
+
+    // --- 发送端：按帧数淘汰，旧帧不再重发 ---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        tx.fragmentCacheFrames = 2;
+        for (int i = 0; i < 3; i++) {
+            [tx sendPayload:MakePayload(3000, (uint8_t)i) displayID:1 flags:0 error:NULL];
+        }
+        NSError *err = nil;
+        OK([tx resendFragmentsForFrameSeq:0 indices:[NSIndexSet indexSetWithIndex:0] error:&err] == 0,
+           "nack-cache-evicts-oldest");
+        OK([tx resendFragmentsForFrameSeq:1 indices:[NSIndexSet indexSetWithIndex:0] error:&err] == 1,
+           "nack-cache-keeps-newest-1");
+        OK([tx resendFragmentsForFrameSeq:2 indices:[NSIndexSet indexSetWithIndex:0] error:&err] == 1,
+           "nack-cache-keeps-newest-2");
+    }
+
+    // --- 发送端：缓存关闭（0）一律不重发 ---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        tx.fragmentCacheFrames = 0;
+        [tx sendPayload:MakePayload(3000, 1) displayID:1 flags:0 error:NULL];
+        NSError *err = nil;
+        OK([tx resendFragmentsForFrameSeq:0 indices:[NSIndexSet indexSetWithIndex:0] error:&err] == 0,
+           "nack-cache-disabled");
+    }
+
+    // --- 接收端：缺 1 片 → 60ms 停滞发 NACK；补片到齐后完成并量 RTT ---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        [tx sendPayload:MakePayload(6000, 3) displayID:1 flags:P1FrameFlagKeyframe error:NULL];
+        OK(sink.datagrams.count == 6, "nack-rx-six-frags");
+
+        P1FrameReassembler *rx = [[P1FrameReassembler alloc] init];
+        __block NSUInteger nacks = 0;
+        __block uint32_t lastSeq = UINT32_MAX;
+        __block uint16_t lastCount = 0;
+        __block NSIndexSet *lastMissing = nil;
+        __block BOOL lastKey = NO;
+        rx.onMissingFragments = ^(uint32_t seq, uint16_t fc, NSIndexSet *mi, BOOL key) {
+            nacks++;
+            lastSeq = seq;
+            lastCount = fc;
+            lastMissing = mi;
+            lastKey = key;
+        };
+
+        double t = 1000;
+        for (NSNumber *idx in @[@0, @1, @3, @4, @5]) {
+            (void)RepairFeed(rx, sink.datagrams[idx.unsignedIntegerValue], t);
+            t += 10;
+        }
+        OK(nacks == 0, "nack-rx-none-before-request-ms");
+        (void)RepairFeed(rx, sink.datagrams[0], 1110);   // 重复片只为推进时钟
+        OK(nacks == 1, "nack-rx-emitted-once");
+        OK(lastSeq == 0 && lastCount == 6, "nack-rx-frame-and-count");
+        OK([lastMissing isEqualToIndexSet:[NSIndexSet indexSetWithIndex:2]],
+           "nack-rx-missing-indices");
+        OK(lastKey, "nack-rx-keyframe-flag");
+        (void)RepairFeed(rx, sink.datagrams[0], 1140);
+        OK(nacks == 1, "nack-rx-rate-limited-until-retry");
+
+        NSArray<P1ReassembledFrame *> *done = RepairFeed(rx, sink.datagrams[2], 1150);
+        OK(done.count == 1, "nack-rx-frame-completes-after-repair");
+        OK(rx.lastRepairRttMs == 40.0, "nack-rx-rtt");
+        OK(rx.repairRttSamples == 1 && rx.repairRequests == 1, "nack-rx-stats");
+        OK(!rx.needsKeyframe, "nack-rx-no-keyframe-needed");
+    }
+
+    // --- 接收端：补片没来 → 120ms 重问，最多 3 次；超过补片窗口判丢并请求关键帧 ---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        [tx sendPayload:MakePayload(6000, 4) displayID:1 flags:P1FrameFlagKeyframe error:NULL];
+
+        P1FrameReassembler *rx = [[P1FrameReassembler alloc] init];
+        __block NSUInteger nacks = 0;
+        rx.onMissingFragments = ^(uint32_t seq, uint16_t fc, NSIndexSet *mi, BOOL key) { nacks++; };
+
+        double t = 2000;
+        for (NSNumber *idx in @[@0, @1, @2, @4, @5]) {
+            (void)RepairFeed(rx, sink.datagrams[idx.unsignedIntegerValue], t);
+            t += 10;
+        }
+        (void)RepairFeed(rx, sink.datagrams[0], 2120);   // NACK #1
+        OK(nacks == 1, "nack-retry-first");
+        (void)RepairFeed(rx, sink.datagrams[0], 2150);   // 未到 120ms，不重问
+        OK(nacks == 1, "nack-retry-not-too-early");
+        (void)RepairFeed(rx, sink.datagrams[0], 2250);   // NACK #2
+        OK(nacks == 2, "nack-retry-second");
+        (void)RepairFeed(rx, sink.datagrams[0], 2380);   // NACK #3（达到上限）
+        OK(nacks == 3, "nack-retry-third");
+        (void)RepairFeed(rx, sink.datagrams[0], 2640);   // 补片窗口耗尽 → 判丢
+        OK(nacks == 3, "nack-retry-capped");
+        OK(rx.needsKeyframe, "nack-retry-gives-up-needs-keyframe");
+        OK(rx.droppedFrames == 1, "nack-retry-counts-dropped-frame");
+        OK(rx.repairRttSamples == 0 && rx.lastRepairRttMs == 0.0, "nack-retry-no-rtt-sample");
+    }
+
+    // --- 接收端：缺失片数超过 maxRepairFragments → 不发 NACK，直接走关键帧 ---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        [tx sendPayload:MakePayload(6000, 7) displayID:1 flags:P1FrameFlagKeyframe error:NULL];
+
+        P1FrameReassembler *rx = [[P1FrameReassembler alloc] init];
+        rx.maxRepairFragments = 4;
+        __block NSUInteger nacks = 0;
+        rx.onMissingFragments = ^(uint32_t seq, uint16_t fc, NSIndexSet *mi, BOOL key) { nacks++; };
+
+        (void)RepairFeed(rx, sink.datagrams[0], 3000);
+        (void)RepairFeed(rx, sink.datagrams[0], 3100);
+        (void)RepairFeed(rx, sink.datagrams[0], 3200);
+        OK(nacks == 0, "nack-too-many-missing-no-request");
+        OK(rx.needsKeyframe, "nack-too-many-missing-keyframe");
+        OK(rx.droppedFrames == 1, "nack-too-many-missing-dropped");
+    }
+
+    // --- 发送端：整帧补片请求重发全部分片 ---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        NSError *err = nil;
+        OK([tx sendPayload:MakePayload(3000, 5) displayID:1 flags:0 error:&err], "whole-tx-send");
+        OK(sink.datagrams.count == 3, "whole-tx-three-frags");
+        [sink.datagrams removeAllObjects];
+
+        uint64_t resentBefore = tx.fragmentsResent;
+        OK([tx resendAllFragmentsForFrameSeq:0 error:&err] == 3, "whole-resend-all");
+        OK(sink.datagrams.count == 3, "whole-resend-all-dgrams");
+        P1FrameHeader h = {0};
+        P1UnpackFrameHeader(sink.datagrams[2], &h, NULL);
+        OK(h.frameSeq == 0 && h.fragIdx == 2, "whole-resend-all-order");
+        OK(tx.fragmentsResent == resentBefore + 3, "whole-resend-all-stat");
+        OK([tx resendAllFragmentsForFrameSeq:42 error:&err] == 0, "whole-resend-unknown-frame");
+
+        tx.fragmentCacheFrames = 0;
+        OK([tx resendAllFragmentsForFrameSeq:0 error:&err] == 0, "whole-resend-cache-disabled");
+    }
+
+    // --- 接收端：nextSeq 整帧零分片 → 60ms 后请求整帧重发，重试有上限 ---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        [tx sendPayload:MakePayload(3000, 1) displayID:1 flags:P1FrameFlagKeyframe error:NULL];
+        NSArray<NSData *> *f0 = [sink.datagrams copy];                          // seq0
+        [tx sendPayload:MakePayload(3000, 2) displayID:1 flags:0 error:NULL];   // seq1 全丢
+        [tx sendPayload:MakePayload(3000, 3) displayID:1 flags:0 error:NULL];   // seq2
+        NSArray<NSData *> *f2 = [sink.datagrams subarrayWithRange:
+                                 NSMakeRange(f0.count * 2, 3)];
+
+        P1FrameReassembler *rx = [[P1FrameReassembler alloc] init];
+        __block NSUInteger nacks = 0;
+        __block uint32_t lastSeq = UINT32_MAX;
+        __block uint16_t lastCount = 9;
+        __block NSUInteger lastMissing = 9;
+        __block BOOL lastKey = YES;
+        rx.onMissingFragments = ^(uint32_t seq, uint16_t fc, NSIndexSet *mi, BOOL key) {
+            nacks++;
+            lastSeq = seq;
+            lastCount = fc;
+            lastMissing = mi.count;
+            lastKey = key;
+        };
+
+        double t = 1000;
+        for (NSData *d in f0) { (void)RepairFeed(rx, d, t); t += 10; }  // 交付 seq0
+        for (NSData *d in f2) { (void)RepairFeed(rx, d, t); t += 10; }  // seq2 就绪，缺口从 1030 起
+        OK(nacks == 0, "gap-repair-none-before-request-ms");
+        (void)RepairFeed(rx, f0[0], 1090);
+        OK(nacks == 1, "gap-repair-emitted-once");
+        OK(lastSeq == 1 && lastCount == 0 && lastMissing == 0 && !lastKey,
+           "gap-repair-whole-frame-args");
+        (void)RepairFeed(rx, f0[0], 1120);
+        OK(nacks == 1, "gap-repair-retry-not-too-early");
+        (void)RepairFeed(rx, f0[0], 1210);
+        OK(nacks == 2, "gap-repair-retry-second");
+        (void)RepairFeed(rx, f0[0], 1340);
+        OK(nacks == 3, "gap-repair-retry-third");
+        (void)RepairFeed(rx, f0[0], 1620);
+        OK(nacks == 3, "gap-repair-retry-capped");
+        OK(rx.needsKeyframe, "gap-repair-gives-up-needs-keyframe");
+    }
+
+    // --- 接收端：整帧重发到达 → 续上顺序，不再等关键帧 ---
+    {
+        M1MemoryDatagramSink *sink = [[M1MemoryDatagramSink alloc] init];
+        M1FrameSender *tx = [[M1FrameSender alloc] initWithSink:sink];
+        [tx sendPayload:MakePayload(3000, 1) displayID:1 flags:P1FrameFlagKeyframe error:NULL];
+        NSArray<NSData *> *f0 = [sink.datagrams copy];
+        [tx sendPayload:MakePayload(3000, 2) displayID:1 flags:0 error:NULL];
+        NSArray<NSData *> *f1 = [sink.datagrams subarrayWithRange:
+                                 NSMakeRange(f0.count, 3)];
+        [tx sendPayload:MakePayload(3000, 3) displayID:1 flags:0 error:NULL];
+        NSArray<NSData *> *f2 = [sink.datagrams subarrayWithRange:
+                                 NSMakeRange(f0.count * 2, 3)];
+
+        P1FrameReassembler *rx = [[P1FrameReassembler alloc] init];
+        __block NSUInteger nacks = 0;
+        __block uint32_t nackSeq = UINT32_MAX;
+        rx.onMissingFragments = ^(uint32_t seq, uint16_t fc, NSIndexSet *mi, BOOL key) {
+            nacks++;
+            nackSeq = seq;
+        };
+
+        double t = 2000;
+        for (NSData *d in f0) { (void)RepairFeed(rx, d, t); t += 10; }
+        for (NSData *d in f2) { (void)RepairFeed(rx, d, t); t += 10; }
+        (void)RepairFeed(rx, f0[0], 2090);
+        OK(nacks == 1 && nackSeq == 1, "gap-repair-request-before-resend");
+
+        NSArray<P1ReassembledFrame *> *out = @[];
+        t = 2100;
+        for (NSData *d in f1) { out = RepairFeed(rx, d, t); t += 10; }
+        OK(out.count == 2, "gap-repair-delivers-whole-chain");
+        if (out.count == 2) {
+            OK(out[0].frameSeq == 1 && out[1].frameSeq == 2, "gap-repair-resumes-in-order");
+        }
+        OK(!rx.needsKeyframe, "gap-repair-no-keyframe-after-repair");
+        OK(nacks == 1, "gap-repair-single-request-used");
+    }
+}
+
 #pragma mark - 控制通道（分帧 / 粘包 / 拆包）
 
 @interface M1TestCollector : NSObject <M1ControlChannelDelegate>
@@ -882,6 +1153,7 @@ int main(void) {
         TestDriverLogic();
         TestInputLogic();
         TestFrameSender();
+        TestFrameRepair();
         TestControlChannel();
         TestControlSessionOverPipe();
         TestControlSessionPairingCode();

@@ -473,6 +473,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 @property (nonatomic, assign) uint64_t keyframeRequestFailures; // 非限流原因的发送失败
 @property (nonatomic, assign) uint64_t repairRequests;          // 接收端发起的补片请求（含限流失败）
 @property (nonatomic, assign) uint64_t repairRequestsSent;      // 实际过线的补片请求
+@property (nonatomic, assign) uint64_t repairWholeFrameRequests; // 其中整帧零分片的整帧重发请求
 @property (nonatomic, assign) double firstFrameMs;
 @property (nonatomic, assign) double lastFrameMs;
 @property (nonatomic, assign) uint32_t lastSavedSeq;
@@ -550,6 +551,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
         }];
     // 缺 1~3 片时先走定向补片：只让 Host 重发这几片，通常一个 RTT 内收尾，
     // 比等下一个 IDR（WAN 实测 kfRtt 800ms+）快一个量级。
+    // 整帧零分片（missingIndices 为空）时没有缺片下标，改请求整帧重发。
     self.receiver.onNeedRepair = ^(uint32_t frameSeq, uint16_t fragCount,
                                    NSIndexSet *missingIndices, BOOL keyframe) {
         __strong typeof(weakSelf) self = weakSelf;
@@ -557,10 +559,15 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
         (void)keyframe;
         self.repairRequests += 1;
         NSError *nackErr = nil;
-        if ([self.session requestFragmentsForFrameSeq:frameSeq fragCount:fragCount
-                                              indices:missingIndices error:&nackErr]) {
-            self.repairRequestsSent += 1;
+        BOOL sent;
+        if (missingIndices.count == 0) {
+            self.repairWholeFrameRequests += 1;
+            sent = [self.session requestWholeFrame:frameSeq error:&nackErr];
+        } else {
+            sent = [self.session requestFragmentsForFrameSeq:frameSeq fragCount:fragCount
+                                                     indices:missingIndices error:&nackErr];
         }
+        if (sent) self.repairRequestsSent += 1;
     };
 }
 
@@ -1124,6 +1131,14 @@ int main(int argc, char **argv) {
             cfg.bitsPerPixel = bpp;
             cfg.outputWidth = outW;
             cfg.outputHeight = outH;
+            {
+                const char *cr = getenv("M1_CAPTURE_RESOLUTION");
+                if (cr) {
+                    if (!strcasecmp(cr, "best")) cfg.captureResolution = 1;
+                    else if (!strcasecmp(cr, "nominal")) cfg.captureResolution = 2;
+                    else cfg.captureResolution = atoi(cr) > 0 ? atoi(cr) : 0;
+                }
+            }
             __block int errCount = 0;
             __block M1FramePipeline *pipe =
                 [[M1FramePipeline alloc] initWithDisplayID:captureID
@@ -1172,11 +1187,19 @@ int main(int argc, char **argv) {
             // 未命中缓存（超出窗口/缓存关闭）就什么都不做——客户端补片窗口到期后
             // 自己会改走 keyframe-request，不需要在这里重复判定。
             __block uint64_t nackRepaired = 0, nackMissed = 0, nackFragments = 0;
+            __block uint64_t nackWholeFrames = 0;
             host.onFrameNack = ^(uint32_t frameSeq, uint16_t fragCount, NSIndexSet *indices) {
                 (void)fragCount;
                 NSError *rsErr = nil;
-                NSUInteger n = [pipe.sender resendFragmentsForFrameSeq:frameSeq
-                                                               indices:indices error:&rsErr];
+                NSUInteger n;
+                if (indices.count == 0) {
+                    // 客户端整帧零分片：重发缓存里的全部分片。
+                    nackWholeFrames += 1;
+                    n = [pipe.sender resendAllFragmentsForFrameSeq:frameSeq error:&rsErr];
+                } else {
+                    n = [pipe.sender resendFragmentsForFrameSeq:frameSeq
+                                                        indices:indices error:&rsErr];
+                }
                 if (n > 0) { nackRepaired += 1; nackFragments += n; }
                 else { nackMissed += 1; }
             };
@@ -1304,9 +1327,9 @@ int main(int argc, char **argv) {
                    captureID);
             printf("  关键帧请求：收到 %lu 次\n",
                    (unsigned long)host.session.keyframeRequestsReceived);
-            printf("  补片请求：收到 %lu 次，命中重发 %llu 帧/%llu 片，未命中 %llu\n",
+            printf("  补片请求：收到 %lu 次（整帧 %llu），命中重发 %llu 帧/%llu 片，未命中 %llu\n",
                    (unsigned long)host.session.frameNacksReceived,
-                   nackRepaired, nackFragments, nackMissed);
+                   nackWholeFrames, nackRepaired, nackFragments, nackMissed);
             if (simLossPct > 0 || simReorderPct > 0) {
                 printf("  注入故障：丢片 %llu 个，乱序交换 %llu 次（%.1f%% / %.1f%%）\n",
                        host.simFragmentsDropped, host.simReordered, simLossPct, simReorderPct);
@@ -1354,6 +1377,7 @@ int main(int argc, char **argv) {
             }
             json[@"keyframeRequestsReceived"] = @(host.session.keyframeRequestsReceived);
             json[@"frameNacksReceived"] = @(host.session.frameNacksReceived);
+            json[@"frameNackWholeFrames"] = @(nackWholeFrames);
             json[@"frameNacksRepaired"] = @(nackRepaired);
             json[@"frameNackFragmentsResent"] = @(nackFragments);
             json[@"frameNacksMissed"] = @(nackMissed);
@@ -1721,6 +1745,7 @@ int main(int argc, char **argv) {
         json[@"keyframeRequestFailures"] = @(client.keyframeRequestFailures);
         json[@"repairRequests"] = @(rs.repairRequests);
         json[@"repairRequestsSent"] = @(client.repairRequestsSent);
+        json[@"repairWholeFrameRequests"] = @(client.repairWholeFrameRequests);
         json[@"frameNacksSent"] = @(client.session.frameNacksSent);
         json[@"repairRttMs"] = @(round(rs.repairRttMs));
         json[@"repairRttSamples"] = @(rs.repairRttSamples);

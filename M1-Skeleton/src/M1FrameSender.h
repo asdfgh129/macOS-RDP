@@ -71,6 +71,11 @@ NS_ASSUME_NONNULL_BEGIN
                                  indices:(NSIndexSet *)indices
                                    error:(NSError * _Nullable * _Nullable)error;
 
+// 整帧补片：客户端一个分片都没收到时，按 frameSeq 重发缓存里的全部分片。
+// 返回实际重发的分片数；不在缓存里返回 0。
+- (NSUInteger)resendAllFragmentsForFrameSeq:(uint32_t)frameSeq
+                                       error:(NSError * _Nullable * _Nullable)error;
+
 @end
 
 NS_ASSUME_NONNULL_END

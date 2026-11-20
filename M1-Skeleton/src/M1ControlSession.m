@@ -52,6 +52,7 @@ static NSString *M1ArchName(void) {
     atomic_uint_fast64_t _nacksSent;
     atomic_uint_fast64_t _nacksReceived;
     _Atomic double _lastNackMs;
+    _Atomic double _lastWholeNackMs;
 }
 @property (nonatomic, strong) M1ControlChannel *channel;
 @property (nonatomic, strong) M1ControlSessionConfig *config;
@@ -94,6 +95,7 @@ static NSString *M1ArchName(void) {
         atomic_init(&_nacksSent, 0);
         atomic_init(&_nacksReceived, 0);
         atomic_store(&_lastNackMs, 0.0);
+        atomic_store(&_lastWholeNackMs, 0.0);
         _inputLimiter = [[P1InputRateLimiter alloc] initWithEventsPerSecond:P1InputMaxEventsPerSecond];
         channel.delegate = self;
     }
@@ -565,6 +567,36 @@ static NSString *M1ArchName(void) {
     return YES;
 }
 
+- (BOOL)requestWholeFrame:(uint32_t)frameSeq error:(NSError **)error {
+    if (error) *error = nil;
+    if (self.role != M1ControlRoleClient) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorProtocol,
+            @"只有 Client 发送 frame-nack");
+        return NO;
+    }
+    if (self.closed || self.stateMachine.state != P1SessionStateStreaming) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorInvalidState,
+            @"会话未处于 STREAMING，整帧补片请求未发送");
+        return NO;
+    }
+    double now = [[NSDate date] timeIntervalSince1970] * 1000.0;
+    double last = atomic_load(&_lastWholeNackMs);
+    if (now - last < 5.0 && last > 0) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorRateLimited,
+            @"整帧补片请求限流（5ms）");
+        return NO;
+    }
+    NSMutableDictionary *payload = [@{ @"type": @"frame-nack",
+                                       @"frameSeq": @(frameSeq),
+                                       @"all": @YES } mutableCopy];
+    NSNumber *displayID = self.remoteDisplays.firstObject[@"displayID"];
+    if ([displayID isKindOfClass:[NSNumber class]]) payload[@"displayID"] = displayID;
+    if (![self sendPayload:payload]) return NO;
+    atomic_store(&_lastWholeNackMs, now);
+    atomic_fetch_add(&_nacksSent, 1);
+    return YES;
+}
+
 - (void)handleFrameNack:(NSDictionary *)msg {
     if (self.role != M1ControlRoleHost) {
         [self failWith:M1SessErr(M1ControlSessionErrorProtocol,
@@ -573,10 +605,23 @@ static NSString *M1ArchName(void) {
     }
     if (self.closed || self.stateMachine.state != P1SessionStateStreaming) return;
     NSNumber *seqNum = msg[@"frameSeq"];
+    if (![seqNum isKindOfClass:[NSNumber class]]) return;
+    NSNumber *allNum = msg[@"all"];
+    if ([allNum isKindOfClass:[NSNumber class]] && allNum.boolValue) {
+        // 整帧零分片：没有缺片下标可校验，交给发送端按 frameSeq 重发全部分片。
+        atomic_fetch_add(&_nacksReceived, 1);
+        if ([self.delegate respondsToSelector:
+                @selector(controlSession:didRequestFragmentsForFrame:fragCount:indices:)]) {
+            [self.delegate controlSession:self
+                 didRequestFragmentsForFrame:(uint32_t)seqNum.unsignedIntValue
+                                 fragCount:0
+                                   indices:[NSIndexSet indexSet]];
+        }
+        return;
+    }
     NSNumber *cntNum = msg[@"fragCount"];
     NSArray *rawIndices = msg[@"indices"];
-    if (![seqNum isKindOfClass:[NSNumber class]] ||
-        ![cntNum isKindOfClass:[NSNumber class]] ||
+    if (![cntNum isKindOfClass:[NSNumber class]] ||
         ![rawIndices isKindOfClass:[NSArray class]] ||
         rawIndices.count == 0 || rawIndices.count > 64) {
         return;   // 畸形补片请求静默忽略：它来自帧通道的推测，不该掀掉会话

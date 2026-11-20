@@ -33,6 +33,8 @@ NS_ASSUME_NONNULL_BEGIN
 // >0 时降采样到该像素尺寸；0 = 屏幕原始尺寸。用于对齐 D-10 的 1080p 目标档。
 @property (nonatomic, assign) int32_t outputWidth;
 @property (nonatomic, assign) int32_t outputHeight;
+// 0=auto 1=best 2=nominal；排查虚拟屏 High-DPI 采集帧率用。
+@property (nonatomic, assign) NSInteger captureResolution;
 @end
 
 @interface M1FramePipelineStats : NSObject

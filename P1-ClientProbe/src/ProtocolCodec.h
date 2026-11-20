@@ -98,8 +98,10 @@ NSArray<NSData *> * _Nullable P1FragmentPayload(NSData *payload,
 
 // 定向补片回调：某帧停止推进、首次超期时把缺失分片下标交出。
 //   missingIndices 为缺失片下标（升序，个数 ≤ maxRepairFragments）；
-//   keyframe 表示该帧是否关键帧。回调在 acceptHeader 的调用线程上同步执行，
-//   实现方必须非阻塞（只做控制消息入队）。
+//   整帧一个分片都没收到时 fragCount=0 且 missingIndices 为空——表示按 frameSeq
+//   请求整帧重发（发送端从分片缓存重发该帧全部分片）。
+//   keyframe 表示该帧是否关键帧（整帧请求时未知，恒为 NO）。
+//   回调在 acceptHeader 的调用线程上同步执行，实现方必须非阻塞（只做控制消息入队）。
 typedef void (^P1MissingFragmentsHandler)(uint32_t frameSeq, uint16_t fragCount,
                                           NSIndexSet *missingIndices, BOOL keyframe);
 
@@ -109,6 +111,7 @@ typedef void (^P1MissingFragmentsHandler)(uint32_t frameSeq, uint16_t fragCount,
 //
 // v4 增加定向补片：首次超期时先回调 onMissingFragments 并延长 repairGraceMs，
 // 让发送端只重发缺失片；补片仍没到才按上面的规则判丢。
+// v5 补上整帧丢失：nextSeq 零分片时同样先按 app 层语义请求整帧重发，再判丢。
 @interface P1FrameReassembler : NSObject
 
 // 交入一个分片（header 与 payload 已分开解析）。
@@ -134,7 +137,7 @@ typedef void (^P1MissingFragmentsHandler)(uint32_t frameSeq, uint16_t fragCount,
 @property (nonatomic) double repairRetryMs;        // 默认 120ms
 @property (nonatomic) NSUInteger maxRepairAttempts; // 默认 3
 // 单次补片请求的缺失片上限；超过说明缺口太大，直接走关键帧重建更划算。
-@property (nonatomic) NSUInteger maxRepairFragments; // 默认 32
+@property (nonatomic) NSUInteger maxRepairFragments; // 默认 64
 @property (nonatomic, copy, nullable) P1MissingFragmentsHandler onMissingFragments;
 @property (nonatomic, readonly) NSUInteger repairRequests;   // 已发出的补片请求数
 // 最近一次「补片请求发出 → 该帧收齐」的耗时；补片本身丢了不算采样。

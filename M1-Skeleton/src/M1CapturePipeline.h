@@ -32,6 +32,8 @@ NS_ASSUME_NONNULL_BEGIN
 // 用途：在 3440×1440 这类物理屏上验证 1080p 目标档，避免测的永远不是目标分辨率。
 @property (nonatomic, assign) int32_t outputWidth;
 @property (nonatomic, assign) int32_t outputHeight;
+// 0=自动（系统默认）1=best 2=nominal；用于排查虚拟屏 High-DPI 下的采集帧率。
+@property (nonatomic, assign) NSInteger captureResolution;
 @end
 
 @interface M1CaptureStats : NSObject
@@ -39,6 +41,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) uint64_t framesRejected;      // 非屏幕输出/无像素缓冲
 @property (nonatomic, readonly) double firstFrameLatencyMs;   // start 返回到首帧的耗时
 @property (nonatomic, readonly) double lastFrameIntervalMs;   // 相邻两帧间隔（判卡顿）
+// 最近一个 1s 窗口的交付数（按内容变化送帧，空闲时可为 0）。
+@property (nonatomic, readonly) uint64_t lastSecondDelivered;
+@property (nonatomic, readonly) uint64_t lastSecondIdle;
 @end
 
 @interface M1CapturePipeline : NSObject

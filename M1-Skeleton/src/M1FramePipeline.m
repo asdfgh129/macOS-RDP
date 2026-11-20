@@ -126,6 +126,7 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
     cc.showsCursor = _config.showsCursor;
     cc.outputWidth = _config.outputWidth;
     cc.outputHeight = _config.outputHeight;
+    cc.captureResolution = _config.captureResolution;
 
     M1CapturePipeline *capture =
         [[M1CapturePipeline alloc] initWithDisplayID:_displayID

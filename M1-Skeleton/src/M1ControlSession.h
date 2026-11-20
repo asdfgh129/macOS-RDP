@@ -85,6 +85,7 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 
 // Host 侧：收到 Client 的 frame-nack，应只重发该帧缺失的分片（定向补片）。
 //   frameSeq/fragCount 来自客户端重组器；indices 为缺失片下标（已校验升序、<fragCount）。
+//   整帧补片请求时 fragCount=0、indices 为空：应重发该帧在缓存里的全部分片。
 //   回调在控制收包队列上；不能阻塞。发送端没有该帧缓存时可不处理，
 //   客户端补片窗口到期后会改走 keyframe-request。
 - (void)controlSession:(M1ControlSession *)session
@@ -149,6 +150,10 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
                           fragCount:(uint16_t)fragCount
                             indices:(NSIndexSet *)indices
                               error:(NSError * _Nullable * _Nullable)error;
+
+// Client：整帧一个分片都没收到时请求 Host 重发该帧全部分片（frame-nack + all:true）。
+//   独立 5ms 限流（不与定向补片互相挤占）；非 STREAMING 返回 NO（INVALID_STATE）。
+- (BOOL)requestWholeFrame:(uint32_t)frameSeq error:(NSError * _Nullable * _Nullable)error;
 
 @property (nonatomic, readonly) NSUInteger keyframeRequestsSent;      // Client 实际发出
 @property (nonatomic, readonly) NSUInteger keyframeRequestsReceived;  // Host 收到并回调

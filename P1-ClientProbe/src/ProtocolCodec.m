@@ -299,6 +299,8 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     BOOL _haveDisplay;
     uint32_t _activeDisplay;
     double _gapSinceMs;            // 首次观察到「nextSeq 缺失但已有更晚帧」的时刻
+    NSUInteger _gapRepairAttempts; // nextSeq 整帧零分片时的整帧重发请求次数
+    double _gapRepairRequestedAtMs;
 }
 
 - (instancetype)init {
@@ -308,7 +310,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
         _repairGraceMs = 250.0;
         _repairRetryMs = 120.0;
         _maxRepairAttempts = 3;
-        _maxRepairFragments = 32;
+        _maxRepairFragments = 64;
         _maxFramesInFlight = 4;
         [self reset];
     }
@@ -335,6 +337,8 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     _haveDisplay = NO;
     _activeDisplay = 0;
     _gapSinceMs = 0;
+    _gapRepairAttempts = 0;
+    _gapRepairRequestedAtMs = 0;
 }
 
 - (NSUInteger)droppedKeyframes { return _droppedKeyframes; }
@@ -406,6 +410,8 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     _needsKeyframe = YES;
     _haveNext = NO;
     _gapSinceMs = 0;
+    _gapRepairAttempts = 0;
+    _gapRepairRequestedAtMs = 0;
 }
 
 // 关键帧到达：先清掉关键帧之前的残留（它们已无参考价值），再以该帧为新的顺序起点。
@@ -428,6 +434,8 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     _nextSeq = seq;
     _needsKeyframe = NO;
     _gapSinceMs = 0;
+    _gapRepairAttempts = 0;
+    _gapRepairRequestedAtMs = 0;
 }
 
 // 帧期限判据是「停止推进」而不是「总耗时」：大帧（WAN 上的 IDR）可以合法地
@@ -507,9 +515,23 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 
 // nextSeq 完全没有分片、但更晚的帧已经在途/就绪 ⇒ 给一个期限，到期即判丢。
 // nextSeq 自己还有分片时走上面的「停止推进」判据，避免把慢速大帧误杀。
+//
+// v5：整帧零分片没有任何 partial，缺片补丁无从谈起——在判丢之前先按 frameSeq
+// 请求整帧重发（fragCount=0、missingIndices 为空）。WAN 突发丢包会整帧带走
+// 4~6 片的 P 帧，之前这里直接 declareLoss，把在途 partial 和已就绪帧一起清掉，
+// 只能等下一个 IDR；一次微突发级联成多次关键帧重建。整帧重发也只占该帧本身
+// 的带宽，命中缓存时一个 RTT 就能续上。
 - (void)checkGapDeadlineAt:(double)nowMs {
-    if (!_haveNext) { _gapSinceMs = 0; return; }
-    if (_partials[@(_nextSeq)] != nil) { _gapSinceMs = 0; return; }
+    if (!_haveNext) {
+        _gapSinceMs = 0;
+        _gapRepairAttempts = 0;
+        return;
+    }
+    if (_partials[@(_nextSeq)] != nil) {
+        _gapSinceMs = 0;
+        _gapRepairAttempts = 0;
+        return;
+    }
     BOOL gap = NO;
     for (NSNumber *k in _ready) {
         if (k.unsignedIntValue > _nextSeq) { gap = YES; break; }
@@ -519,9 +541,30 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
             if (k.unsignedIntValue > _nextSeq) { gap = YES; break; }
         }
     }
-    if (!gap) { _gapSinceMs = 0; return; }
+    if (!gap) {
+        _gapSinceMs = 0;
+        _gapRepairAttempts = 0;
+        return;
+    }
     if (_gapSinceMs == 0) { _gapSinceMs = nowMs; return; }
-    if (nowMs - _gapSinceMs < self.frameDeadlineMs) return;
+    BOOL retryDue = _gapRepairAttempts == 0
+        || nowMs - _gapRepairRequestedAtMs >= self.repairRetryMs;
+    if (self.onMissingFragments && retryDue &&
+        _gapRepairAttempts < MAX(1, self.maxRepairAttempts) &&
+        nowMs - _gapSinceMs >= self.repairRequestMs) {
+        _gapRepairAttempts++;
+        _gapRepairRequestedAtMs = nowMs;
+        _repairRequests++;
+        self.onMissingFragments(_nextSeq, 0, [NSIndexSet indexSet], NO);
+        return;
+    }
+    double deadline = _gapRepairAttempts > 0
+        ? MAX(self.repairGraceMs, self.frameDeadlineMs)
+        : self.frameDeadlineMs;
+    double ref = _gapRepairAttempts > 0
+        ? MAX(_gapSinceMs, _gapRepairRequestedAtMs)
+        : _gapSinceMs;
+    if (nowMs - ref < deadline) return;
     _droppedFrames++;   // _nextSeq 一个分片都没收到
     [self declareLoss];
 }

@@ -169,6 +169,7 @@ static NSError *M1PipeErr(M1PipelineErrorCode code, NSString *msg) {
                                    error:(NSError **)error {
     if (error) *error = nil;
     if (indices.count == 0) return 0;
+    if (self.fragmentCacheFrames == 0) return 0;   // 缓存关闭：即便残留旧条目也不重发
     [self.cacheLock lock];
     NSArray<NSData *> *frags = self.fragCache[@(frameSeq)];
     [self.cacheLock unlock];
@@ -191,6 +192,33 @@ static NSError *M1PipeErr(M1PipelineErrorCode code, NSString *msg) {
         self.fragmentsResent++;
         self.stats.fragmentsSent += 1;
         self.stats.bytesSent += frags[i].length;
+    }
+    return sent;
+}
+
+- (NSUInteger)resendAllFragmentsForFrameSeq:(uint32_t)frameSeq error:(NSError **)error {
+    if (error) *error = nil;
+    if (self.fragmentCacheFrames == 0) return 0;
+    [self.cacheLock lock];
+    NSArray<NSData *> *frags = self.fragCache[@(frameSeq)];
+    [self.cacheLock unlock];
+    if (!frags) return 0;
+
+    NSUInteger sent = 0;
+    for (NSData *frag in frags) {
+        NSError *sendErr = nil;
+        if (![self.sink sendDatagram:frag error:&sendErr]) {
+            self.stats.sinkFailures += 1;
+            if (error) {
+                *error = M1PipeErr(M1PipelineErrorSinkFailed,
+                                   sendErr.localizedDescription ?: @"补片投递失败");
+            }
+            break;
+        }
+        sent++;
+        self.fragmentsResent++;
+        self.stats.fragmentsSent += 1;
+        self.stats.bytesSent += frag.length;
     }
     return sent;
 }
