@@ -845,6 +845,10 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.30 | 跨网段联调**两端必须同一 commit 且各自重建**：本轮上一次 `-9858` 与本轮成功之间的唯一实质差异就是 client 侧更新到同一 commit，握手即通过。排障顺序应先对齐 commit，再查 TLS/MTU | `docs/P2-CHECKLIST.md` §3 / 本轮 v0.29 |
 | C-17.31 | P2.2 的「client 解码尺寸 = 请求规格」判据**只对独占会话成立**：client 用 `--spec WxH`（`P2_SPEC`）请求，host 在 `session-start` 里据此建虚拟屏；镜像模式不建屏、解码物理屏原始尺寸，尺寸不符不算失败。client JSON 记 `requestedWidth/Height/specMatch`，`p2.sh summary` 仅在 `sessionMode` 以 `exclusive` 开头时据此判 FAIL；`specMatch` 缺失按 FAIL 处理以强制两端 commit 对齐 | `stream_probe.m` / `P2-Dual/p2.sh` / `docs/P2-CHECKLIST.md` §4 |
 | C-17.32 | `render_selftest` 的 letterbox 期望矩形必须用**独立公式**算，不能调被测的 `M1AspectFitRect`（自证循环）。档位至少覆盖两种受限方向：16:9 源在近 16:9 视图里**高度顶满**、超宽 3440×1440 在同样视图里**宽度顶满**。耗时是离屏纯转换基线（不含窗口合成），作回归护栏而非上屏性能结论，性能结论只认跨机 client `lastRenderMs` | `M1-Skeleton/tools/render_selftest.m` / 本轮 v0.33 |
+| C-17.33 | 独占会话一旦建屏/禁屏成功，**所有退出路径都必须走 `endExclusive`**：握手超时、未知 `--inject`、无限等待模式下单次接入失败各有一条早退分支，漏掉就把机器留在黑屏态（守护只在异常退出时兜底）。`--wait-ms 0` 的单次失败要清掉 `virtualDisplayID` 再等下一次，避免拿旧 ID 采集 | `stream_probe.m` / 本轮 v0.34 |
+| C-17.34 | C-09 不能只在日志里口头声明：`keep-main` 由 Coordinator 明确跳过校验，`c09Status` 必须是 `skipped-keep-main`；全禁模式只有 `startWithSpecs` 通过才记 `verified`。host JSON 同时落 `virtualDisplayIDs/activeDisplayIDsAfterDisable/sessionPhase/sessionRecovered`，`p2.sh summary` 对 `exclusive` 缺证据判 FAIL | `stream_probe.m` / `P2-Dual/p2.sh` / 本轮 v0.34 |
+| C-17.35 | `p2.sh summary` 的解码门禁按场景分层：LAN 0% ≥0.98、LAN 0.1% ≥0.90、WAN（有 `advertisedEndpoint`）≥0.85、注入 ≥1% 只记趋势；另加帧丢弃 <5%、等待关键帧占比 <10%（以 `streamDurationMs` 为分母）、`keyframeRequestsSent>0` 而主机未收到则 FAIL。阈值仍是结构性判据，延迟结论另算 | `P2-Dual/p2.sh` / 本轮 v0.34 |
+| C-17.36 | 独占会话即使 client 没传 `--spec`，也要用 `session-ready` 里 host 实际建的屏规格（`effectiveWidth/Height/effectiveSpecMatch`）核对解码尺寸；显式 `--spec` 优先。这样「不传参数跑独占」也有规格判据，而不是静默跳过 | `stream_probe.m` / `P2-Dual/p2.sh` / 本轮 v0.34 |
 
 ### 代价与边界
 

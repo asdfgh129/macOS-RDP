@@ -118,6 +118,9 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
                                                                               NSError **error);
 // Host 侧：收到 keyframe-request（控制收包队列上调用）。
 @property (nonatomic, copy, nullable) void (^onKeyframeRequest)(void);
+// 单次接入失败（握手/会话错误）时回调：独占模式必须在这里恢复显示，
+// 否则 --wait-ms 0 会清掉错误继续等下一次，把机器留在禁屏态。
+@property (nonatomic, copy, nullable) void (^onAttemptFailed)(void);
 // Client 侧：session-start 请求的规格；nil = 1920x1080。
 @property (nonatomic, copy, nullable) NSArray<NSDictionary *> *requestedSpecs;
 
@@ -242,6 +245,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
                     printf("  [%s] 本次尝试失败：%s（继续等待重试）\n",
                            self.isHost ? "host" : "client",
                            self.error.localizedDescription.UTF8String ?: "unknown");
+                    if (self.onAttemptFailed) self.onAttemptFailed();
                     fflush(stdout);
                     self.error = nil;
                 }
@@ -882,6 +886,13 @@ int main(int argc, char **argv) {
             __block CGDirectDisplayID virtualDisplayID = 0;
             __block NSUInteger virtualW = 0, virtualH = 0;
             __block BOOL exclusiveEnded = NO;
+            // C-09 / 恢复证据：随 host.json 落盘，供 summary 与现场核对。
+            __block M1RDPDriver *exclusiveDriver = nil;
+            __block NSArray<NSNumber *> *exclusiveDisplayIDs = nil;  // 本会话新建的虚拟屏
+            __block NSArray<NSNumber *> *exclusiveActiveIDs = nil;   // 禁屏后 active 屏
+            __block NSString *exclusiveC09Status = @"not-started";  // verified / skipped-keep-main
+            __block NSString *exclusivePhaseAtReady = nil;          // 建屏后的会话阶段
+            __block BOOL exclusiveRecoveryOK = YES;
 
             // 独占会话（P2.2）：在 session-start 到达时同步建虚拟屏/禁物理屏，
             // 让 session-ready 带的是真实 displayID；失败会回 session-error 并结束会话。
@@ -906,12 +917,18 @@ int main(int argc, char **argv) {
                             userInfo:@{NSLocalizedDescriptionKey: @"session-start 缺可用宽度/高度"}];
                         return nil;
                     }
+                    // 保留 driver 引用：C-09 校验结果（active 屏快照）在它身上，
+                    // session-start 之后才能读到；json 收尾时统一落盘。
+                    exclusiveDriver = [M1RDPDriver new];
                     M1SessionCoordinator *coord =
-                        [[M1SessionCoordinator alloc] initWithDriver:[M1RDPDriver new]];
+                        [[M1SessionCoordinator alloc] initWithDriver:exclusiveDriver];
                     coord.locksScreenOnEnd = NO;   // 探针连续测量；锁屏会打断远程操作
                     if (keepMain) coord.extraKeepDisplayIDs = @[ @(CGMainDisplayID()) ];
                     NSError *startErr = nil;
                     if (![coord startWithSpecs:conv needsLogin:NO credential:nil error:&startErr]) {
+                        // Coordinator 内部已做 best-effort 恢复；这里只清引用，避免误触发
+                        // endExclusive 对未成功的会话再恢复一次。
+                        exclusiveDriver = nil;
                         if (perr) *perr = startErr;
                         return nil;
                     }
@@ -919,11 +936,19 @@ int main(int argc, char **argv) {
                     if (ids.count == 0) {
                         NSError *endErr = nil;
                         [coord endSessionError:&endErr];
+                        exclusiveDriver = nil;
                         if (perr) *perr = [NSError errorWithDomain:@"streamprobe" code:6
                             userInfo:@{NSLocalizedDescriptionKey: @"建屏成功但没有 displayID"}];
                         return nil;
                     }
                     exclusiveCoordinator = coord;
+                    exclusiveEnded = NO;   // 新一次会话：上一轮失败时已置 YES
+                    exclusiveRecoveryOK = YES;
+                    exclusiveDisplayIDs = [ids copy];
+                    exclusiveActiveIDs = [exclusiveDriver.lastActiveDisplayIDs copy] ?: @[];
+                    // keepMain 保留了物理主屏，Coordinator 明确跳过 C-09；不能谎报已校验。
+                    exclusiveC09Status = keepMain ? @"skipped-keep-main" : @"verified";
+                    exclusivePhaseAtReady = M1HostSessionPhaseName(coord.phase);
                     virtualDisplayID = ids.firstObject.unsignedIntValue;
                     virtualW = [conv.firstObject[@"width"] unsignedIntegerValue];
                     virtualH = [conv.firstObject[@"height"] unsignedIntegerValue];
@@ -936,27 +961,52 @@ int main(int argc, char **argv) {
                     }
                     printf("  [独占] 虚拟屏就绪 ids=%s  phase=%s  physicalDisabled=%s\n",
                            [[displays valueForKey:@"displayID"] componentsJoinedByString:@","].UTF8String,
-                           M1HostSessionPhaseName(coord.phase).UTF8String,
+                           exclusivePhaseAtReady.UTF8String,
                            keepMain ? "保留主屏" : "是");
+                    printf("  [独占] C-09=%s  禁屏后 active=%s\n",
+                           exclusiveC09Status.UTF8String,
+                           [[exclusiveActiveIDs description] UTF8String] ?: "[]");
                     fflush(stdout);
                     return displays;
                 };
             }
 
+            // onAttemptFailed 由 host 持有，里面又会调 endExclusive：
+            // 两个 block 都通过 weakHost 上锁，避免 host → block → host 环。
+            __weak StreamNode *weakHost = host;
             void (^endExclusive)(void) = ^{
-                @synchronized (host) {
+                StreamNode *syncHost = weakHost;
+                if (!syncHost) return;
+                @synchronized (syncHost) {
                     if (exclusiveEnded || !exclusiveCoordinator) return;
                     exclusiveEnded = YES;
                     M1SessionCoordinator *coord = exclusiveCoordinator;
                     exclusiveCoordinator = nil;
                     NSError *endErr = nil;
-                    if (![coord endSessionError:&endErr]) {
+                    exclusiveRecoveryOK = [coord endSessionError:&endErr];
+                    if (!exclusiveRecoveryOK) {
                         printf("  [独占] 恢复失败: %s\n",
                                endErr.localizedDescription.UTF8String ?: "unknown");
                     } else {
                         printf("  [独占] 已恢复物理屏并销毁虚拟屏\n");
                     }
+                    exclusiveDriver = nil;
                     fflush(stdout);
+                }
+            };
+            // 无限等待模式：单次接入失败后清掉独占显示状态，下一次 session-start
+            // 会重建虚拟屏；不要把上一次失败的 displayID 带进下一次采集。
+            host.onAttemptFailed = ^{
+                StreamNode *host = weakHost;
+                if (!host) return;
+                @synchronized (host) {
+                    endExclusive();
+                    virtualDisplayID = 0;
+                    virtualW = 0; virtualH = 0;
+                    exclusiveDisplayIDs = nil;
+                    exclusiveActiveIDs = nil;
+                    exclusivePhaseAtReady = nil;
+                    if (exclusive) exclusiveC09Status = @"attempt-failed-recovered";
                 }
             };
 
@@ -996,6 +1046,10 @@ int main(int argc, char **argv) {
             if (![host waitForStreamingTimeoutMs:waitMs]) {
                 printf("✗ %us 内未进入 STREAMING: %s\n", waitMs / 1000, (const char *)
                        host.error.localizedDescription.UTF8String ?: "无客户端");
+                // session-start 已到但握手未完成时，displayProvider 可能已建好虚拟屏并禁了
+                // 物理屏；这里不恢复会把机器留在黑屏态（守护只在进程异常退出时兜底）。
+                endExclusive();
+                [host shutdown];
                 return 4;
             }
             printf("双端已 STREAMING，开始推流（%d ms / %d fps）\n", durationMs, fps);
@@ -1062,6 +1116,7 @@ int main(int argc, char **argv) {
                     printf("✗ 未知 --inject 模式：%s（只支持 record / real）\n",
                            injectMode.UTF8String);
                     [pipe stop];
+                    endExclusive();
                     [host shutdown];
                     return 1;
                 }
@@ -1170,6 +1225,7 @@ int main(int argc, char **argv) {
             NSMutableDictionary *json = [NSMutableDictionary dictionary];
             json[@"role"] = @"host";
             json[@"port"] = @(host.port);
+            json[@"streamDurationMs"] = @(durationMs);
             if (advertiseSpec.length) json[@"advertisedEndpoint"] = advertiseSpec;
             json[@"streaming"] = @(host.streaming);
             json[@"stateLog"] = host.stateLog;
@@ -1192,6 +1248,14 @@ int main(int argc, char **argv) {
             json[@"sessionMode"] = exclusive ? (keepMain ? @"exclusive-keep-main" : @"exclusive")
                                              : @"mirror";
             json[@"captureDisplayID"] = @(captureID);
+            if (exclusive) {
+                json[@"virtualDisplayIDs"] = exclusiveDisplayIDs ?: @[];
+                json[@"activeDisplayIDsAfterDisable"] = exclusiveActiveIDs ?: @[];
+                json[@"c09Status"] = exclusiveC09Status;
+                json[@"sessionPhase"] = exclusivePhaseAtReady ?: @"";
+                json[@"sessionRecovered"] = @(exclusiveRecoveryOK);
+                json[@"sessionEnded"] = @(exclusiveEnded);
+            }
             json[@"keyframeRequestsReceived"] = @(host.session.keyframeRequestsReceived);
             json[@"simLossPct"] = @(simLossPct);
             json[@"simReorderPct"] = @(simReorderPct);
@@ -1528,6 +1592,7 @@ int main(int argc, char **argv) {
 
         NSMutableDictionary *json = [NSMutableDictionary dictionary];
         json[@"role"] = @"client";
+        json[@"streamDurationMs"] = @(durationMs);
         json[@"streaming"] = @(client.streaming);
         json[@"stateLog"] = client.stateLog;
         json[@"handshakeMs"] = @(round(client.handshakeMs * 10) / 10.0);
@@ -1548,6 +1613,17 @@ int main(int argc, char **argv) {
             json[@"requestedWidth"] = @(specW);
             json[@"requestedHeight"] = @(specH);
             json[@"specMatch"] = @(client.decodedWidth == specW && client.decodedHeight == specH);
+        }
+        // 即使 client 没传 --spec，session-ready 也带了 host 实际建的屏规格；
+        // 独占会话据此核对「解码尺寸 = 本次会话真实规格」，避免不传 --spec 时无判据。
+        NSDictionary *effectiveDisplay = client.session.remoteDisplays.firstObject;
+        int effectiveW = [effectiveDisplay[@"w"] intValue];
+        int effectiveH = [effectiveDisplay[@"h"] intValue];
+        if (effectiveW > 0 && effectiveH > 0) {
+            json[@"effectiveWidth"] = @(effectiveW);
+            json[@"effectiveHeight"] = @(effectiveH);
+            json[@"effectiveSpecMatch"] = @(client.decodedWidth == effectiveW &&
+                                            client.decodedHeight == effectiveH);
         }
         json[@"decodeFps"] = @(round(decodeFps * 10) / 10.0);
         json[@"lastDecodeLatencyMs"] = @(round(rs.lastDecodeLatencyMs * 10) / 10.0);

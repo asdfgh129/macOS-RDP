@@ -140,6 +140,14 @@ P2_ADVERTISE=112.5.32.34:46600 P2_WAIT_MS=60000 ./p2.sh host
 
 # 无人值守：一直等 client 接入，不因超时退出（每 10s 打印一次已等多久）
 P2_ADVERTISE=112.5.32.34:46600 P2_PORT=46600 P2_WAIT_MS=0 ./p2.sh host
+
+# P2.2 独占会话（先跑 pipeline_kiosk_probe 冒烟；全禁物理屏需现场确认可黑屏）
+P2_EXCLUSIVE=1 P2_SPEC=1280x720 P2_FPS=15 P2_SECONDS=30 ./p2.sh host
+# 诊断模式：保留物理主屏，不满足 C-09，summary 不会把 c09Status=skipped 判成通过
+P2_EXCLUSIVE=1 P2_KEEP_MAIN=1 P2_SPEC=1280x720 ./p2.sh host
+
+# P2.1 丢片复现（环回即可模拟 WAN 行为；0.1% 是门禁档，1% 只记趋势）
+P2_SIM_LOSS=0.1 P2_WIDTH=1280 P2_HEIGHT=720 P2_FPS=15 ./p2.sh host
 ```
 
 `preflight` 逐行看，必须 `ok=1`：
@@ -260,9 +268,10 @@ M1_QUIC_DEBUG=1 P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 P2_SECONDS=35 \
 |---|---|---|
 | 双端状态序列 | 一致，末态 `STREAMING` | 逐条比对 `stateLog` |
 | 解码/发出 | 按丢片率分层：0% ≥0.98、0.1% ≥0.90 | 1% 及以上只记趋势（见下） |
-| 客户端丢帧 | < 5% | `framesDropped / framesCompleted`（帧口径） |
+| 客户端丢帧 | < 5% | `framesDropped / framesCompleted`（帧口径，`p2.sh summary` 自动判） |
 | 分片丢弃 | 仅记录 | `fragmentsDiscarded` 是作废的分片数，与帧数不可比 |
-| 等待关键帧占比 | < 10% | `awaitingKeyframeMs` / 会话时长 |
+| 等待关键帧占比 | < 10% | `awaitingKeyframeMs` / `streamDurationMs`（`summary` 自动判） |
+| C-09 / 恢复（仅 `exclusive`） | 必须 `verified` / 恢复成功 | host JSON `c09Status`、`sessionRecovered`；`exclusive-keep-main` 明确记 `skipped-keep-main` 不作通过 |
 | 关键帧请求 | 收到 > 周期基线即生效 | 主机 `keyframeRequestsReceived` 与 `key` 计数对照 |
 | 主机 `sendFailures` | = 0 | 非 0 说明分片数/MTU 有问题 |
 | 控制通道最大间隔 | < 3000 ms | 心跳 1s，超过 3 倍即被视频挤掉 |
@@ -281,10 +290,11 @@ M1_QUIC_DEBUG=1 P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 P2_SECONDS=35 \
 >
 > - 重组器 v3 已支持乱序/重复/帧期限，但**丢片仍必须请求关键帧**（H.264 参考链断裂，不假装能恢复）；`keyframe-request` 已打通到编码器，主机侧 900ms 合并、客户端 1s 重试。
 >
-> **规格断言的适用范围（2026-11-20）**：client 记 `requestedWidth/requestedHeight/specMatch`，
-> `summary` 只在 host 的 `sessionMode` 为 `exclusive` / `exclusive-keep-main` 时检查；
-> 镜像模式即使尺寸不同也不会 FAIL（镜像不建屏，尺寸由物理屏决定）。`specMatch`
-> 字段缺失时按 FAIL 处理——通常是 client 还是旧二进制，需 `git pull` 后重建。
+> **规格断言的适用范围（2026-11-20）**：client 记 `requestedWidth/requestedHeight/specMatch`；
+> 没传 `--spec` 时记 `session-ready` 里 host 实际建的屏规格 `effectiveWidth/Height/effectiveSpecMatch`。
+> `summary` 只在 host 的 `sessionMode` 为 `exclusive` / `exclusive-keep-main` 时检查，
+> 显式 `--spec` 优先；镜像模式即使尺寸不同也不会 FAIL（镜像不建屏，尺寸由物理屏决定）。
+> 独占模式下判据字段缺失按 FAIL 处理——通常是 client 还是旧二进制，需 `git pull` 后重建。
 > - 1% 以上要达标需 FEC/分片重传（P2.1-FEC，见 `docs/P2-NEXT-PLAN.md` §3）；`p2.sh` 的阈值可用 `P2_MIN_DECODE_RATIO=0.90` 覆盖。
 > - 渲染端：Sequoia 上 3440×1440 实测 84.7 ms/帧，是独立瓶颈；720p 下单帧 16.6–41.6 ms，不是主要瓶颈。
 > - 控制间隔只在 `STREAMING` 之后统计；P2.2 建虚拟屏（约 10s）不计入门禁。
