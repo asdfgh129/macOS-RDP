@@ -654,6 +654,7 @@ static void PrintUsage(void) {
         "用法:\n"
         "  stream_probe --host [--port N] [--port-file PATH] [--duration-ms N]\n"
         "                    [--display ID] [--fps N] [--out JSON] [--spec WxH]\n"
+        "                    [--width N] [--height N]       # 编码输出尺寸（镜像模式降分辨率用）\n"
         "                    [--exclusive [--keep-main]] # 建虚拟屏并禁物理屏（keep-main=保留主屏的安全模式）\n"
         "                    [--sim-loss PCT] [--sim-reorder PCT] # 发送端丢片/乱序模拟\n"
         "                    [--advertise HOST[:PORT]]   # 跨网段/NAT：防火墙映射后的对外端点\n"

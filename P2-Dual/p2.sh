@@ -22,6 +22,8 @@
 #                         外部端口可与 P2_PORT 不同；client 侧用 --port 指定映射后的端口
 #   P2_SECONDS=60       推流时长
 #   P2_FPS=20           目标帧率
+#   P2_WIDTH=1280       host 编码输出宽（镜像模式降分辨率用；0=跟随采集源）
+#   P2_HEIGHT=720       host 编码输出高（同上）
 #   P2_INJECT=real      host 的注入方式：real（真注入，需辅助功能授权）/ record
 #   P2_WINDOW=1280x720  client 窗口尺寸
 #   P2_SPEC=1280x720    client 请求 host 的推流规格（独占模式下解码尺寸必须与之相同）
@@ -97,6 +99,8 @@ preflight)
 host)
   need_bin
   mkdir -p "$OUT"
+  WH_ARG=""
+  [ -n "${P2_WIDTH:-}" ] && [ -n "${P2_HEIGHT:-}" ] && WH_ARG="--width $P2_WIDTH --height $P2_HEIGHT"
   # 上次的 host 子进程可能活着而父 shell 已退出（p2.sh 被杀不会带走 stream_probe），
   # 结果就是 EADDRINUSE 48。启动前先看一眼，给出可复制的清理命令。
   if lsof -nP -iUDP:"$PORT" >/dev/null 2>&1; then
@@ -121,7 +125,8 @@ host)
   adv_arg=""
   [ -n "$ADVERTISE" ] && adv_arg="--advertise $ADVERTISE"
   # shellcheck disable=SC2086
-  ./stream_probe --host --port "$PORT" $adv_arg --wait-ms "$WAIT_MS" \
+  # shellcheck disable=SC2086
+  ./stream_probe --host --port "$PORT" $adv_arg $WH_ARG --wait-ms "$WAIT_MS" \
       --duration-ms "$((SECS * 1000))" --fps "$FPS" \
       --inject "$INJECT" --out "$OUT/host.json" 2>&1 | tee "$OUT/host.log"
   rc=${PIPESTATUS[0]}

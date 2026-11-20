@@ -950,7 +950,7 @@ CPE 的入站规则从 TCP 改成 UDP 后，**首次跨公网端到端跑通**�
 
 ## 7. 变更记录
 
-- v0.32-draft 2026-11-20 08:5x：**补齐 P2.2 的规格断言**。client 新增 `requestedWidth/Height/specMatch`（`--spec WxH` / `P2_SPEC`），控制台打印「规格断言」；`p2.sh summary` 仅在 `sessionMode` 为独占时把尺寸不符判 FAIL，镜像模式不参与判定（镜像不建屏）。新增 `P2_SPEC` 环境变量透传。环回验证三条路径：镜像模式请求 1280×720/解码 3440×1440 → 断言 FAIL 但 summary PASS（符合预期）；伪造独占 + 不符 → summary FAIL；伪造独占 + 一致 → summary PASS。单测 **207/207 PASS**。仍未测：Tahoe host 跑本轮独占代码、全禁物理屏 + C-09、跨公网 P2.1 门禁复测。
+- v0.32-draft 2026-11-20 08:5x：**补齐 P2.2 的规格断言**。client 新增 `requestedWidth/Height/specMatch`（`--spec WxH` / `P2_SPEC`），控制台打印「规格断言」；`p2.sh summary` 仅在 `sessionMode` 为独占时把尺寸不符判 FAIL，镜像模式不参与判定（镜像不建屏）。新增 `P2_SPEC` 环境变量透传。另补 `P2_WIDTH`/`P2_HEIGHT` 透传 host 编码输出尺寸（此前只有直接调 `stream_probe --host --width/--height` 才能降分辨率，`p2.sh` 不透传）——环回验证 host 输出 1280×720、client 解码 1280×720、40/40 帧；`usage` 同步补上这两个参数。环回验证三条路径：镜像模式请求 1280×720/解码 3440×1440 → 断言 FAIL 但 summary PASS（符合预期）；伪造独占 + 不符 → summary FAIL；伪造独占 + 一致 → summary PASS。单测 **207/207 PASS**。仍未测：Tahoe host 跑本轮独占代码、全禁物理屏 + C-09、跨公网 P2.1 门禁复测。
 - v0.31-draft 2026-11-19 22:5x：**P2.1/P2.2 首轮落地（Sequoia 本机）**。重组器 v3（位图+帧期限+乱序容错）、帧级指标、keyframe-request 全链路（客户端 1s 重试、主机 900ms 合并）；720p 丢片矩阵 0%=1.00、0.1%=0.955、1%=0.13、5%=0。P2.2 修掉 Sequoia 上误用 Tahoe 保守建屏导致的残留槽位镜像死锁，`--exclusive --keep-main` 冒烟 PASS（虚拟屏 4128835、31/31、恢复成功）；控制间隔门禁改为仅统计 STREAMING 之后。详见 §5.14。
 - v0.1-draft 2026-11-18：首次建立按 OS 分离的结论表；把 Sequoia 与 Tahoe 的 V-01/V-03/V-04 结论拆开，明确禁止跨版本外推。
 - v0.2-draft 2026-11-18：补入 Tahoe V-02（锁屏态虚拟屏 `active=false`，不成立）、V-04a（通过）、V-04b（判据污染，未确认）、V-04d（不成立）；补入替代采集路径对照结果（`CGDisplayCreateImage`/`CGWindowListCreateImage` 稳定可用）。
