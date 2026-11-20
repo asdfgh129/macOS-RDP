@@ -97,6 +97,18 @@ cd <macOS-RDP>/M1-Skeleton
 判定：打印虚拟屏 displayID、`采集 1280x720`、结束「已恢复物理屏」；
 `/tmp/kiosk-keepmain.png` 有画面。Sequoia 上这轮已 PASS；**Tahoe 本轮未跑，这步就是要补的证据**。
 
+> **采集按内容变化送帧**：虚拟屏上只有静止桌面时，每秒只有约 1 个 complete 帧（其余是 idle），
+> 看起来像采集卡死。要给虚拟屏喂持续变化的内容，窗口必须**贴在这块虚拟屏上**（按 displayID，
+> 不能按「主屏」猜——禁屏重排后窗口会落在物理屏）：
+>
+> ```bash
+> cd <macOS-RDP>/P2-Dual
+> ./gui-run.sh ./tools/anim_display.sh <虚拟屏 displayID> 60
+> ```
+>
+> 2026-11-20 本机实测：贴窗后 1920×1080 采集稳定 20fps（complete=20/s、idle=0）。
+> 镜像模式（不建虚拟屏）测试时传 `0`，工具会自动选主屏：`anim_display.sh 0 60`。
+
 若 2.1 就失败（零显示/WindowServer 断言）：**停**，记 OS/build 到 `RESULTS-BY-OS.md`，
 回退镜像模式，不上 2.2。
 
@@ -116,6 +128,16 @@ P2_OUT=$PWD/out/exclusive-1120 \
 #   [独占] C-09=verified  禁屏后 active=(仅虚拟屏)
 #   采集目标：虚拟屏 displayID=...（物理屏已禁用）
 ```
+
+看到 `虚拟屏就绪 ids=...` 后，在 host 的第二个终端给这块虚拟屏喂动态内容（否则送帧只剩 idle）：
+
+```bash
+cd <macOS-RDP>/P2-Dual
+./gui-run.sh ./tools/anim_display.sh <虚拟屏 displayID> 120
+```
+
+**判定补充**：host 每秒 `[capture]` 行的 `complete` 应≈目标 fps、`idle`≈0；
+若 `idle` 占绝大多数而 `complete`≈1/s，先查动画窗口是否真在虚拟屏上，不要直接判采集退化。
 
 ```bash
 # client（Sequoia）：传 --spec，尺寸断言生效
