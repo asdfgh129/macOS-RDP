@@ -31,7 +31,7 @@
 | 1.1 | `P1FrameReassembler` 改按帧缓存：每帧 `fragIdx` 位图 + 分片暂存，允许乱序/重复/交错到达；整帧齐才交付 | `P1-ClientProbe/src/ProtocolCodec.{h,m}` |
 | 1.2 | 帧截止时间（默认 120ms，可配）：超时才判丢帧、置 `needsKeyframe`；同时淘汰旧帧，内存上限 2–4 帧在飞。真丢片仍不可解码 → 必须请求关键帧，**不假装能恢复** | 同上 |
 | 1.3 | 打通 `keyframe-request`：client 在 `onNeedKeyframe` 发送 `{"type":"keyframe-request","displayID":N}`（限速 ≥300ms），host 收到后 `[pipeline requestKeyframe]`；`M1ControlSession` 增加该消息分发与 delegate | `M1-Skeleton/src/M1ControlSession.{h,m}`、`stream_probe.m` |
-| 1.4 | 指标修正：`framesDropped` 只计帧；新增 `fragmentsDiscarded`、`awaitingKeyframeMs`、`keyframeRequestRttMs`，`p2.sh summary` 用帧口径 | `M1FrameReceiver.{h,m}`、`stream_probe.m`、`P2-Dual/p2.sh` |
+| 1.4 | ✅ 完成（2026-11-20 RTT 补齐）：`framesDropped` 只计帧；新增 `fragmentsDiscarded`、`awaitingKeyframeMs`、`keyframeRequestRttMs`（首个成功请求→关键帧重组到达，不含解码/上屏）、`keyframeRequestRttSamples`，`p2.sh summary` 用帧口径 | `M1FrameReceiver.{h,m}`、`stream_probe.m`、`P2-Dual/p2.sh` |
 | 1.5 | 可重复验证：host 增加 `--sim-loss PCT [--sim-reorder PCT]`（发出前按 PRNG 丢弃/延迟），环回即可复现 WAN 行为；补单测（乱序、重复、缺尾片、超时、跨帧交错、换屏、请求限速） | `stream_probe.m`、`M1-Skeleton/tests` |
 
 **完成判据（2026-11 按实测修订）**
@@ -47,6 +47,7 @@
 | 5% | 0/117 | IDR 存活率 ≈1e-8，不可达 |
 
 - 单测全过（含新增重组/乱序/重复/超时/限速用例）。
+- **进度（2026-11-20）**：步骤 1.1–1.5 全部落地，含 `keyframeRequestRttMs / keyframeRequestRttSamples`（仅观测、不设门禁）；单测 207/207 PASS。**仍未做**：今晚的公网门禁复测。
 - 环回 720p15/30s：**0% ≥0.98、0.1% ≥0.90**；`awaitingKeyframeMs` 占比 <10%；请求确实到达编码器（host key 计数 > 周期基线）。
 - 1% 与 5% 只作趋势记录，不作门禁；5% 的 0.95 判据在无 FEC 下不可实现，已删除。
 - 跨公网 720p15/30s：解码/发出 **≥0.85**（前提是端到端丢片率 ≲0.1%），`sendFailures=0`，控制间隔 <3s。

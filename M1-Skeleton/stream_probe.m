@@ -513,6 +513,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
             NSError *kfErr = nil;
             if ([self.session requestKeyframeWithError:&kfErr]) {
                 self.keyframeRequestsSent += 1;
+                [self.receiver noteKeyframeRequestSent];   // 只有真正过线才开始计 RTT
             } else if (kfErr.code != M1ControlSessionErrorRateLimited) {
                 self.keyframeRequestFailures += 1;
             }
@@ -1546,11 +1547,12 @@ int main(int argc, char **argv) {
         printf("\n--- client 结果 ---\n");
         printf("  receiver: datagrams=%llu completed=%llu decoded=%llu dropped=%llu "
                "discardedFrags=%llu decodeFail=%llu keyReq=%llu keyReqSent=%llu "
-               "awaitKeyframe=%.0fms malformed=%llu\n",
+               "awaitKeyframe=%.0fms kfRtt=%.0fms/%llu malformed=%llu\n",
                rs.datagramsReceived, rs.framesCompleted, rs.framesDecoded,
                rs.framesDropped, rs.fragmentsDiscarded, rs.decodeFailures,
                rs.keyframeRequests, client.keyframeRequestsSent,
-               rs.awaitingKeyframeMs, rs.malformedDatagrams);
+               rs.awaitingKeyframeMs, rs.keyframeRequestRttMs,
+               rs.keyframeRequestRttSamples, rs.malformedDatagrams);
         double firstFrameLatency = (client.firstFrameMs > 0 && client.streamStartMs > 0)
             ? client.firstFrameMs - client.streamStartMs : 0;
         printf("  解码尺寸 %dx%d  解码帧率 %.1f fps  首帧延迟 %.0f ms\n",
@@ -1606,6 +1608,8 @@ int main(int argc, char **argv) {
         json[@"keyframeRequests"] = @(rs.keyframeRequests);
         json[@"keyframeRequestsSent"] = @(client.keyframeRequestsSent);
         json[@"keyframeRequestFailures"] = @(client.keyframeRequestFailures);
+        json[@"keyframeRequestRttMs"] = @(round(rs.keyframeRequestRttMs));
+        json[@"keyframeRequestRttSamples"] = @(rs.keyframeRequestRttSamples);
         json[@"malformed"] = @(rs.malformedDatagrams);
         json[@"decodedWidth"] = @(client.decodedWidth);
         json[@"decodedHeight"] = @(client.decodedHeight);

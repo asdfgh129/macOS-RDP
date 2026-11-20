@@ -273,6 +273,7 @@ M1_QUIC_DEBUG=1 P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 P2_SECONDS=35 \
 | 等待关键帧占比 | < 10% | `awaitingKeyframeMs` / `streamDurationMs`（`summary` 自动判） |
 | C-09 / 恢复（仅 `exclusive`） | 必须 `verified` / 恢复成功 | host JSON `c09Status`、`sessionRecovered`；`exclusive-keep-main` 明确记 `skipped-keep-main` 不作通过 |
 | 关键帧请求 | 收到 > 周期基线即生效 | 主机 `keyframeRequestsReceived` 与 `key` 计数对照 |
+| 关键帧请求 RTT | 仅记录 | client `keyframeRequestRttMs` / `keyframeRequestRttSamples`：首个成功请求→关键帧重组到达，不含解码/上屏 |
 | 主机 `sendFailures` | = 0 | 非 0 说明分片数/MTU 有问题 |
 | 控制通道最大间隔 | < 3000 ms | 心跳 1s，超过 3 倍即被视频挤掉 |
 | 客户端上屏 | ≥ 1 帧且 fps ≥ 0.8×目标 | 窗口不可见会被跳过（`renderSkippedOccluded`） |

@@ -227,6 +227,7 @@ rows = [
         c.get("fragmentsDiscarded"), await_ms, (await_pct or 0) * 100)),
     ("客户帧丢弃率", "%.1f%%" % ((drop_pct or 0) * 100)),
     ("关键帧请求 发出/主机收到", "%s / %s" % (c.get("keyframeRequestsSent"), h.get("keyframeRequestsReceived"))),
+    ("关键帧请求 RTT 最近/样本", "%s ms / %s 次" % (c.get("keyframeRequestRttMs", 0), c.get("keyframeRequestRttSamples", 0))),
     ("客户端上屏",        "%s 帧（跳过 %s 不可见）" % (c.get("framesRendered"), c.get("renderSkippedOccluded"))),
     ("请求规格/解码尺寸",  "%s → %s（%s）" % (req_text, got_text,
         "一致" if c.get("specMatch") else "未一致/未判定")),

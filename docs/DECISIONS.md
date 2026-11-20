@@ -849,6 +849,7 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.34 | C-09 不能只在日志里口头声明：`keep-main` 由 Coordinator 明确跳过校验，`c09Status` 必须是 `skipped-keep-main`；全禁模式只有 `startWithSpecs` 通过才记 `verified`。host JSON 同时落 `virtualDisplayIDs/activeDisplayIDsAfterDisable/sessionPhase/sessionRecovered`，`p2.sh summary` 对 `exclusive` 缺证据判 FAIL | `stream_probe.m` / `P2-Dual/p2.sh` / 本轮 v0.34 |
 | C-17.35 | `p2.sh summary` 的解码门禁按场景分层：LAN 0% ≥0.98、LAN 0.1% ≥0.90、WAN（有 `advertisedEndpoint`）≥0.85、注入 ≥1% 只记趋势；另加帧丢弃 <5%、等待关键帧占比 <10%（以 `streamDurationMs` 为分母）、`keyframeRequestsSent>0` 而主机未收到则 FAIL。阈值仍是结构性判据，延迟结论另算 | `P2-Dual/p2.sh` / 本轮 v0.34 |
 | C-17.36 | 独占会话即使 client 没传 `--spec`，也要用 `session-ready` 里 host 实际建的屏规格（`effectiveWidth/Height/effectiveSpecMatch`）核对解码尺寸；显式 `--spec` 优先。这样「不传参数跑独占」也有规格判据，而不是静默跳过 | `stream_probe.m` / `P2-Dual/p2.sh` / 本轮 v0.34 |
+| C-17.37 | `keyframeRequestRttMs` 的口径是「本轮**首个成功过线**的 keyframe-request → 后续关键帧完整重组到达」，不含 VT 解码/上屏；同一等待周期的重复请求不重置起点，否则 1s 重试会把 RTT 越测越短。限流/发送失败不计时；周期关键帧无请求时不产生样本。只作观测，不设门禁 | `M1FrameReceiver.{h,m}` / `stream_probe.m` / `P2-Dual/p2.sh` / 本轮 v0.35 |
 
 ### 代价与边界
 

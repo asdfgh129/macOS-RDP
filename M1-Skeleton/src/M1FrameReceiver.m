@@ -65,6 +65,8 @@ static BOOL M1SplitAVCC(NSData *payload,
 @property (nonatomic, assign) uint64_t decodeFailures;
 @property (nonatomic, assign) uint64_t keyframeRequests;
 @property (nonatomic, assign) double awaitingKeyframeMs;
+@property (nonatomic, assign) double keyframeRequestRttMs;
+@property (nonatomic, assign) uint64_t keyframeRequestRttSamples;
 @property (nonatomic, assign) double lastDecodeLatencyMs;
 @property (nonatomic, assign) double decoderCreateMs;
 @property (nonatomic, assign) double decoderPrewarmMs;
@@ -84,6 +86,11 @@ static BOOL M1SplitAVCC(NSData *payload,
     BOOL _awaitingKeyframe;
     double _awaitingSinceMs;
     double _lastKeyframeRequestMs;
+    // RTT 采样：只记本轮首个成功过线的请求；收到关键帧时结算。
+    double _lastRequestSentMs;
+    BOOL _rttAwaitingKeyframe;
+    _Atomic double _keyframeRequestRttMs;
+    atomic_uint_fast64_t _keyframeRequestRttSamples;
     atomic_uint_fast64_t _datagramsReceived;
     atomic_uint_fast64_t _malformed;
     atomic_uint_fast64_t _framesCompleted;
@@ -163,6 +170,10 @@ static double gPrewarmMs = -1;
         _awaitingKeyframe = NO;
         _awaitingSinceMs = 0;
         _lastKeyframeRequestMs = 0;
+        _lastRequestSentMs = 0;
+        _rttAwaitingKeyframe = NO;
+        atomic_store(&_keyframeRequestRttMs, 0.0);
+        atomic_init(&_keyframeRequestRttSamples, 0);
         atomic_init(&_datagramsReceived, 0);
         atomic_init(&_malformed, 0);
         atomic_init(&_framesCompleted, 0);
@@ -234,6 +245,14 @@ static double gPrewarmMs = -1;
     return YES;
 }
 
+- (void)noteKeyframeRequestSent {
+    // 同一个缺口 episode 的重复请求不重置起点：只有从「最早一次成功请求」
+    // 算到关键帧到达，才代表用户真实经历的恢复时延。
+    if (_rttAwaitingKeyframe) return;
+    _lastRequestSentMs = M1RxNowMs();
+    _rttAwaitingKeyframe = YES;
+}
+
 - (void)absorbReassembledFrame:(P1ReassembledFrame *)frame {
     atomic_fetch_add(&_framesCompleted, 1);
 
@@ -257,6 +276,15 @@ static double gPrewarmMs = -1;
     }
 
     if (frame.keyframe) {
+        if (_rttAwaitingKeyframe) {
+            double rtt = M1RxNowMs() - _lastRequestSentMs;
+            if (rtt > 0) {
+                atomic_store(&_keyframeRequestRttMs, rtt);
+                atomic_fetch_add(&_keyframeRequestRttSamples, 1);
+            }
+            _rttAwaitingKeyframe = NO;
+            _lastRequestSentMs = 0;
+        }
         if (_awaitingKeyframe) {
             _awaitingKeyframe = NO;
             atomic_store(&_awaitingKeyframeMs,
@@ -397,6 +425,10 @@ static double gPrewarmMs = -1;
     _awaitingKeyframe = NO;
     _awaitingSinceMs = 0;
     _lastKeyframeRequestMs = 0;
+    _lastRequestSentMs = 0;
+    _rttAwaitingKeyframe = NO;
+    atomic_store(&_keyframeRequestRttMs, 0.0);
+    atomic_store(&_keyframeRequestRttSamples, 0);
     _videoWidth = 0;
     _videoHeight = 0;
     atomic_store(&_framesDropped, 0);
@@ -427,6 +459,8 @@ static double gPrewarmMs = -1;
     double awaiting = atomic_load(&_awaitingKeyframeMs);
     if (_awaitingKeyframe) awaiting += M1RxNowMs() - _awaitingSinceMs;
     s.awaitingKeyframeMs = awaiting;
+    s.keyframeRequestRttMs = atomic_load(&_keyframeRequestRttMs);
+    s.keyframeRequestRttSamples = atomic_load(&_keyframeRequestRttSamples);
     s.lastDecodeLatencyMs = atomic_load(&_lastDecodeLatencyMs);
     s.decoderCreateMs = atomic_load(&_decoderCreateMs);
     s.decoderPrewarmMs = (gPrewarmMs > 0) ? gPrewarmMs : 0;

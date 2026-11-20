@@ -31,6 +31,10 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) uint64_t decodeFailures;
 @property (nonatomic, readonly) uint64_t keyframeRequests;   // 请求关键帧的「次数」（缺口 episode）
 @property (nonatomic, readonly) double awaitingKeyframeMs;   // 处于等关键帧状态的总时长
+// 最近一次「首个成功请求发出 → 后续关键帧完整重组到达」的耗时。
+// 不含 VT 解码/上屏；0 表示本轮没有完成的采样。
+@property (nonatomic, readonly) double keyframeRequestRttMs;
+@property (nonatomic, readonly) uint64_t keyframeRequestRttSamples; // 已完成采样数
 @property (nonatomic, readonly) double lastDecodeLatencyMs;
 // VTDecompressionSessionCreate 的实际耗时（建一次记一次，末次值）。
 // 预热生效后应落在几十 ms；首次且未预热时实测 260~1110ms。
@@ -56,6 +60,10 @@ NS_ASSUME_NONNULL_BEGIN
 // 交入一个完整 datagram（16B 帧头 + 载荷）。
 // 返回 YES 表示该 datagram 被正确解析并吸收（不代表已出画面）。
 - (BOOL)acceptDatagram:(NSData *)datagram error:(NSError * _Nullable * _Nullable)error;
+
+// 客户端成功把 keyframe-request 送上控制通道时调用；限流/发送失败不要调用。
+// 同一等待周期内只以首个成功请求作为 RTT 起点，重复请求不重置。
+- (void)noteKeyframeRequestSent;
 
 // 丢弃解码器与重组状态。分辨率变化或重连时调用。
 - (void)reset;
