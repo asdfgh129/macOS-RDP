@@ -1201,12 +1201,12 @@ host 镜像主屏 3440×1440 → 编码 1920×1080@20；a/b 轮动画窗口 1200
 | `P0V-RootDaemon/build.sh` | ✅ | ✅ 产出 `build/P0VRootProbe.app` |
 | `M1-Skeleton/build_tests.sh`（268 断言 + 守护负向） | ✅ 268 passed, 0 failed | ✅ 268 passed, 0 failed |
 | `P1-ClientProbe/build_tests.sh` | ✅ ALL PASS | ✅ ALL PASS |
-| `stream_probe --preflight client` | 已有实测通过记录 | ❌ `ok=0`：`locked=1` / `asleep=1` / `active=0`；`onConsole=1`，client 不要求 ax/capture |
+| `stream_probe --preflight client` | 已有实测通过记录 | ✅ 15:4x 人工解锁后 `ok=1`：`locked=0` / `asleep=0` / `active=1` / `onConsole=1`；`ax=0 capture=0` 对 client 不是失败项 |
 
 - 两端同为 commit `e118f89`；Ventura 侧先 `git pull --ff-only`，旧临时补丁已删除，现为干净工作区。
-- 预检失败是**屏幕锁定/显示器睡眠**，不是 SDK 或权限问题（client 角色不检查屏幕录制/辅助功能）。需在 iMac 控制台解锁并唤醒显示器后重跑：
-  `cd ~/macOS-RDP/M1-Skeleton && ./stream_probe --preflight client`
-- **边界**：本轮只证明「13 上可本机编译 + 纯逻辑测试通过」。13 host 的建虚拟屏 / 禁物理屏 / C-09 隔离、以及 13 作为 client 的真实收流上屏，**均未实测**，仍按 A-07 待回归处理；不得从本节的编译结论外推到独占会话可用性。
+- 15:0x 首次预检 `ok=0`（`locked=1` / `asleep=1` / `active=0`）。用 `caffeinate -d -u` 可远程唤醒显示器（`asleep=0 active=1`），但**锁屏无法远程解除**：`sysadminctl -screenLock off` 只改延迟不解锁，自动登录写入被 `SACSetAutoLoginPassword error:22` 拒绝，内置 VNC 因 SIP 无法激活，`CGEventPost` / `osascript` / GUI Terminal 的 `AXIsProcessTrusted` 均为 0。15:4x 由人在控制台解锁后立即重跑，`ok=1`。
+- 13 的远程解锁能力属于 D-08 Path A（客户端呈现登录界面 + 凭据注入），**不是 VNC，也尚未在 13 上实测**；当前 `stream_probe` 的 P2 工具链仍是 `needsLogin:NO`，凭据注入只在 coordinator/driver 单测与 Tahoe V-04 探针里验证过。
+- **边界**：本轮证明「13 上可本机编译 + 纯逻辑测试通过 + client 预检通过」。13 host 的建虚拟屏 / 禁物理屏 / C-09 隔离、13 作为 client 的真实收流上屏、以及 13 上的远程登录（Path A），**均未实测**，仍按 A-07 待回归处理；不得从本节的结论外推到独占会话可用性。
 
 ## 6. 状态汇总
 
