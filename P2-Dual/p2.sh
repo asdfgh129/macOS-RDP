@@ -41,6 +41,10 @@
 #
 set -uo pipefail
 
+# 记录调用方 cwd：下面会 cd 到 SKEL，但 summary 的 <host.json>/<client.json>
+# 按操作单是相对调用目录写的（./p2.sh summary out/x/host.json out/x/client.json）。
+# 不在这里转成绝对路径就会在 SKEL 下找不到文件。
+CALLER_PWD="$(pwd)"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SKEL="$HERE/../M1-Skeleton"
 cd "$SKEL" || { echo "找不到 M1-Skeleton"; exit 2; }
@@ -179,6 +183,9 @@ client)
 summary)
   H="${2:-}"; C="${3:-}"
   [ -n "$H" ] && [ -n "$C" ] || die "用法: ./p2.sh summary <host.json> <client.json>"
+  # 相对路径按调用方 cwd 解析（此时 shell 已在 SKEL 下）。
+  case "$H" in /*) : ;; *) H="$CALLER_PWD/$H" ;; esac
+  case "$C" in /*) : ;; *) C="$CALLER_PWD/$C" ;; esac
   python3 - "$H" "$C" <<'PY'
 import json, os, sys
 
