@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 版本 | v0.46-draft |
-| 日期 | 2026-11-20 |
+| 版本 | v0.47-draft |
+| 日期 | 2026-11-21 |
 | 原则 | **结论绑定具体 OS build 与机器，禁止跨版本外推**。同一判据在 Sequoia 与 Tahoe 分别记录，未测就写未测。 |
 | 上位文档 | `docs/DESIGN.md` §8、`docs/DECISIONS.md` |
 
@@ -15,6 +15,7 @@
 |---|---|---|---|---|
 | **Sequoia** | macOS 15.5 | 24F74 | Macmini8,1 / i5-9500 / x86_64 | 2026-11-17 晚间实测机；屏幕 3 块（含竖屏） |
 | **Tahoe** | macOS 26.5.2 | 25F84 | Macmini8,1 / i5-9500 / x86_64 | 2026-11-17/18 白天实测机；物理屏 2 块 |
+| **Ventura** | macOS 13.6.7 | 22G720 | iMac17,1 / x86_64 4 核 / 192.168.34.213 | 2026-11-21 新增测试机（iMac-3）；仅 CLT 14.3.1 / 13.3 SDK；**编译与单测已验证，独占会话未实测** |
 
 > 2026-11-17 早前文档写过的 26.7.3 未在该机复现，已作废。
 
@@ -1189,6 +1190,24 @@ host 镜像主屏 3440×1440 → 编码 1920×1080@20；a/b 轮动画窗口 1200
 - 1080p20 的默认路径即此前的 `--exclusive` 路径（h5/h6，§5.20），代码分支未变，无需重跑；下次 1080p 重测直接免旗标即可。
 - 客户端渲染仍受本机负载影响（p 轮 51.4ms、q 轮 95.2ms，上屏 405/169 帧并分别积压 35/258），P2.3 结论仍以空闲环境为准。
 
+### 5.23 Ventura 13.6.7 新增测试机：编译与单测验证（2026-11-21 14:5x–15:0x，iMac17,1）
+
+**目标**：验证「Intel 13–26 双角色」目标中的**下界**能在只有旧 SDK 的机器上自洽构建（C-01 / C-17.38 / `DESIGN.md` §2.4.1）。本机只有 CLT 14.3.1 / macOS 13.3 SDK，无法安装新版 CLT/Xcode；改动前对 14+ API 做了审计，确认只有 3 处文件、7 个编译错误点，且全在既有 `@available` 运行时守卫内，因此只补编译期守卫，不改任何运行时行为。
+
+| 项 | 26.5.2 Tahoe（本机 Xcode 26.5 SDK） | 13.6.7 Ventura（iMac-3，CLT 14.3.1 / 13.3 SDK） |
+|---|---|---|
+| `M1-Skeleton/build_stream_probe.sh` | ✅ | ✅ `built: ./stream_probe` |
+| `P0-TahoeProbe/build.sh` | ✅ | ✅ `构建完成：./p0probe`（脚本明确提示「当前 macOS 大版本是 13，verify 结论仅供参考」） |
+| `P0V-RootDaemon/build.sh` | ✅ | ✅ 产出 `build/P0VRootProbe.app` |
+| `M1-Skeleton/build_tests.sh`（268 断言 + 守护负向） | ✅ 268 passed, 0 failed | ✅ 268 passed, 0 failed |
+| `P1-ClientProbe/build_tests.sh` | ✅ ALL PASS | ✅ ALL PASS |
+| `stream_probe --preflight client` | 已有实测通过记录 | ❌ `ok=0`：`locked=1` / `asleep=1` / `active=0`；`onConsole=1`，client 不要求 ax/capture |
+
+- 两端同为 commit `e118f89`；Ventura 侧先 `git pull --ff-only`，旧临时补丁已删除，现为干净工作区。
+- 预检失败是**屏幕锁定/显示器睡眠**，不是 SDK 或权限问题（client 角色不检查屏幕录制/辅助功能）。需在 iMac 控制台解锁并唤醒显示器后重跑：
+  `cd ~/macOS-RDP/M1-Skeleton && ./stream_probe --preflight client`
+- **边界**：本轮只证明「13 上可本机编译 + 纯逻辑测试通过」。13 host 的建虚拟屏 / 禁物理屏 / C-09 隔离、以及 13 作为 client 的真实收流上屏，**均未实测**，仍按 A-07 待回归处理；不得从本节的编译结论外推到独占会话可用性。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe |
@@ -1203,6 +1222,7 @@ host 镜像主屏 3440×1440 → 编码 1920×1080@20；a/b 轮动画窗口 1200
 
 ## 7. 变更记录
 
+- v0.47-draft 2026-11-21 15:0x：**Ventura 13 编译验证，见 §5.23**。新增 iMac17,1 / 13.6.7 测试机；3 个构建目标 + 2 套单测在 13.3 SDK 与 26.5 SDK 上均通过。14+ SCK API 补 `#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000` 编译期守卫（与既有 `@available` 并存），并在 `DESIGN.md` §2.4.1 / `DECISIONS.md` C-17.38 明确 13–26 Intel 双角色目标。13 的 client 预检因屏幕锁定未通过，host 独占会话未实测。
 - v0.46-draft 2026-11-20 23:3x：**G2 收口，见 §5.22**。`stream_probe --host` 默认按客户端 `session-start specs` 建虚拟屏并禁物理屏（`--mirror` 降为诊断开关，`p2.sh` 增 `P2_MIRROR=1`）。默认路径 720p15（p）：441/441、C-09 verified/recovered、补片 34/34、关键帧 0、控制间隔 1310ms；镜像对照（q）：428/428、补片 23/23、控制间隔 1055ms；均 PASS。
 - v0.45-draft 2026-11-20 23:2x：**矩阵补测（2b9ec03）720p15 WAN 镜像/独占，见 §5.21**。m 442/441=0.998、n 440/440=1.000（C-09 verified/recovered、输入 81/79、光标 1342px），补片 30/30 与 25/25 全命中、关键帧 0、sendFailures 0。LAN 行因无同 LAN 第二台机如实标注不可得。P2.3 渲染基线被本机 Screen Sharing/Qoder 负载污染（同代码两轮 273.8ms vs 9.6ms、render_selftest 1080p 14.8–95.4ms），需空闲环境重测。
 - v0.44-draft 2026-11-20 23:4x：**回归复跑 + 窗口外分片锁死治理，见 §5.20**。修正 v0.43 镜像 f/g 的证据口径（4.2–4.4KB/帧≈空白画面，不能代表大帧档）。新增分片丢弃去向与重组状态诊断。修复「`_nextSeq` 落后超窗后所有新分片静默丢弃、整段流锁死」：连续 ≥64 片 ahead 拒收即判丢并请求关键帧。回归：720p 镜像 442/442、720p 独占 424/425（C-09 verified）、1080p 镜像 585/586、1080p 独占 h5 573/574、h6 549/570（ahead=64 触发一次、关键帧 RTT 208ms），全部 PASS；单测 268/268。
