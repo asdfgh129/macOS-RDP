@@ -22,6 +22,7 @@
 #import <dlfcn.h>
 #import <math.h>
 #import <stdlib.h>
+#import <unistd.h>
 
 // CGSessionCopyCurrentDictionary 在 ApplicationServices 里没有稳定公开声明，自己补。
 extern CFDictionaryRef CGSessionCopyCurrentDictionary(void);
@@ -364,6 +365,9 @@ static void P0VTypeToPid(pid_t pid, NSString *ascii) {
         CGEventPostToPid(pid, up);
         CFRelease(down);
         CFRelease(up);
+        // loginwindow 会丢弃过密的合成按键：实测 8 字符只落 2 个字符。
+        // 30ms 间隔保证每个 Unicode 事件都被密码框接收。
+        usleep(30000);
     }
 }
 
@@ -471,12 +475,18 @@ static int P0VCmdType(void) {
         printf("{\"ok\":false,\"error\":\"找不到 loginwindow\"}\n");
         return 1;
     }
+    // 先清空密码框里可能残留的错误输入（Delete 键码 51）。
+    // 不打印明文口令：日志里只保留长度与结果。
+    for (int i = 0; i < 32; i++) {
+        P0VPostKeyToPid(lw, 51, true);
+        P0VPostKeyToPid(lw, 51, false);
+        usleep(15000);
+    }
     P0VTypeToPid(lw, gInjectText);
     P0VPostKeyToPid(lw, 36, true);
     P0VPostKeyToPid(lw, 36, false);
-    printf("{\"ok\":true,\"loginwindowPID\":%d,\"textLength\":%lu,\"text\":\"%s\"}\n",
-           lw, (unsigned long)gInjectText.length,
-           [gInjectText UTF8String] ?: "");
+    printf("{\"ok\":true,\"loginwindowPID\":%d,\"textLength\":%lu}\n",
+           lw, (unsigned long)gInjectText.length);
     return 0;
 }
 

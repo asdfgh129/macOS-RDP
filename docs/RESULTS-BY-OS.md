@@ -1364,9 +1364,11 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - 保存帧 `P2-Dual/out/a07-patha-cgimage/frame-002.png` 清楚显示登录壁纸、`bemin` 头像、`Enter Password` 输入框和时钟（证据已同步到本机同名目录）。
 - **键盘注入也得到确认**：锁屏 + caffeinate 下 `p0vprobe type --text zzzzzzzz` 返回 `ok=true loginwindowPID=16094`，前后 `CGDisplayCreateImage` 截图哈希由 `dc1e1eb6…` 变为 `6b88690e…`；后一张密码框出现输入圆点（iMac `P2-Dual/out/a07-patha-inject/`）。⇒ 13 的 Path A「看见登录界面 + 定向键入」在镜像模式已可用。
 
-**边界**：① 仍必须持有防显示睡眠断言，否则 `CGDisplayCreateImage` 返回 NULL；② 本轮只注入错误口令验证 UI 接收，**未用真实密码做解锁端到端**（需用户凭据）；③ 完整独占禁屏 / C-09 的 WindowServer 崩溃（§5.28 第 1–3 点）与此无关，仍是 OS 层阻塞；④ `CGDisplayCreateImage` 自 14 deprecated，只作锁屏态专用后端，未锁屏仍用 SCK/CGDisplayStream。
+**补测：真实口令解锁 PASS（2026-11-21 21:28）**。用户提供真实口令后，经临时文件（600 权限、执行后立即删除）传入 GUI 会话，`p0vprobe type` 输出不再包含明文。首轮暴露新问题：Unicode 事件投递过密，10 字符口令只有 2 个圆点落到密码框（错误口令 8 字符同样只落 2 个）。修复 `P0V-RootDaemon/src/p0vprobe.m`：逐字符间隔 30ms，键入前先发 32 次 Delete（键码 51）清空残留输入。复测：锁屏 + `caffeinate -d -u` → `p0vprobe lock` → 前置 `locked=1` → 注入真实口令 → 后置 **`locked=0 / ok=1`、截图为已解锁桌面**（`P2-Dual/out/a07-unlock-real-r2/`）。⇒ 13 上 Path A 的「看见登录界面 + 定向键入 + 正确口令解锁」端到端成立（镜像模式）。
 
-**A-07 最终口径**：client 全角色 PASS；host 镜像 / keep-main 虚拟屏全链路 PASS，真实输入注入 PASS，SPI 建屏 PASS，锁屏态看见登录界面 + 键盘注入 PASS；**仅完整独占禁屏 / C-09 仍为 OS 层阻塞**。A-09 在 13 从「不可行」更新为「镜像模式 Path A 视觉 + 注入 PASS，真实口令解锁未测」。
+**边界**：① 仍必须持有防显示睡眠断言，否则 `CGDisplayCreateImage` 返回 NULL；② 完整独占禁屏 / C-09 的 WindowServer 崩溃（§5.28 第 1–3 点）与此无关，仍是 OS 层阻塞；③ `CGDisplayCreateImage` 自 14 deprecated，只作锁屏态专用后端，未锁屏仍用 SCK/CGDisplayStream；④ 合成键入必须逐字符延时，否则 loginwindow 会丢弃事件（已修入 `p0vprobe`）。
+
+**A-07 最终口径**：client 全角色 PASS；host 镜像 / keep-main 虚拟屏全链路 PASS，真实输入注入 PASS，SPI 建屏 PASS，锁屏态看见登录界面 + 键盘注入 + 真实口令解锁 PASS；**仅完整独占禁屏 / C-09 仍为 OS 层阻塞**。A-09 在 13 从「不可行」更新为「镜像模式 Path A 端到端 PASS（V-04a/b/c 等价）」。
 
 ## 6. 状态汇总
 
@@ -1376,13 +1378,14 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 | — |
 | A-07 13–26 双角色 | — | — | ⚠️ 部分收敛：client 全角色 PASS（§5.24）；host 的 SCK 被系统拒绝但 CG 回退可用，镜像 + 虚拟屏 keep-main 双机全链路 PASS（§5.27/§5.28），真实系统输入注入 PASS（光标位移 >1000px），SPI 建虚拟屏 PASS，帧率 ~14.8fps@720p；锁屏态改用 CGDisplayCreateImage 后端后可看见登录界面并接受键入，14.9fps@720p（§5.29）。**仅完整独占禁屏/C-09 两次触发 WindowServer 崩溃，为 OS 层阻塞（§5.28）** |
 | A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
-| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） | ⚠️ 镜像模式 Path A 视觉 + 键入 PASS：锁屏且防睡眠下 CGDisplayCreateImage 后端看到完整登录界面（14.9fps），`p0vprobe type` 错误口令使密码框出现圆点、前后截图哈希变化（§5.29）。**真实口令解锁端到端未测**；完整独占禁屏下的登录窗迁移仍受 C-09 崩溃阻塞 |
+| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） | ✅ 镜像模式 Path A 端到端 PASS（V-04a/b/c 等价）：锁屏且防睡眠下 CGDisplayCreateImage 后端看到完整登录界面（14.9fps），定向键入使密码框出现圆点，真实口令注入后 `locked=0 / ok=1`、回到桌面（§5.29）。完整独占禁屏下的登录窗迁移仍受 C-09 崩溃阻塞（V-04d 等价项未测） |
 | A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。2026-11-19 跨公网已取得首批双机数据（§5.13，Tahoe host × Sequoia client）：1080p20 客户端渲染 84.7ms/帧、解码/发出 54/375；720p10 渲染 41.6ms、上屏 0 积压；补测 C/D 拿到完整配对（3440×1440 → 7 解出；720p15 → 136/443，丢包 4–6% + 严格按序重组等关键帧是主因）。无 60fps / glass-to-glass 证据，A-02 保持开放，见 D-10 |
 
 ---
 
 ## 7. 变更记录
 
+- v0.54-draft 2026-11-21 21:2x：**13 Path A 真实口令解锁 PASS（§5.29 补测）**。用户给出真实口令；发现合成 Unicode 事件投递过密导致 10 字符只落 2 个圆点，修复 `p0vprobe.m`：逐字符 30ms 间隔 + 键入前 32 次 Delete 清场，并从输出里去掉明文口令。复测 `p0vprobe lock` → 前置 `locked=1` → 注入 → 后置 `locked=0 / ok=1`，截图为已解锁桌面，证据 `P2-Dual/out/a07-unlock-real-r2/`。A-09 在 13 更新为镜像模式端到端 PASS；完整独占禁屏下的登录窗迁移仍受 C-09 阻塞。
 - v0.53-draft 2026-11-21 21:2x：**13 锁屏黑屏根因更正 + CGDisplayCreateImage 后端，见 §5.29**。用户指出锁屏数秒无输入会黑屏；对照实验证明有两层原因：① 显示睡眠时 `CGDisplayCreateImage` 直接返回 NULL（`caffeinate -d -u` 可解，Tahoe 早有此前置）；② 即使屏亮，CGDisplayStream 在锁屏态仍交付黑帧，而 `CGDisplayCreateImage` 能看到完整登录界面。`M1CapturePipeline.m` 新增第三条后端 `M1CGImageSource`（定时快照 → BGRA CVPixelBuffer），按 `CGSessionCopyCurrentDictionary()` 锁屏状态自动切换、解锁后恢复，`M1_CAPTURE_BACKEND=cgimage` 可强制；13/26 SDK 双构建 + 各 268 单测通过。13 host 锁屏 × Tahoe client 镜像 1280x720@15：359 帧上屏、14.9fps、落盘图含 `bemin`/密码框，PASS；`p0vprobe type --text zzzzzzzz` 后密码框出现圆点、截图哈希变化，确认登录 UI 收到键入。§5.28「13 Path A OS 层不可行」结论作废，A-09 更新为镜像模式视觉+注入 PASS、真实口令解锁未测；完整独占禁屏/C-09 仍是 OS 阻塞。
 - v0.52-draft 2026-11-21 21:0x：**A-07 剩余项收敛，见 §5.28**。13 上私有 SPI 探测与建虚拟屏 PASS；完整独占禁屏/C-09 两次触发 WindowServer 崩溃（崩溃栈 `DisplayStreamStateSW::CopyFrame / CGXRestoreDisplayConfiguration`），第二次踢回 loginwindow，判定 OS 层阻塞、不再重试。`--keep-main` 安全变体下虚拟屏 + CG 回退后端全链路 PASS（278 解出 / 251 上屏 / 0 丢帧），帧率 ~14.8fps@720p。用户手动给 Terminal 辅助功能授权后 `--inject real` PASS（6 收到 / 3–6 注入，光标位移 1055–1154px）。Path A 锁屏态 CG 帧全黑、`screencapture` 失败，远程看见登录界面不可行；为绕开 SCK verdict 给 `p0vprobe` 增加 `type` 子命令（只键入 + Return）。A-07 按 OS 分离收敛，13 的独占禁屏与 Path A 保持开放为 OS 限制。
 - v0.51-draft 2026-11-21 17:4x：**13 host 回退后端集成 + 双机全链路 PASS，见 §5.27**。`M1CapturePipeline.m` 加版本/能力门控的 `CGDisplayStream` 后端（13 直接走 CG，14+ SCK 失败自动回退），`IOSurface→CVPixelBuffer` 复用原编码链；`M1_CAPTURE_BACKEND=cg|sck` 可强制。13.3/26.5 SDK 双构建 + 各 268 单测通过。iMac13 host × Tahoe client 镜像 1280x720@15 两轮：81/81、53/53 收齐解出上屏，0 丢帧，输入 6/6 回传，均 PASS。3.7fps 归因于 iMac 弱 GPU 上动画夹具的内容更新率（独立 CG 探针 3.8fps），非后端缺陷。修 `P2-Dual/p2.sh` client 丢弃 `--input-synth/--manual/--keep-front` 的工具 bug。A-07 更新为「13 host 镜像模式可用，独占/锁屏未测」。
