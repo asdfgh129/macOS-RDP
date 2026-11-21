@@ -1237,13 +1237,38 @@ host 镜像主屏 3440×1440 → 编码 1920×1080@20；a/b 轮动画窗口 1200
 - d 轮发送 525 / 解出 525（1.000）、丢帧 0、`sendFailures=0`、补片全命中、关键帧 0、控制间隔 1060ms、首帧 858/1769ms、渲染 25.9ms/帧、输入 2 收到但注入 0（该轮 record 计划为 0，光标未动；§5.24 b 轮已单独证明 2/2 注入 + 1399px 位移成立）。⇒ **P2.3 的 1080p20 满帧（20fps 级）首次在双真机 LAN 上达成**，A-02 的「真实帧率」证据前进一步（glass-to-glass 延迟仍未测，A-02 保持开放）。
 - **部署含义**：3440×1440 等高分辨率物理屏上做镜像推流时，必须显式设 `M1_CAPTURE_RESOLUTION=best`，否则采集会被降采样路径拖垮。建议写进 host 启动脚本/操作单。
 
+### 5.25 Ventura 13 host 角色实测：TCC 已授权但 SCK 建流被系统拒绝（2026-11-21 16:1x–16:3x，iMac17,1）
+
+**结论：13 作为 host 仍不可用，卡在 macOS 13 系统层，不是本项目代码或配置问题；13 作为 client 可用（§5.24）。**
+
+**人工授权步骤（用户完成）**：在 iMac「系统设置 → 隐私与安全性 → 屏幕录制」勾选 `~/macOS-RDP/M1-Skeleton/stream_probe`。授权后：
+
+| 检查 | 结果 |
+|---|---|
+| GUI 会话内 `stream_probe --preflight host` | `capture=1 ax=0 locked=0 asleep=0 active=1 ok=1` |
+| SSH 内同一命令 | `capture=0 ok=0`（SSH 无 TCC 责属，预期；host 必须从 GUI 会话启动） |
+| `gui-run.sh`（launchctl asuser） | `onConsole=1` 但 `capture=0`——13 上该路径拿不到 TCC 责属 |
+| 屏幕内容枚举 | `preflight=1`、`displays=1`、`display 1920x1080`、`addStreamOutput=1`（成功） |
+| `SCStream startCapture` | **失败**：`CoreGraphicsErrorDomain Code=1003 "Start stream failed" / "The stream is nil."` |
+
+**故障隔离证据**（均为 GUI Terminal 上下文）：
+- 统一日志定位到系统 daemon：`replayd[pid] [SCCaptureSession startWithCompletionHandler:598] startError=CoreGraphicsErrorDomain Code=1003 "The stream is nil."`——失败发生在 replayd 创建底层 CG stream 时，早于本项目任何帧处理。
+- 用**独立最小 SCK 程序**（不链接本项目任何代码）复现：5 种配置（minimal / width-height / +pixelFormat / +scalesToFit / 完整项目参数）全部同样 `1003 The stream is nil` ⇒ 与 stream 配置无关。
+- TCC 正常：`tccd` 对 `kTCCServiceScreenCapture` 返回 `authValue=2`（allowed）；`screencapture -x` 可出图。
+- 杀掉 `replayd` / `screensharingd` / `ARDAgent`（早期 VNC 尝试残留）后仍失败；`remotemanagementd` 受 SIP 保护无法 bootout。排除「第二个采集者占用」假设。
+- 对照：Tahoe 26.5.2 上同一份 ad-hoc 签名二进制采集正常（§5.24）。
+
+**修复的真实 bug（与上述系统限制独立）**：原 `M1CapturePipeline.m:355` 在 `startCapture` 失败后调用 `[stream removeStreamOutput:...]`，macOS 13 上从未 start 成功的 SCStream 底层为空，该调用 `EXC_BAD_ACCESS` 崩溃（crash report：`-[M1CapturePipeline start:] (M1CapturePipeline.m:355)` → `SCStream removeStreamOutput`，`SIGSEGV / KERN_INVALID_ADDRESS at 0x0`）。已改为失败时直接返回、由 ARC 释放局部 stream/output（commit `52ab8b8`）。复测确认：host 现在优雅退出 `rc=5` + `管线启动失败: startCapture 失败: Start stream failed`，无 segfault、无新 crash report。
+
+**边界**：本节证明「13 已能完成 TCC 授权并在 GUI 会话启动 host，握手到 STREAMING 全程正常；但 13 的 SCK 无法创建采集流」，A-07 的 host 侧（建屏/禁屏/C-09）继续未验证。13 上 client 侧不受影响（§5.24 两轮 PASS）。`DECISIONS.md` C-17 关于 ad-hoc 签名只能产生 path 级 TCC 条目、正式形态需正确签名用户态 App 的结论与本结果一致，进一步说明 13 host 可能需要正式签名才能在 SCK 层通过。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
 |---|---|---|---|
 | A-01 Tahoe SPI 可用 | — | ✅ 关闭 | — |
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 | — |
-| A-07 13–26 双角色 | — | — | ⚠️ 部分：client 收流/上屏/输入回传在跨网段 LAN 实测 PASS（§5.24）；host 建屏/禁屏/C-09 与 Path A 未测。capture TCC 需人工 GUI 授权，无法远程授予 |
+| A-07 13–26 双角色 | — | — | ⚠️ 部分：client 收流/上屏/输入回传在跨网段 LAN 实测 PASS（§5.24）；host 已人工授权 TCC、GUI 内 preflight `ok=1`、握手正常，但 `SCStream startCapture` 被系统 `replayd` 以 CG 1003 拒绝（独立 SCK 程序同样失败，见 §5.25）⇒ 13 host 不可用，建屏/禁屏/C-09 与 Path A 未测 |
 | A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
 | A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） |
 | A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。2026-11-19 跨公网已取得首批双机数据（§5.13，Tahoe host × Sequoia client）：1080p20 客户端渲染 84.7ms/帧、解码/发出 54/375；720p10 渲染 41.6ms、上屏 0 积压；补测 C/D 拿到完整配对（3440×1440 → 7 解出；720p15 → 136/443，丢包 4–6% + 严格按序重组等关键帧是主因）。无 60fps / glass-to-glass 证据，A-02 保持开放，见 D-10 |
@@ -1252,6 +1277,7 @@ host 镜像主屏 3440×1440 → 编码 1920×1080@20；a/b 轮动画窗口 1200
 
 ## 7. 变更记录
 
+- v0.50-draft 2026-11-21 16:3x：**Ventura 13 host 实测 + 修复 startCapture 失败崩溃，见 §5.25**。用户完成屏幕录制授权后，GUI 会话内 host preflight `capture=1 ok=1`，握手到 STREAMING 正常，但 `SCStream startCapture` 被系统 `replayd` 以 `CoreGraphicsErrorDomain 1003 "The stream is nil."` 拒绝；独立最小 SCK 程序 5 种配置全部同样失败、TCC authValue=2、杀采集 daemon 无效 ⇒ 13 的 SCK 建流是 OS 层阻塞，非本项目代码/配置。13 host 角色仍不可用（A-07 host 侧未关闭），13 client 不受影响。修复 `M1CapturePipeline.m` 在 startCapture 失败时 `removeStreamOutput` 导致的 `EXC_BAD_ACCESS`（commit `52ab8b8`）：改为直接返回由 ARC 释放，复测优雅退出 rc=5、无新 crash report。
 - v0.49-draft 2026-11-21 16:0x：**1080p20 满帧门禁达成 + 定位采集侧瓶颈，见 §5.24 补测**。`anim_display 0 60 full` 两轮对照：`res=auto` 时 SCK 送原生 3440×1440 再降采样，i5-9500 上采集仅 ~5fps（171 帧/30s、上屏 146）；`M1_CAPTURE_RESOLUTION=best` 让 SCK 直出 1080p，采集稳 18–20fps，发 525/解 525=1.000、上屏 493 帧、丢帧 0、`sendFailures=0`，`p2.sh summary` PASS。⇒ P2.3 的 1080p20 满帧首次在双真机 LAN 达成；确认瓶颈在采集侧转录/缩放而非网络/client，高分辨率物理屏镜像推流必须显式设 `M1_CAPTURE_RESOLUTION=best`。A-02 延迟仍未测、保持开放。
 - v0.48-draft 2026-11-21 15:5x：**首次双真机跨网段 LAN 实测 + 工具链修复，见 §5.24**。Tahoe host × Ventura client，720p15 解码 276/278=0.993、1080p20 解码 85/85=1.000，两轮 `p2.sh summary` PASS，`sendFailures=0`，1080p 输入 2/2 注入、光标位移 1399px。client 空闲环境渲染基线刷新：720p 14.5ms、1080p 26.5ms/帧（此前 84.7ms 是本机负载污染）。LAN 行从「不可得」变为有实测证据（镜像模式）。修两个实测中暴露的工具链 bug：① `P2-Dual/p2.sh` 的 `summary` 相对路径在 `cd SKEL` 后失效，改为按调用方 cwd 解析；② 本地 `core.filemode=false` 导致全部脚本以 100644 入库，新克隆（filemode=true）拿不到执行位，`./p2.sh` 报 Permission denied——用 `git update-index --chmod=+x` 修正 7 个文档直接调用的脚本。**未证明** 13 host 建屏/禁屏/C-09、13 上 Path A；capture 授权无法远程授予（`CGRequestScreenCaptureAccess` 静默失败、SIP 保护 TCC.db），13 host 仍需人工在系统设置里点一次屏幕录制。
 - v0.47-draft 2026-11-21 15:0x：**Ventura 13 编译验证，见 §5.23**。新增 iMac17,1 / 13.6.7 测试机；3 个构建目标 + 2 套单测在 13.3 SDK 与 26.5 SDK 上均通过。14+ SCK API 补 `#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000` 编译期守卫（与既有 `@available` 并存），并在 `DESIGN.md` §2.4.1 / `DECISIONS.md` C-17.38 明确 13–26 Intel 双角色目标。13 的 client 预检因屏幕锁定未通过，host 独占会话未实测。
