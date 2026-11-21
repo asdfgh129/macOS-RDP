@@ -1264,6 +1264,33 @@ host 镜像主屏 3440×1440 → 编码 1920×1080@20；a/b 轮动画窗口 1200
 
 **边界**：本节证明「13 已能完成 TCC 授权并在 GUI 会话启动 host，握手到 STREAMING 全程正常；但 13 的 SCK 无法创建采集流」，A-07 的 host 侧（建屏/禁屏/C-09）继续未验证。13 上 client 侧不受影响（§5.24 两轮 PASS）。`DECISIONS.md` C-17 关于 ad-hoc 签名只能产生 path 级 TCC 条目、正式形态需正确签名用户态 App 的结论与本结果一致，进一步说明 13 host 可能需要正式签名才能在 SCK 层通过。
 
+### 5.26 13 host 替代采集路径调研：CGDisplayStream 在本机可用（2026-11-21 17:1x，iMac17,1）
+
+**上一节的结论需要修正一个关键点：13 的失败是 SCK/SkyLight 专属，不是「macOS 13 不能抓屏」。** 联网核对与本机实测都指向 `CGDisplayStream` 作为可行替代。
+
+**开源实现对照**
+- **OBS Studio**（当前 master `plugins/mac-capture/mac-display-capture.m`）仍用 `CGDisplayStreamCreateWithDispatchQueue` + `IOSurface`，没有 SCK 路径。
+- **RustDesk / `scrap`**（`libs/scrap/src/quartz/capturer.rs`）同样用 `CGDisplayStreamCreateWithDispatchQueue`，回调里包装 `IOSurfaceRef`。
+- **SideScreen**（`MacHost/Sources/ScreenCapture.swift`）是 **SCK 优先 + CGDisplayStream 兜底**：`startCapture()` 抛错、流中止、或 5s 无帧都触发 `attemptFallbackCapture()`；没有按 OS 版本分支。
+- **flutter_screen_share** 也采用 SCK(12.3+) / CGDisplayStream 双后端。
+
+**本机实测**：在 iMac 13.6.7 上用 12.3 SDK 可编译的最小 Objective-C 程序（不链接项目代码）调用 `CGDisplayStreamCreateWithDispatchQueue` 抓主屏，GUI Terminal 内结果：
+
+```text
+preflight=1
+display=1535231424 1920x1080
+create=OK
+start=0                      // kCGErrorSuccess
+frame=1 status=0 surface=0x600002e80100
+frame=2 status=0 surface=0x600002e884e0
+total_complete_frames=2      // 6s 静态屏，只有内容变化时才出帧，符合 Quartz 语义
+RC=0
+```
+
+源码与日志留在 `P2-Dual/out/cgdisplay-probe-13/`（该目录被 gitignore，不入库）。同一台机器、同一 TCC 状态下 SCK `startCapture` 必失败，而 CGDisplayStream 能建流并交付 `IOSurface`，因此**13 host 有可行替代路径**。
+
+**边界与后续**：`CGDisplayStream` 在 macOS 14 标记 deprecated、15 对虚拟屏 obsoleted（RustDesk issue #26：15 上对 BetterDisplay 等虚拟屏返回 nil）；所以不能全局替换，应做成**版本/能力门控的后端**：14+ 继续 SCK，13 且 SCK 失败时回退 CGDisplayStream。本项目尚未集成该后端；A-07 host 侧仍保持未关闭，直到回退路径在真实双机上跑通。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
