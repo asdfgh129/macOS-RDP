@@ -6,10 +6,22 @@
 #import "M1CapturePipeline.h"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <IOSurface/IOSurface.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <math.h>
+
+// CGSessionCopyCurrentDictionary 是公开 API；键名字符串在 13/26 通用。
+// 用于在运行时识别锁屏态：CGDisplayStream 在锁屏态交付黑帧，而
+// CGDisplayCreateImage 仍能看到登录界面（§5.28/§5.29）。
+static BOOL M1ScreenIsLocked(void) {
+    CFDictionaryRef d = CGSessionCopyCurrentDictionary();
+    if (!d) return NO;
+    BOOL locked = [((__bridge NSDictionary *)d)[@"CGSSessionScreenIsLocked"] boolValue];
+    CFRelease(d);
+    return locked;
+}
 
 static NSError *M1CaptureErr(M1PipelineErrorCode code, NSString *msg) {
     return [NSError errorWithDomain:M1PipelineErrorDomain
@@ -287,6 +299,136 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
 #pragma clang diagnostic pop
 
+#pragma mark - CGDisplayCreateImage 轮询后端（锁屏态专用）
+
+// CGDisplayStream 在锁屏态仍以低频出帧，但帧内容是纯黑（§5.28）。
+// 同一 TCC 状态下 CGDisplayCreateImage 能拿到完整登录界面（§5.29），
+// 因此锁屏态改用同步快照轮询。该 API 自 14 deprecated，仅在锁屏态启用。
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+@interface M1CGImageSource : NSObject {
+@public
+    CGDirectDisplayID _displayID;
+    size_t _width;
+    size_t _height;
+    dispatch_queue_t _queue;
+    dispatch_source_t _timer;
+    M1CaptureOutput *_sink;
+    int _nullCount;
+}
+- (BOOL)startWithDisplay:(CGDirectDisplayID)displayID
+                   width:(size_t)width
+                  height:(size_t)height
+                     fps:(int)fps
+                    sink:(M1CaptureOutput *)sink
+                   error:(NSError **)error;
+- (void)stop;
+@end
+
+@implementation M1CGImageSource
+
+- (BOOL)startWithDisplay:(CGDirectDisplayID)displayID
+                   width:(size_t)width
+                  height:(size_t)height
+                     fps:(int)fps
+                    sink:(M1CaptureOutput *)sink
+                   error:(NSError **)error {
+    CGImageRef first = CGDisplayCreateImage(displayID);
+    if (!first) {
+        if (error) *error = M1CaptureErr(M1PipelineErrorCaptureFailed,
+            @"CGDisplayCreateImage 首帧为 NULL（TCC 未授权或显示器已睡眠）");
+        return NO;
+    }
+    CGImageRelease(first);
+
+    _displayID = displayID;
+    _width = width;
+    _height = height;
+    _sink = sink;
+    _nullCount = 0;
+    _queue = dispatch_queue_create("m1.capture.cgimage", DISPATCH_QUEUE_SERIAL);
+    _timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
+    uint64_t interval = (uint64_t)(1e9 / (double)MAX(1, fps));
+    dispatch_source_set_timer(_timer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                              interval, interval / 4);
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(_timer, ^{
+        @autoreleasepool {
+            M1CGImageSource *strong = weakSelf;
+            if (!strong) return;
+            M1CaptureOutput *sinkRef = strong->_sink;
+            if (!sinkRef || !sinkRef->_running) return;
+
+            CGImageRef img = CGDisplayCreateImage(strong->_displayID);
+            if (!img) {
+                strong->_nullCount++;
+                if (strong->_nullCount == 1 || strong->_nullCount % 30 == 0) {
+                    printf("[capture] CGDisplayCreateImage 返回 NULL (%d 次): "
+                           "显示器可能已睡眠，需 caffeinate -d\n", strong->_nullCount);
+                    fflush(stdout);
+                }
+                atomic_fetch_add(&sinkRef->_framesRejected, 1);
+                return;
+            }
+            strong->_nullCount = 0;
+
+            size_t w = strong->_width, h = strong->_height;
+            CVPixelBufferRef pb = NULL;
+            NSDictionary *attrs = @{ (__bridge id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+            CVReturn cr = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+                                              kCVPixelFormatType_32BGRA,
+                                              (__bridge CFDictionaryRef)attrs, &pb);
+            if (cr != kCVReturnSuccess || !pb) {
+                CGImageRelease(img);
+                atomic_fetch_add(&sinkRef->_framesRejected, 1);
+                return;
+            }
+            BOOL ok = NO;
+            if (CVPixelBufferLockBaseAddress(pb, 0) == kCVReturnSuccess) {
+                void *base = CVPixelBufferGetBaseAddress(pb);
+                size_t rowBytes = CVPixelBufferGetBytesPerRow(pb);
+                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                CGContextRef ctx = CGBitmapContextCreate(base, w, h, 8, rowBytes, cs,
+                    kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+                CGColorSpaceRelease(cs);
+                if (ctx) {
+                    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
+                    CGContextRelease(ctx);
+                    ok = YES;
+                }
+                CVPixelBufferUnlockBaseAddress(pb, 0);
+            }
+            CGImageRelease(img);
+            if (!ok) {
+                CVPixelBufferRelease(pb);
+                atomic_fetch_add(&sinkRef->_framesRejected, 1);
+                return;
+            }
+            [sinkRef deliverPixelBuffer:pb ptsMs:M1WallMs()];
+            CVPixelBufferRelease(pb);
+        }
+    });
+    dispatch_resume(_timer);
+    printf("[capture] backend=CGDisplayCreateImage display=%u out=%zux%zu fps=%d "
+           "(锁屏态快照轮询)\n", displayID, width, height, fps);
+    fflush(stdout);
+    return YES;
+}
+
+- (void)stop {
+    if (_timer) {
+        dispatch_source_cancel(_timer);
+        _timer = NULL;
+    }
+    _queue = nil;
+    _sink = nil;
+}
+
+@end
+
+#pragma clang diagnostic pop
+
 #pragma mark - 采集管线
 
 @interface M1CapturePipeline () {
@@ -297,13 +439,23 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     SCStream *_stream;
     M1CaptureOutput *_output;
     M1CGDisplaySource *_cgSource;
+    M1CGImageSource *_cgImageSource;
     dispatch_queue_t _queue;
+    dispatch_queue_t _monitorQueue;
+    dispatch_source_t _monitorTimer;
+    int _preferredBackend;   // 0=SCK, 1=CGDisplayStream
+    BOOL _lastLocked;
+    size_t _outWidth;
+    size_t _outHeight;
     int32_t _pixelWidth;
     int32_t _pixelHeight;
     BOOL _running;
 }
 - (BOOL)startSCKWithError:(NSError **)error;
 - (BOOL)startCGWithError:(NSError **)error;
+- (BOOL)startCGImageWithError:(NSError **)error;
+- (void)stopBackendSourcesKeepingOutput;
+- (void)startLockMonitor;
 - (void)setupOutput:(M1CaptureOutput *)output;
 @end
 
@@ -354,11 +506,37 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     if (@available(macOS 14.0, *)) useSCK = YES;
 #endif
     const char *forcedBackend = getenv("M1_CAPTURE_BACKEND");
+    BOOL forceCGImage = NO;
     if (forcedBackend && !strcasecmp(forcedBackend, "cg")) useSCK = NO;
     if (forcedBackend && !strcasecmp(forcedBackend, "sck")) useSCK = YES;
+    if (forcedBackend && !strcasecmp(forcedBackend, "cgimage")) forceCGImage = YES;
+    _preferredBackend = useSCK ? 0 : 1;
 
     NSError *sckErr = nil;
-    if (useSCK && [self startSCKWithError:&sckErr]) return YES;
+    NSError *cgErr = nil;
+
+    // 锁屏态：CGDisplayStream 只交付黑帧，必须改用 CGDisplayCreateImage 快照轮询。
+    // 显示器睡眠时该 API 返回 NULL，需要 p2.sh 已有的 caffeinate -d 断言先唤醒。
+    if (forceCGImage || M1ScreenIsLocked()) {
+        NSError *imgErr = nil;
+        if ([self startCGImageWithError:&imgErr]) {
+            [self startLockMonitor];
+            return YES;
+        }
+        printf("[capture] CGDisplayCreateImage 后端不可用: %s%s\n",
+               imgErr.localizedDescription.UTF8String ?: "unknown",
+               forceCGImage ? "（强制模式，不回退）" : "（回退常规后端）");
+        fflush(stdout);
+        if (forceCGImage) {
+            if (error) *error = imgErr;
+            return NO;
+        }
+    }
+
+    if (useSCK && [self startSCKWithError:&sckErr]) {
+        [self startLockMonitor];
+        return YES;
+    }
     if (useSCK) {
         printf("[capture] SCK 后端失败，回退 CGDisplayStream: %s\n",
                sckErr.localizedDescription.UTF8String ?: "unknown");
@@ -372,7 +550,6 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         _queue = nil;
     }
 
-    NSError *cgErr = nil;
     if (![self startCGWithError:&cgErr]) {
         if (error) {
             if (sckErr) {
@@ -386,6 +563,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         }
         return NO;
     }
+    [self startLockMonitor];
     return YES;
 }
 
@@ -572,9 +750,131 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     return YES;
 }
 
+- (BOOL)startCGImageWithError:(NSError **)error {
+    size_t outW = (size_t)CGDisplayPixelsWide(_displayID);
+    size_t outH = (size_t)CGDisplayPixelsHigh(_displayID);
+    if (_config.outputWidth > 0 && _config.outputHeight > 0) {
+        outW = (size_t)_config.outputWidth;
+        outH = (size_t)_config.outputHeight;
+    }
+    outW -= outW % 2;
+    outH -= outH % 2;
+    if (outW < 2 || outH < 2) {
+        if (error) *error = M1CaptureErr(M1PipelineErrorDegenerateMode,
+            [NSString stringWithFormat:@"CGImage 换算后尺寸 %zux%zu 非法", outW, outH]);
+        return NO;
+    }
+
+    // 锁屏切换时复用同一个 output（统计与下游 block 不中断）。
+    M1CaptureOutput *output = _output;
+    if (!output) {
+        output = [[M1CaptureOutput alloc] init];
+        [self setupOutput:output];
+        _output = output;
+    }
+
+    M1CGImageSource *source = [[M1CGImageSource alloc] init];
+    NSError *imgErr = nil;
+    if (![source startWithDisplay:_displayID
+                            width:outW
+                           height:outH
+                              fps:MAX(1, _config.targetFps)
+                             sink:output
+                            error:&imgErr]) {
+        if (error) *error = imgErr;
+        return NO;
+    }
+    _cgImageSource = source;
+    _outWidth = outW;
+    _outHeight = outH;
+    _pixelWidth = (int32_t)outW;
+    _pixelHeight = (int32_t)outH;
+    _running = YES;
+    return YES;
+}
+
+- (void)stopBackendSourcesKeepingOutput {
+    if (_stream) {
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [_stream stopCaptureWithCompletionHandler:^(NSError *e) {
+            dispatch_semaphore_signal(sem);
+        }];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        [_stream removeStreamOutput:_output type:SCStreamOutputTypeScreen error:NULL];
+        _stream = nil;
+    }
+    if (_cgSource) {
+        [_cgSource stop];
+        _cgSource = nil;
+    }
+    // 不碰 _output->_running / _queue：锁屏切换期间下游不能中断。
+}
+
+- (void)startLockMonitor {
+    if (_monitorTimer) return;
+    _lastLocked = M1ScreenIsLocked();
+    if (_outWidth == 0) {
+        _outWidth = (size_t)_pixelWidth;
+        _outHeight = (size_t)_pixelHeight;
+    }
+    _monitorQueue = dispatch_queue_create("m1.capture.lockwatch", DISPATCH_QUEUE_SERIAL);
+    _monitorTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _monitorQueue);
+    dispatch_source_set_timer(_monitorTimer, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                              1 * NSEC_PER_SEC, 100 * NSEC_PER_MSEC);
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(_monitorTimer, ^{
+        M1CapturePipeline *strong = weakSelf;
+        if (!strong || !strong->_running) return;
+        BOOL locked = M1ScreenIsLocked();
+        if (locked == strong->_lastLocked) return;
+        printf("[capture] 锁屏状态变化 locked=%d，切换采集后端\n", locked ? 1 : 0);
+        fflush(stdout);
+        strong->_lastLocked = locked;
+        if (locked) {
+            [strong stopBackendSourcesKeepingOutput];
+            NSError *imgErr = nil;
+            if (![strong startCGImageWithError:&imgErr]) {
+                printf("[capture] 锁屏快照后端启动失败: %s，退回常规后端\n",
+                       imgErr.localizedDescription.UTF8String ?: "unknown");
+                fflush(stdout);
+                NSError *e = nil;
+                if (strong->_preferredBackend == 0) {
+                    if (![strong startSCKWithError:&e]) [strong startCGWithError:NULL];
+                } else {
+                    [strong startCGWithError:NULL];
+                }
+                strong->_lastLocked = NO;
+            }
+        } else {
+            if (strong->_cgImageSource) {
+                [strong->_cgImageSource stop];
+                strong->_cgImageSource = nil;
+            }
+            if (strong->_output) strong->_output->_running = NO;
+            NSError *e = nil;
+            if (strong->_preferredBackend == 0) {
+                if (![strong startSCKWithError:&e]) [strong startCGWithError:NULL];
+            } else {
+                [strong startCGWithError:NULL];
+            }
+        }
+    });
+    dispatch_resume(_monitorTimer);
+}
+
 - (void)stop {
     _running = NO;
     if (_output) _output->_running = NO;
+
+    if (_monitorTimer) {
+        dispatch_source_cancel(_monitorTimer);
+        _monitorTimer = NULL;
+        _monitorQueue = nil;
+    }
+    if (_cgImageSource) {
+        [_cgImageSource stop];
+        _cgImageSource = nil;
+    }
 
     if (_stream) {
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
