@@ -1226,6 +1226,17 @@ host 镜像主屏 3440×1440 → 编码 1920×1080@20；a/b 轮动画窗口 1200
 - **client 规格断言**：两轮都是 mirror，host 日志「请求规格 1920x1080(实际屏)→1280x720/1920x1080（未一致/未判定）」符合预期（C-17.31：镜像不建屏，尺寸断言不参与判定）。
 - **边界**：本节证明的是「13 作为 client 的真实收流→解码→上屏→输入回传」在跨网段 LAN 上成立（关闭 A-07 的 client 侧），以及 LAN 行结构性证据。**不代表** 13 host 的建屏/禁屏/C-09、13 的 Path A 远程登录已验证（仍待 A-07 host 侧）。`p2.sh` 的相对路径 summary 与脚本执行位问题在本轮暴露并修复（见 §7 v0.48）。
 
+**补测（16:0x，1080p20 满帧门禁）**：为排除 idle 干扰，用 `anim_display 0 60 full`（1200×700→铺满 3440×1440）复跑两轮，坐实了 §5.24 的 idle 归因，并定位到真正的满帧开关：
+
+| 轮次 | SCK 路径 | 采集/编码/发出 | 解出 | 每秒稳态 | 上屏 | 判定 |
+|---|---|---|---|---|---|---|
+| c · full + `res=auto` | 3440×1440 原生 → 缩放 1080p | 172/171/171 | 171 | complete≈4 / idle≈16，5.7fps | 146 帧 | PASS（解码率 1.000，但帧率不达标） |
+| d · full + `M1_CAPTURE_RESOLUTION=best` | SCK 直接出 1080p | 530/525/525 | 525 | complete≈18–20 / idle≈0 | 493 帧 | **PASS（18–20fps 满帧）** |
+
+- **根因**：`res=auto` 让 SCK 送原生 3440×1440 再在 host 降采样到 1920×1080，i5-9500 上转录/缩放把采集压到 ~5fps；`M1_CAPTURE_RESOLUTION=best`（macOS 14+ 的 `SCCaptureResolutionBest`，`stream_probe.m:1137`）让 SCK 直接输出目标分辨率，采集稳在 18–20fps。`nominal` 未测。这是 host 编码前的采集侧参数，不是传输或 client 问题。
+- d 轮发送 525 / 解出 525（1.000）、丢帧 0、`sendFailures=0`、补片全命中、关键帧 0、控制间隔 1060ms、首帧 858/1769ms、渲染 25.9ms/帧、输入 2 收到但注入 0（该轮 record 计划为 0，光标未动；§5.24 b 轮已单独证明 2/2 注入 + 1399px 位移成立）。⇒ **P2.3 的 1080p20 满帧（20fps 级）首次在双真机 LAN 上达成**，A-02 的「真实帧率」证据前进一步（glass-to-glass 延迟仍未测，A-02 保持开放）。
+- **部署含义**：3440×1440 等高分辨率物理屏上做镜像推流时，必须显式设 `M1_CAPTURE_RESOLUTION=best`，否则采集会被降采样路径拖垮。建议写进 host 启动脚本/操作单。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
@@ -1241,6 +1252,7 @@ host 镜像主屏 3440×1440 → 编码 1920×1080@20；a/b 轮动画窗口 1200
 
 ## 7. 变更记录
 
+- v0.49-draft 2026-11-21 16:0x：**1080p20 满帧门禁达成 + 定位采集侧瓶颈，见 §5.24 补测**。`anim_display 0 60 full` 两轮对照：`res=auto` 时 SCK 送原生 3440×1440 再降采样，i5-9500 上采集仅 ~5fps（171 帧/30s、上屏 146）；`M1_CAPTURE_RESOLUTION=best` 让 SCK 直出 1080p，采集稳 18–20fps，发 525/解 525=1.000、上屏 493 帧、丢帧 0、`sendFailures=0`，`p2.sh summary` PASS。⇒ P2.3 的 1080p20 满帧首次在双真机 LAN 达成；确认瓶颈在采集侧转录/缩放而非网络/client，高分辨率物理屏镜像推流必须显式设 `M1_CAPTURE_RESOLUTION=best`。A-02 延迟仍未测、保持开放。
 - v0.48-draft 2026-11-21 15:5x：**首次双真机跨网段 LAN 实测 + 工具链修复，见 §5.24**。Tahoe host × Ventura client，720p15 解码 276/278=0.993、1080p20 解码 85/85=1.000，两轮 `p2.sh summary` PASS，`sendFailures=0`，1080p 输入 2/2 注入、光标位移 1399px。client 空闲环境渲染基线刷新：720p 14.5ms、1080p 26.5ms/帧（此前 84.7ms 是本机负载污染）。LAN 行从「不可得」变为有实测证据（镜像模式）。修两个实测中暴露的工具链 bug：① `P2-Dual/p2.sh` 的 `summary` 相对路径在 `cd SKEL` 后失效，改为按调用方 cwd 解析；② 本地 `core.filemode=false` 导致全部脚本以 100644 入库，新克隆（filemode=true）拿不到执行位，`./p2.sh` 报 Permission denied——用 `git update-index --chmod=+x` 修正 7 个文档直接调用的脚本。**未证明** 13 host 建屏/禁屏/C-09、13 上 Path A；capture 授权无法远程授予（`CGRequestScreenCaptureAccess` 静默失败、SIP 保护 TCC.db），13 host 仍需人工在系统设置里点一次屏幕录制。
 - v0.47-draft 2026-11-21 15:0x：**Ventura 13 编译验证，见 §5.23**。新增 iMac17,1 / 13.6.7 测试机；3 个构建目标 + 2 套单测在 13.3 SDK 与 26.5 SDK 上均通过。14+ SCK API 补 `#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000` 编译期守卫（与既有 `@available` 并存），并在 `DESIGN.md` §2.4.1 / `DECISIONS.md` C-17.38 明确 13–26 Intel 双角色目标。13 的 client 预检因屏幕锁定未通过，host 独占会话未实测。
 - v0.46-draft 2026-11-20 23:3x：**G2 收口，见 §5.22**。`stream_probe --host` 默认按客户端 `session-start specs` 建虚拟屏并禁物理屏（`--mirror` 降为诊断开关，`p2.sh` 增 `P2_MIRROR=1`）。默认路径 720p15（p）：441/441、C-09 verified/recovered、补片 34/34、关键帧 0、控制间隔 1310ms；镜像对照（q）：428/428、补片 23/23、控制间隔 1055ms；均 PASS。
