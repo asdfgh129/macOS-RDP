@@ -416,10 +416,13 @@ static NSDictionary *P0LumaStats(CVPixelBufferRef pb) {
     // 1x 虚拟屏两者相等；HiDPI(2x) 屏若不乘 pointPixelScale，就会把 2x 画面降采样成 1x 再编码，
     // 使 HiDPI 验证（A-05）测到的其实是半分辨率流。宽高另按 H.264 要求取偶数。
     // pointPixelScale 从 macOS 14 起才有；Ventura 13 上退回 1.0（13 上暂无 HiDPI 需求）。
+    // 编译期同样要守卫：13 SDK 的头文件不声明该属性。
     CGFloat scale = 1.0;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
     if (@available(macOS 14.0, *)) {
         if (filter.pointPixelScale > 0) scale = filter.pointPixelScale;
     }
+#endif
     size_t outW = (size_t)llround(target.width * scale);
     size_t outH = (size_t)llround(target.height * scale);
     outW -= outW % 2;

@@ -275,7 +275,9 @@ static NSDictionary *P0VCapture(CGDirectDisplayID displayID, int durationMs, BOO
     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:target excludingWindows:@[]];
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
     CGFloat scale = 1.0;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
     if (@available(macOS 14.0, *)) { if (filter.pointPixelScale > 0) scale = filter.pointPixelScale; }
+#endif
     size_t outW = (size_t)llround(target.width * scale);
     size_t outH = (size_t)llround(target.height * scale);
     outW -= outW % 2; outH -= outH % 2;

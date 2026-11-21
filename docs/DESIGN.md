@@ -100,6 +100,13 @@
 | **C-08** | **单会话模型，不做多会话并发**：macOS 的 Aqua 会话创建被 `com.apple.private.aqua.createSession` 独占（仅 loginwindow 持有），第三方无法新建并行会话。产品用「同一 console 会话内独占」实现隔离语义，**不是 Windows RDP 的多会话** | 本机 entitlement 取证，见 `P0V-SessionRecon/README.md` §1.2 |
 | **C-09** | **显示空间隔离（硬约束）**：会话期间 Host 全局坐标空间**只能包含本会话的虚拟屏**。物理屏必须 `disable`（移出空间），**不得**只做「置黑 / 高窗口层遮罩但仍启用」。任何使指针可落入物理屏区域、或使窗口可被拖入物理屏区域的实现一律判不合格。屏数恒等于客户端请求数，与 Host 物理屏数量无关 | 用户需求 2026-11-17（"不能在 4 块屏里移动"）；决策见 D-05 |
 
+### 2.4.1 构建与部署矩阵（Intel 13–26，双角色）
+
+- **目标**：同一份源码在 Intel x86_64 的 **macOS 13 Ventura – 26 Tahoe** 上均可本机编译、运行；其中任一机器既能当 **host**（建虚拟屏 / 禁物理屏 / 采集编码 / 注入），也能当 **client**（收流 / 解码 / 上屏 / 键鼠采集）。这是 C-01 的落地口径，不把角色绑死在特定 OS 版本上。
+- **构建基线**：所有构建脚本统一 `-mmacosx-version-min=13.0`；用新 SDK 编出的二进制可部署到 13。
+- **旧 SDK 本机编译**：macOS 13 SDK 的 ScreenCaptureKit 头文件不声明 14+ 的属性/常量，仅有 `@available(macOS 14.0, *)` 运行时判断仍会编译失败。因此 14+ API 必须同时具备编译期守卫 `#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000`。当前落点：`M1-Skeleton/src/M1CapturePipeline.m`、`P0-TahoeProbe/src/PipelineProbe.m`、`P0V-RootDaemon/src/p0vprobe.m`。13 上走既有回退（`scale=1.0`、忽略 captureResolution），主流程不受影响。
+- **验证状态口径**：26.5.2 Tahoe（host）与 15.5 Sequoia（client）已有实测记录；13.6.7 Ventura 新机（iMac-3 / 192.168.34.213）已完成 SSH、仓库与编译环境配置。**「13 SDK 可编译」不等于「13 的 host 已验证」**：13 上建屏 / 禁屏 / C-09 独占会话仍属 A-07 待回归项，须按 OS 分别记录于 `RESULTS-BY-OS.md`，禁止跨版本外推。
+
 ### 2.5 待验证假设（定稿前必须关闭 A-01/A-02）
 
 | 编号 | 假设 | 验证方式 | 不成立时的回退 |

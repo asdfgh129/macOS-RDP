@@ -253,10 +253,14 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
 
     // 安全阀 2：HiDPI 乘 pointPixelScale（macOS 14+ 才有该属性）。
+    // 编译期也要守卫：macOS 13 SDK 的 ScreenCaptureKit 头没有该属性声明，
+    // 只有 @available 运行时判断仍会报 property not found。
     CGFloat scale = 1.0;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
     if (@available(macOS 14.0, *)) {
         if (filter.pointPixelScale > 0) scale = filter.pointPixelScale;
     }
+#endif
     // 目标输出尺寸：显式指定优先（降采样验证目标档），否则用屏幕原始像素。
     size_t outW, outH;
     if (_config.outputWidth > 0 && _config.outputHeight > 0) {
@@ -284,11 +288,13 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
     cfg.showsCursor = _config.showsCursor;
     cfg.capturesAudio = _config.capturesAudio;
     cfg.scalesToFit = YES;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
     if (@available(macOS 14.0, *)) {
         cfg.preservesAspectRatio = YES;
         if (_config.captureResolution == 1) cfg.captureResolution = SCCaptureResolutionBest;
         else if (_config.captureResolution == 2) cfg.captureResolution = SCCaptureResolutionNominal;
     }
+#endif
     {
         CGDisplayModeRef dm = CGDisplayCopyDisplayMode(_displayID);
         size_t dw = dm ? CGDisplayModeGetWidth(dm) : 0;

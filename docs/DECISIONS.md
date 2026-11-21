@@ -850,6 +850,7 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 | C-17.35 | `p2.sh summary` 的解码门禁按场景分层：LAN 0% ≥0.98、LAN 0.1% ≥0.90、WAN（有 `advertisedEndpoint`）≥0.85、注入 ≥1% 只记趋势；另加帧丢弃 <5%、等待关键帧占比 <10%（以 `streamDurationMs` 为分母）、`keyframeRequestsSent>0` 而主机未收到则 FAIL。阈值仍是结构性判据，延迟结论另算 | `P2-Dual/p2.sh` / 本轮 v0.34 |
 | C-17.36 | 独占会话即使 client 没传 `--spec`，也要用 `session-ready` 里 host 实际建的屏规格（`effectiveWidth/Height/effectiveSpecMatch`）核对解码尺寸；显式 `--spec` 优先。这样「不传参数跑独占」也有规格判据，而不是静默跳过 | `stream_probe.m` / `P2-Dual/p2.sh` / 本轮 v0.34 |
 | C-17.37 | `keyframeRequestRttMs` 的口径是「本轮**首个成功过线**的 keyframe-request → 后续关键帧完整重组到达」，不含 VT 解码/上屏；同一等待周期的重复请求不重置起点，否则 1s 重试会把 RTT 越测越短。限流/发送失败不计时；周期关键帧无请求时不产生样本。只作观测，不设门禁 | `M1FrameReceiver.{h,m}` / `stream_probe.m` / `P2-Dual/p2.sh` / 本轮 v0.35 |
+| C-17.38 | 目标平台为 **Intel x86_64 / macOS 13 Ventura – 26 Tahoe，双端均可当 host 或 client**（沿用 C-01）。所有构建保持 `-mmacosx-version-min=13.0`；14+ 的 SCK API 必须同时有 `@available(macOS 14.0, *)` 与 `#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000` 两道守卫，使只有 CLT 14.3.1 / 13.3 SDK 的机器也能本机编译。13 上仅关闭 HiDPI/采集分辨率增强，主流程不变；13 的 host 独占会话仍待真机回归（A-07），不得把「可编译」写成「已验证」 | `docs/DESIGN.md` §2.4.1 / `M1CapturePipeline.m` / `PipelineProbe.m` / `p0vprobe.m` |
 
 ### 代价与边界
 
