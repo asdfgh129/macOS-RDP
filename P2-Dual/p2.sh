@@ -153,13 +153,14 @@ host)
 
 client)
   need_bin
-  PEER=""; FP=""; SPEC_ARG=""
+  PEER=""; FP=""; SPEC_ARG=""; EXTRA_ARGS=()
   [ -n "${P2_SPEC:-}" ] && SPEC_ARG="--spec $P2_SPEC"
   while [ $# -gt 0 ]; do
     case "$1" in
       --host) PEER="$2"; shift 2 ;;
       --fingerprint) FP="$2"; shift 2 ;;
       --port) PORT="$2"; shift 2 ;;
+      --input-synth|--manual|--keep-front) EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
       *) shift ;;
     esac
   done
@@ -171,6 +172,7 @@ client)
   say "输出：$OUT"
   # shellcheck disable=SC2086
   ./stream_probe --client --connect "$PEER" --port "$PORT" --fingerprint "$FP" $SPEC_ARG \
+      "${EXTRA_ARGS[@]}" \
       --handshake-ms "$HANDSHAKE_MS" --wait-ms "$WAIT_MS" \
       --duration-ms "$((SECS * 1000))" --window "$WIN" \
       --save-frames 0 --out "$OUT/client.json" 2>&1 | tee "$OUT/client.log"

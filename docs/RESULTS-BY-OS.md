@@ -1289,7 +1289,28 @@ RC=0
 
 源码与日志留在 `P2-Dual/out/cgdisplay-probe-13/`（该目录被 gitignore，不入库）。同一台机器、同一 TCC 状态下 SCK `startCapture` 必失败，而 CGDisplayStream 能建流并交付 `IOSurface`，因此**13 host 有可行替代路径**。
 
-**边界与后续**：`CGDisplayStream` 在 macOS 14 标记 deprecated、15 对虚拟屏 obsoleted（RustDesk issue #26：15 上对 BetterDisplay 等虚拟屏返回 nil）；所以不能全局替换，应做成**版本/能力门控的后端**：14+ 继续 SCK，13 且 SCK 失败时回退 CGDisplayStream。本项目尚未集成该后端；A-07 host 侧仍保持未关闭，直到回退路径在真实双机上跑通。
+**边界与后续**：`CGDisplayStream` 在 macOS 14 标记 deprecated、15 对虚拟屏 obsoleted（RustDesk issue #26：15 上对 BetterDisplay 等虚拟屏返回 nil）；所以不能全局替换，做成**版本/能力门控的后端**：14+ 继续 SCK，13 且 SCK 失败时回退 CGDisplayStream。该后端已在 §5.27 集成并跑通。
+
+### 5.27 13 host CGDisplayStream 回退后端集成 + 双机全链路 PASS（2026-11-21 17:2x–17:4x）
+
+**实现**（`M1-Skeleton/src/M1CapturePipeline.m` / `.h`）：
+- `M1CapturePipeline` 现在有两个采集后端，共用同一个 `M1CaptureOutput` 统计/分发对象（新增 `-deliverPixelBuffer:ptsMs:`），下游 VT 编码 / 分片 / QUIC 完全不感知后端差异。
+- 版本门控：13 SDK 编译期直接 `useSCK=NO`；14+ 运行时 `@available(macOS 14.0, *)` 优先 SCK，**SCK 的 content 获取 / addStreamOutput / startCapture 任一失败即回退 CGDisplayStream**。诊断开关 `M1_CAPTURE_BACKEND=cg|sck` 可强制指定（默认按版本自动）。
+- `CGDisplayStream` 后端以 `kCVPixelFormatType_32BGRA` 输出，`IOSurfaceRef` 用 `CVPixelBufferCreateWithIOSurface` 包一层后走原有编码链；`kCGDisplayStreamMinimumFrameTime=1/fps`、`kCGDisplayStreamShowCursor=config.showsCursor`；`CGDisplayStreamStart/Stop` 严格配对，回调 block 用 weakSelf 避免循环引用。
+- 编译期兼容：`CGDisplayStream*` 在 26 SDK 标注 obsoleted-15，靠 `-mmacosx-version-min=13.0` + 局部 `#pragma clang diagnostic ignored "-Wdeprecated-declarations"` 保留；13.3 SDK 与 26.5 SDK **均构建通过**，两端各 268 项单测 ALL PASS。
+
+**双机配置**：iMac17,1 / 13.6.7 当 host，从 **GUI Terminal** 启动（`ssh` 会话拿不到 TCC 责属），`P2_MIRROR=1 P2_WIDTH=1280 P2_HEIGHT=720 P2_FPS=15 P2_PORT=46611 P2_INJECT=record`，`anim_display 0 90 full` 喂动态内容；Macmini8,1 / 26.5.2 当 client，`--spec 1280x720`。host preflight `capture=1 locked=0 asleep=0 onConsole=1 active=1 ok=1`。
+
+| 轮次 | 采集后端日志 | 采集/编码/发送 | 客户端收齐/解出/上屏 | 丢帧 | 输入回传 | 判定 |
+|---|---|---|---|---|---|---|
+| 1（25s 视频） | `[capture] backend=CGDisplayStream display=1535231424 out=1280x720 fps=15` | 90 / 81 / 81 | 81 / 81 / 81 | 0 | 未注入（record 无事件） | PASS |
+| 2（18s + 合成输入） | 同上 | 62 / 53 / 53 | 53 / 53 / 53 | 0 | 6 发出 / 6 收到 / 6 注入成功 | PASS |
+
+两轮 `encFail=0 sendFail=0 decodeFail=0`，规格断言 1280x720 → 1280x720 一致；第二轮 `p2.sh summary` 判定 PASS。证据：`P2-Dual/out/cg-fallback-13/`、`P2-Dual/out/cg-fallback-13-input2/`（两端同名目录，含 wrapper/host/client 日志与 json）。
+
+**帧率归因**：客户端只有 3.7fps，不是回退后端缺陷。独立最小 CGDisplayStream 程序在同一台 iMac、同一动画夹具下 10s 仅 38 帧（3.8fps），说明 `anim_display` 全屏动画在这台弱 GPU 上的实际内容更新率就是 ~4fps；CGDisplayStream 按内容变化出帧（静态屏 6s 只有 2 帧，§5.26），符合 Quartz 语义。需要在更强 GPU 或更高更新率夹具上另测帧率上限，本轮只把「全链路可用性」作为门禁。
+
+**未覆盖**：13 host 的独占会话（建虚拟屏 / 禁物理屏 / C-09）、Path A 锁屏进入、真实系统级输入注入（本机 `ax=0`，未授予辅助功能）仍未测；13 host 的 frame-rate 上限也未测。A-07 从「host 不可用」更新为「host 镜像模式双机全链路 PASS，独占/锁屏未测」。
 
 ## 6. 状态汇总
 
@@ -1297,7 +1318,7 @@ RC=0
 |---|---|---|---|
 | A-01 Tahoe SPI 可用 | — | ✅ 关闭 | — |
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 | — |
-| A-07 13–26 双角色 | — | — | ⚠️ 部分：client 收流/上屏/输入回传在跨网段 LAN 实测 PASS（§5.24）；host 已人工授权 TCC、GUI 内 preflight `ok=1`、握手正常，但 `SCStream startCapture` 被系统 `replayd` 以 CG 1003 拒绝（独立 SCK 程序同样失败，见 §5.25）⇒ 13 host 不可用，建屏/禁屏/C-09 与 Path A 未测 |
+| A-07 13–26 双角色 | — | — | ⚠️ 部分：client 收流/上屏/输入回传在跨网段 LAN 实测 PASS（§5.24）；host 的 SCK 路径被系统 `replayd` 以 CG 1003 拒绝（§5.25），但已加版本门控的 CGDisplayStream 回退后端，13 host × Tahoe client 镜像模式双机全链路两轮 PASS、6/6 输入回传 PASS（§5.27）；建屏/禁屏/C-09、Path A、帧率上限与真实系统输入注入仍未测 |
 | A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
 | A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） |
 | A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。2026-11-19 跨公网已取得首批双机数据（§5.13，Tahoe host × Sequoia client）：1080p20 客户端渲染 84.7ms/帧、解码/发出 54/375；720p10 渲染 41.6ms、上屏 0 积压；补测 C/D 拿到完整配对（3440×1440 → 7 解出；720p15 → 136/443，丢包 4–6% + 严格按序重组等关键帧是主因）。无 60fps / glass-to-glass 证据，A-02 保持开放，见 D-10 |
@@ -1306,6 +1327,7 @@ RC=0
 
 ## 7. 变更记录
 
+- v0.51-draft 2026-11-21 17:4x：**13 host 回退后端集成 + 双机全链路 PASS，见 §5.27**。`M1CapturePipeline.m` 加版本/能力门控的 `CGDisplayStream` 后端（13 直接走 CG，14+ SCK 失败自动回退），`IOSurface→CVPixelBuffer` 复用原编码链；`M1_CAPTURE_BACKEND=cg|sck` 可强制。13.3/26.5 SDK 双构建 + 各 268 单测通过。iMac13 host × Tahoe client 镜像 1280x720@15 两轮：81/81、53/53 收齐解出上屏，0 丢帧，输入 6/6 回传，均 PASS。3.7fps 归因于 iMac 弱 GPU 上动画夹具的内容更新率（独立 CG 探针 3.8fps），非后端缺陷。修 `P2-Dual/p2.sh` client 丢弃 `--input-synth/--manual/--keep-front` 的工具 bug。A-07 更新为「13 host 镜像模式可用，独占/锁屏未测」。
 - v0.50-draft 2026-11-21 16:3x：**Ventura 13 host 实测 + 修复 startCapture 失败崩溃，见 §5.25**。用户完成屏幕录制授权后，GUI 会话内 host preflight `capture=1 ok=1`，握手到 STREAMING 正常，但 `SCStream startCapture` 被系统 `replayd` 以 `CoreGraphicsErrorDomain 1003 "The stream is nil."` 拒绝；独立最小 SCK 程序 5 种配置全部同样失败、TCC authValue=2、杀采集 daemon 无效 ⇒ 13 的 SCK 建流是 OS 层阻塞，非本项目代码/配置。13 host 角色仍不可用（A-07 host 侧未关闭），13 client 不受影响。修复 `M1CapturePipeline.m` 在 startCapture 失败时 `removeStreamOutput` 导致的 `EXC_BAD_ACCESS`（commit `52ab8b8`）：改为直接返回由 ARC 释放，复测优雅退出 rc=5、无新 crash report。
 - v0.49-draft 2026-11-21 16:0x：**1080p20 满帧门禁达成 + 定位采集侧瓶颈，见 §5.24 补测**。`anim_display 0 60 full` 两轮对照：`res=auto` 时 SCK 送原生 3440×1440 再降采样，i5-9500 上采集仅 ~5fps（171 帧/30s、上屏 146）；`M1_CAPTURE_RESOLUTION=best` 让 SCK 直出 1080p，采集稳 18–20fps，发 525/解 525=1.000、上屏 493 帧、丢帧 0、`sendFailures=0`，`p2.sh summary` PASS。⇒ P2.3 的 1080p20 满帧首次在双真机 LAN 达成；确认瓶颈在采集侧转录/缩放而非网络/client，高分辨率物理屏镜像推流必须显式设 `M1_CAPTURE_RESOLUTION=best`。A-02 延迟仍未测、保持开放。
 - v0.48-draft 2026-11-21 15:5x：**首次双真机跨网段 LAN 实测 + 工具链修复，见 §5.24**。Tahoe host × Ventura client，720p15 解码 276/278=0.993、1080p20 解码 85/85=1.000，两轮 `p2.sh summary` PASS，`sendFailures=0`，1080p 输入 2/2 注入、光标位移 1399px。client 空闲环境渲染基线刷新：720p 14.5ms、1080p 26.5ms/帧（此前 84.7ms 是本机负载污染）。LAN 行从「不可得」变为有实测证据（镜像模式）。修两个实测中暴露的工具链 bug：① `P2-Dual/p2.sh` 的 `summary` 相对路径在 `cd SKEL` 后失效，改为按调用方 cwd 解析；② 本地 `core.filemode=false` 导致全部脚本以 100644 入库，新克隆（filemode=true）拿不到执行位，`./p2.sh` 报 Permission denied——用 `git update-index --chmod=+x` 修正 7 个文档直接调用的脚本。**未证明** 13 host 建屏/禁屏/C-09、13 上 Path A；capture 授权无法远程授予（`CGRequestScreenCaptureAccess` 静默失败、SIP 保护 TCC.db），13 host 仍需人工在系统设置里点一次屏幕录制。

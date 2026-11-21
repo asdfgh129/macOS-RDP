@@ -2,7 +2,8 @@
 //  M1CapturePipeline.h
 //  M1-Skeleton
 //
-//  ScreenCaptureKit 逐屏采集（D-10 主路径的采集段）。
+//  逐屏采集（D-10 主路径的采集段）：14+ 优先 ScreenCaptureKit，
+//  13 或 SCK 建流失败时回退 CGDisplayStream（两者都只产出 CVPixelBuffer）。
 //
 //  刻意保留 P0 阶段的三个安全阀，它们都是踩出来的：
 //    1. 退化 mode（<2×2）拒绝采集 —— 2026-11-14 WindowServer 挂起事故的疑似触发点。

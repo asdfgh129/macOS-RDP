@@ -6,6 +6,7 @@
 #import "M1CapturePipeline.h"
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreMedia/CoreMedia.h>
+#import <IOSurface/IOSurface.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <math.h>
@@ -72,6 +73,7 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
 
 // SCStreamOutput + Delegate 需要一个独立对象：SCStream 对 delegate 是弱引用，
 // 由 pipeline 强持有它，pipeline 生命周期内始终存活。
+// CGDisplayStream 回退后端也复用这个对象做统计与帧分发（见 -deliverPixelBuffer:）。
 @interface M1CaptureOutput : NSObject <SCStreamOutput, SCStreamDelegate> {
 @public
     void (^_onFrame)(CVPixelBufferRef, double);
@@ -91,12 +93,13 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
     _Atomic double _lastScale;
     BOOL _running;
 }
+- (void)deliverPixelBuffer:(CVPixelBufferRef)pb ptsMs:(double)ptsMs;
 @end
 
 @implementation M1CaptureOutput
 
 - (void)stream:(SCStream *)stream
-        didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         ofType:(SCStreamOutputType)type {
     if (type != SCStreamOutputTypeScreen) {
         atomic_fetch_add(&_framesRejected, 1);
@@ -110,6 +113,13 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
     if (frameScale > 0) atomic_store(&_lastScale, (double)frameScale);
 
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
+    [self deliverPixelBuffer:pb ptsMs:M1WallMs()];
+}
+
+// SCK 与 CGDisplayStream 的公共帧出口：在这里统一做统计与时间戳，
+// 下游（VT 编码 / 分片 / QUIC）完全看不到后端差异。
+- (void)deliverPixelBuffer:(CVPixelBufferRef)pb ptsMs:(double)ptsMs {
+    if (!_running) return;
     if (!pb) {
         atomic_fetch_add(&_framesRejected, 1);
         _secRejected++;
@@ -117,7 +127,7 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
         return;
     }
 
-    double now = M1WallMs();
+    double now = ptsMs > 0 ? ptsMs : M1WallMs();
     if (atomic_load(&_firstFrameLatencyMs) <= 0 && _startMs > 0) {
         atomic_store(&_firstFrameLatencyMs, now - _startMs);
     }
@@ -129,8 +139,7 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
     atomic_fetch_add(&_framesDelivered, 1);
     _secDelivered++;
     [self tickSecondIfNeeded];
-    double ptsMs = now;
-    if (_onFrame) _onFrame(pb, ptsMs);
+    if (_onFrame) _onFrame(pb, now);
 }
 
 // 每秒打印一次状态分布：区分「有画面但帧率低」与「系统判定无变化(idle)」。
@@ -174,6 +183,110 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
 
 @end
 
+#pragma mark - CGDisplayStream 回退后端
+
+// 只在 macOS 13 或 SCK 建流失败时启用。CGDisplayStream 自 14 deprecated、
+// 15 obsoleted；这里用部署目标 13 + 编译警告抑制保留这条兼容路径。
+// 注意：回调给的是 IOSurface，等价于 SCK 的 CMSampleBuffer 里的像素缓冲，
+// 用 CVPixelBufferCreateWithIOSurface 包一层即可复用现有编码器。
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+@interface M1CGDisplaySource : NSObject {
+@public
+    CGDisplayStreamRef _stream;
+    dispatch_queue_t _queue;
+    M1CaptureOutput *_sink;
+}
+- (BOOL)startWithDisplay:(CGDirectDisplayID)displayID
+                   width:(size_t)width
+                  height:(size_t)height
+                     fps:(int)fps
+              showCursor:(BOOL)showCursor
+                    sink:(M1CaptureOutput *)sink
+                   error:(NSError **)error;
+- (void)stop;
+@end
+
+@implementation M1CGDisplaySource
+
+- (BOOL)startWithDisplay:(CGDirectDisplayID)displayID
+                   width:(size_t)width
+                  height:(size_t)height
+                     fps:(int)fps
+              showCursor:(BOOL)showCursor
+                    sink:(M1CaptureOutput *)sink
+                   error:(NSError **)error {
+    NSMutableDictionary *props = [NSMutableDictionary dictionary];
+    // CGDisplayStream 只在内容变化时出帧；设定最小间隔避免空闲屏刷到 60fps。
+    props[(id)kCGDisplayStreamMinimumFrameTime] = @(1.0 / (double)MAX(1, fps));
+    props[(id)kCGDisplayStreamShowCursor] = @(showCursor ? YES : NO);
+
+    dispatch_queue_t q = dispatch_queue_create("m1.capture.cgdisplay", DISPATCH_QUEUE_SERIAL);
+    __weak typeof(self) weakSelf = self;
+    CGDisplayStreamRef s = CGDisplayStreamCreateWithDispatchQueue(
+        displayID, width, height, (int32_t)kCVPixelFormatType_32BGRA,
+        (__bridge CFDictionaryRef)props, q,
+        ^(CGDisplayStreamFrameStatus status, uint64_t displayTime,
+          IOSurfaceRef surface, CGDisplayStreamUpdateRef updateRef) {
+        @autoreleasepool {
+            M1CGDisplaySource *strong = weakSelf;
+            if (!strong) return;
+            M1CaptureOutput *sink = strong->_sink;
+            if (!sink || !sink->_running) return;
+            if (status != kCGDisplayStreamFrameStatusFrameComplete || !surface) return;
+
+            CVPixelBufferRef pb = NULL;
+            CVReturn cr = CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault,
+                                                           surface, NULL, &pb);
+            if (cr != kCVReturnSuccess || !pb) {
+                atomic_fetch_add(&sink->_framesRejected, 1);
+                return;
+            }
+            [sink deliverPixelBuffer:pb ptsMs:M1WallMs()];
+            CVPixelBufferRelease(pb);
+        }
+    });
+    if (!s) {
+        if (error) *error = M1CaptureErr(M1PipelineErrorCaptureFailed,
+            @"CGDisplayStreamCreateWithDispatchQueue 返回空 stream");
+        return NO;
+    }
+
+    // 先挂 sink/queue 再 start：回调可能在 start 内立即触发。
+    _sink = sink;
+    _queue = q;
+    CGError rc = CGDisplayStreamStart(s);
+    if (rc != kCGErrorSuccess) {
+        CFRelease(s);
+        _sink = nil;
+        _queue = nil;
+        if (error) *error = M1CaptureErr(M1PipelineErrorCaptureFailed,
+            [NSString stringWithFormat:@"CGDisplayStreamStart 失败: %d", (int)rc]);
+        return NO;
+    }
+    _stream = s;
+    printf("[capture] backend=CGDisplayStream display=%u out=%zux%zu fps=%d "
+           "cursor=%d (iOSurface→CVPixelBuffer)\n",
+           displayID, width, height, fps, showCursor ? 1 : 0);
+    fflush(stdout);
+    return YES;
+}
+
+- (void)stop {
+    if (_stream) {
+        CGDisplayStreamStop(_stream);
+        CFRelease(_stream);
+        _stream = NULL;
+    }
+    _queue = nil;
+    _sink = nil;
+}
+
+@end
+
+#pragma clang diagnostic pop
+
 #pragma mark - 采集管线
 
 @interface M1CapturePipeline () {
@@ -183,11 +296,15 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
     void (^_onError)(NSError *);
     SCStream *_stream;
     M1CaptureOutput *_output;
+    M1CGDisplaySource *_cgSource;
     dispatch_queue_t _queue;
     int32_t _pixelWidth;
     int32_t _pixelHeight;
     BOOL _running;
 }
+- (BOOL)startSCKWithError:(NSError **)error;
+- (BOOL)startCGWithError:(NSError **)error;
+- (void)setupOutput:(M1CaptureOutput *)output;
 @end
 
 @implementation M1CapturePipeline
@@ -217,9 +334,9 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
 
 - (BOOL)start:(NSError **)error {
     if (error) *error = nil;
-    if (_stream) return YES;
+    if (_running) return YES;
 
-    // 安全阀 1：退化 mode 拒绝采集。
+    // 安全阀 1：退化 mode 拒绝采集。此检查与后端无关，必须先做。
     CGDisplayModeRef mode = CGDisplayCopyDisplayMode(_displayID);
     size_t mw = mode ? CGDisplayModeGetWidth(mode) : 0;
     size_t mh = mode ? CGDisplayModeGetHeight(mode) : 0;
@@ -230,6 +347,68 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
         return NO;
     }
 
+    // 版本门控：13 直接走 CGDisplayStream（实测 SCK/SkyLight 在本机 13.6.7
+    // 无法建流）；14+ 优先 SCK，失败时同样回退 CGDisplayStream。
+    BOOL useSCK = NO;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
+    if (@available(macOS 14.0, *)) useSCK = YES;
+#endif
+    const char *forcedBackend = getenv("M1_CAPTURE_BACKEND");
+    if (forcedBackend && !strcasecmp(forcedBackend, "cg")) useSCK = NO;
+    if (forcedBackend && !strcasecmp(forcedBackend, "sck")) useSCK = YES;
+
+    NSError *sckErr = nil;
+    if (useSCK && [self startSCKWithError:&sckErr]) return YES;
+    if (useSCK) {
+        printf("[capture] SCK 后端失败，回退 CGDisplayStream: %s\n",
+               sckErr.localizedDescription.UTF8String ?: "unknown");
+        fflush(stdout);
+        // 不要在 startCapture 失败的 stream 上 removeStreamOutput：
+        // macOS 13 的 SCStream 从未 start 成功时底层 CG stream 为空，
+        // removeStreamOutput 会 EXC_BAD_ACCESS（§5.25）。这里只摘引用，
+        // 由 ARC 释放局部对象。
+        _stream = nil;
+        _output = nil;
+        _queue = nil;
+    }
+
+    NSError *cgErr = nil;
+    if (![self startCGWithError:&cgErr]) {
+        if (error) {
+            if (sckErr) {
+                *error = M1CaptureErr(M1PipelineErrorCaptureFailed,
+                    [NSString stringWithFormat:@"SCK: %@; CGDisplayStream: %@",
+                     sckErr.localizedDescription ?: @"unknown",
+                     cgErr.localizedDescription ?: @"unknown"]);
+            } else {
+                *error = cgErr;
+            }
+        }
+        return NO;
+    }
+    return YES;
+}
+
+- (void)setupOutput:(M1CaptureOutput *)output {
+    output->_onFrame = [_onFrame copy];
+    output->_onError = [_onError copy];
+    atomic_init(&output->_framesDelivered, 0);
+    atomic_init(&output->_framesRejected, 0);
+    atomic_init(&output->_lastSecondDelivered, 0);
+    atomic_init(&output->_lastSecondIdle, 0);
+    atomic_store(&output->_firstFrameLatencyMs, 0.0);
+    atomic_store(&output->_lastIntervalMs, 0.0);
+    atomic_store(&output->_lastScale, 0.0);
+    output->_startMs = M1WallMs();
+    output->_secStartMs = output->_startMs;
+    output->_lastFrameMs = 0;
+    memset(output->_secStatus, 0, sizeof(output->_secStatus));
+    output->_secDelivered = 0;
+    output->_secRejected = 0;
+    output->_running = YES;
+}
+
+- (BOOL)startSCKWithError:(NSError **)error {
     NSError *contentErr = nil;
     SCShareableContent *content = [self syncShareableContentWithError:&contentErr];
     if (!content) {
@@ -303,27 +482,15 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
         if (dm) CGDisplayModeRelease(dm);
         const char *resName = _config.captureResolution == 1 ? "best"
                             : _config.captureResolution == 2 ? "nominal" : "auto";
-        printf("[capture] display=%u mode=%zux%zu@%.1fHz sck=%zux%zu scale=%.2f "
-               "out=%zux%zu fps=%d qDepth=%d res=%s\n",
+        printf("[capture] backend=ScreenCaptureKit display=%u mode=%zux%zu@%.1fHz "
+               "sck=%zux%zu scale=%.2f out=%zux%zu fps=%d qDepth=%d res=%s\n",
                _displayID, dw, dh, hz, (size_t)target.width, (size_t)target.height,
                (double)scale, outW, outH, fps, _config.queueDepth, resName);
         fflush(stdout);
     }
 
     M1CaptureOutput *output = [[M1CaptureOutput alloc] init];
-    output->_onFrame = [_onFrame copy];
-    output->_onError = [_onError copy];
-    atomic_init(&output->_framesDelivered, 0);
-    atomic_init(&output->_framesRejected, 0);
-    atomic_init(&output->_lastSecondDelivered, 0);
-    atomic_init(&output->_lastSecondIdle, 0);
-    atomic_store(&output->_firstFrameLatencyMs, 0.0);
-    atomic_store(&output->_lastIntervalMs, 0.0);
-    atomic_store(&output->_lastScale, 0.0);
-    output->_startMs = M1WallMs();
-    output->_secStartMs = output->_startMs;
-    output->_lastFrameMs = 0;
-    output->_running = YES;
+    [self setupOutput:output];
 
     NSError *streamErr = nil;
     SCStream *stream = [[SCStream alloc] initWithFilter:filter
@@ -352,10 +519,6 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
         if (error) *error = M1CaptureErr(M1PipelineErrorCaptureFailed,
             [NSString stringWithFormat:@"startCapture 失败: %@",
              startErr.localizedDescription ?: @"unknown"]);
-        // 不要在 startCapture 失败的 stream 上 removeStreamOutput：
-        // macOS 13 的 SCStream 在从未 start 成功时，底层 CG stream 为空，
-        // removeStreamOutput 会 EXC_BAD_ACCESS（实测 stream_probe 在 Ventura 崩溃）。
-        // stream/output 都是本方法内的强局部，return 后 ARC 会释放，无需手动摘 output。
         return NO;
     }
 
@@ -367,21 +530,67 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
     return YES;
 }
 
+- (BOOL)startCGWithError:(NSError **)error {
+    // CGDisplayStream 的输出尺寸是像素（不是 point）；13 上没有 pointPixelScale，
+    // 直接用 CGDisplayPixelsWide/High。显式 outputWidth/Height 仍优先。
+    size_t outW = (size_t)CGDisplayPixelsWide(_displayID);
+    size_t outH = (size_t)CGDisplayPixelsHigh(_displayID);
+    if (_config.outputWidth > 0 && _config.outputHeight > 0) {
+        outW = (size_t)_config.outputWidth;
+        outH = (size_t)_config.outputHeight;
+    }
+    outW -= outW % 2;
+    outH -= outH % 2;
+    if (outW < 2 || outH < 2) {
+        if (error) *error = M1CaptureErr(M1PipelineErrorDegenerateMode,
+            [NSString stringWithFormat:@"CG 换算后尺寸 %zux%zu 非法", outW, outH]);
+        return NO;
+    }
+
+    M1CaptureOutput *output = [[M1CaptureOutput alloc] init];
+    [self setupOutput:output];
+
+    M1CGDisplaySource *source = [[M1CGDisplaySource alloc] init];
+    NSError *cgErr = nil;
+    if (![source startWithDisplay:_displayID
+                            width:outW
+                           height:outH
+                              fps:MAX(1, _config.targetFps)
+                       showCursor:_config.showsCursor
+                             sink:output
+                            error:&cgErr]) {
+        output->_running = NO;
+        if (error) *error = cgErr;
+        return NO;
+    }
+
+    _cgSource = source;
+    _output = output;
+    _pixelWidth = (int32_t)outW;
+    _pixelHeight = (int32_t)outH;
+    _running = YES;
+    return YES;
+}
+
 - (void)stop {
     _running = NO;
     if (_output) _output->_running = NO;
-    if (!_stream) {
-        _output = nil;
-        return;
+
+    if (_stream) {
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [_stream stopCaptureWithCompletionHandler:^(NSError *e) {
+            dispatch_semaphore_signal(sem);
+        }];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        [_stream removeStreamOutput:_output type:SCStreamOutputTypeScreen error:NULL];
     }
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    [_stream stopCaptureWithCompletionHandler:^(NSError *e) {
-        dispatch_semaphore_signal(sem);
-    }];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
-    [_stream removeStreamOutput:_output type:SCStreamOutputTypeScreen error:NULL];
+    if (_cgSource) {
+        [_cgSource stop];
+        _cgSource = nil;
+    }
     _stream = nil;
     _output = nil;
+    _queue = nil;
 }
 
 - (M1CaptureStats *)stats {
