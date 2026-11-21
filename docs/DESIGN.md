@@ -106,7 +106,7 @@
 - **构建基线**：所有构建脚本统一 `-mmacosx-version-min=13.0`；用新 SDK 编出的二进制可部署到 13。
 - **旧 SDK 本机编译**：macOS 13 SDK 的 ScreenCaptureKit 头文件不声明 14+ 的属性/常量，仅有 `@available(macOS 14.0, *)` 运行时判断仍会编译失败。因此 14+ API 必须同时具备编译期守卫 `#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000`。当前落点：`M1-Skeleton/src/M1CapturePipeline.m`、`P0-TahoeProbe/src/PipelineProbe.m`、`P0V-RootDaemon/src/p0vprobe.m`。13 上走既有回退（`scale=1.0`、忽略 captureResolution），主流程不受影响。
 - **采集后端门控**：13 上 SCK/SkyLight 在本机无法建流（§5.25），因此 `M1CapturePipeline` 采用双后端：13 直接使用 `CGDisplayStream`（`IOSurface→CVPixelBuffer`，复用原编码链），14+ 优先 SCK 且建流失败自动回退 CGDisplayStream；`M1_CAPTURE_BACKEND=cg|sck` 可强制指定做 A/B。CGDisplayStream 在 14 deprecated、15 obsoleted，禁止在 14+ 作为首选。13 host × Tahoe client 镜像模式全链路两轮 PASS（§5.27）。
-- **验证状态口径**：26.5.2 Tahoe（host）与 15.5 Sequoia（client）已有实测记录；13.6.7 Ventura（iMac-3 / 192.168.34.213）已完成 SSH、仓库与编译环境配置。**13 host 已验证**：镜像与 `--keep-main` 虚拟屏全链路 PASS、真实输入注入 PASS、SPI 建虚拟屏 PASS、720p 约 14.8fps（§5.27/§5.28）。**锁屏态**：CGDisplayStream 仍交付黑帧，已按版本/状态门控切到 `CGDisplayCreateImage` 快照后端，13 host 锁屏下可看见登录界面并接受定向键入（14.9fps@720p，§5.29），但需保持防显示睡眠断言；真实口令解锁未测。**OS 层阻塞**：完整独占禁屏 / C-09 两次触发 WindowServer 崩溃（§5.28）。该项不得写成「已支持」，按 OS 分离记录于 `RESULTS-BY-OS.md`，禁止跨版本外推。
+- **验证状态口径**：26.5.2 Tahoe（host）与 15.5 Sequoia（client）已有实测记录；13.6.7 Ventura（iMac-3 / 192.168.34.213）已完成 SSH、仓库与编译环境配置。**13 host 已验证**：镜像与 `--keep-main` 虚拟屏全链路 PASS、真实输入注入 PASS、SPI 建虚拟屏 PASS、720p 约 14.8fps（§5.27/§5.28）。**锁屏态**：CGDisplayStream 仍交付黑帧，已按版本/状态门控切到 `CGDisplayCreateImage` 快照后端，13 host 锁屏下可看见登录界面并接受定向键入（14.9fps@720p，§5.29），但需保持防显示睡眠断言；真实口令解锁未测。**完整独占禁屏 / C-09**：早期两次 WindowServer 崩溃（§5.28）已定位为 ScreensharingAgent 显示流与显示重配置竞态，加 13 专属冻结窗口后真机 PASS（C-17.40、§5.30）。真机结论仍按 OS 分离记录于 `RESULTS-BY-OS.md`，禁止跨版本外推。
 
 ### 2.5 待验证假设（定稿前必须关闭 A-01/A-02）
 

@@ -1325,7 +1325,7 @@ WindowServer  EXC_BAD_ACCESS / SIGBUS
   CGXDisplaysDidReconfigure → CGXRestoreDisplayConfiguration
 ```
 
-两次 WindowServer 都重启，第二次把控制台踢回 loginwindow（`/dev/console` owner=root）；用户手动重新登录才恢复。guardian 的 `.done` 握手在第二次是正常收尾，但无法阻止 WindowServer 自身崩溃。对照：单独建 1280×720 虚拟屏（`p0probe verify --spec 1280x720x0`）不崩。⇒ **13 上「建虚拟屏」可用，「禁物理屏」是 OS 层阻塞，C-09 无法在 13 验证**，不再重试。
+两次 WindowServer 都重启，第二次把控制台踢回 loginwindow（`/dev/console` owner=root）；用户手动重新登录才恢复。guardian 的 `.done` 握手在第二次是正常收尾，但无法阻止 WindowServer 自身崩溃。对照：单独建 1280×720 虚拟屏（`p0probe verify --spec 1280x720x0`）不崩。⇒ 当时判定 **13 上「建虚拟屏」可用，「禁物理屏」是 OS 层阻塞，C-09 无法在 13 验证**，不再重试。**该结论已于 §5.30 更正**：崩溃是 ScreensharingAgent 显示流竞态，加竞态规避后完整独占 C-09 PASS。
 
 **3) 独占安全变体 `--keep-main` PASS**。`P2_KEEP_MAIN=1` 下保留物理主屏、只建虚拟屏，host 日志：
 
@@ -1366,9 +1366,40 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 **补测：真实口令解锁 PASS（2026-11-21 21:28）**。用户提供真实口令后，经临时文件（600 权限、执行后立即删除）传入 GUI 会话，`p0vprobe type` 输出不再包含明文。首轮暴露新问题：Unicode 事件投递过密，10 字符口令只有 2 个圆点落到密码框（错误口令 8 字符同样只落 2 个）。修复 `P0V-RootDaemon/src/p0vprobe.m`：逐字符间隔 30ms，键入前先发 32 次 Delete（键码 51）清空残留输入。复测：锁屏 + `caffeinate -d -u` → `p0vprobe lock` → 前置 `locked=1` → 注入真实口令 → 后置 **`locked=0 / ok=1`、截图为已解锁桌面**（`P2-Dual/out/a07-unlock-real-r2/`）。⇒ 13 上 Path A 的「看见登录界面 + 定向键入 + 正确口令解锁」端到端成立（镜像模式）。
 
-**边界**：① 仍必须持有防显示睡眠断言，否则 `CGDisplayCreateImage` 返回 NULL；② 完整独占禁屏 / C-09 的 WindowServer 崩溃（§5.28 第 1–3 点）与此无关，仍是 OS 层阻塞；③ `CGDisplayCreateImage` 自 14 deprecated，只作锁屏态专用后端，未锁屏仍用 SCK/CGDisplayStream；④ 合成键入必须逐字符延时，否则 loginwindow 会丢弃事件（已修入 `p0vprobe`）。
+**边界**：① 仍必须持有防显示睡眠断言，否则 `CGDisplayCreateImage` 返回 NULL；② 完整独占禁屏 / C-09 的 WindowServer 崩溃（§5.28 第 2 点）已由 §5.30 的 ScreensharingAgent 竞态规避解决，不再是 OS 层阻塞；③ `CGDisplayCreateImage` 自 14 deprecated，只作锁屏态专用后端，未锁屏仍用 SCK/CGDisplayStream；④ 合成键入必须逐字符延时，否则 loginwindow 会丢弃事件（已修入 `p0vprobe`）。
 
-**A-07 最终口径**：client 全角色 PASS；host 镜像 / keep-main 虚拟屏全链路 PASS，真实输入注入 PASS，SPI 建屏 PASS，锁屏态看见登录界面 + 键盘注入 + 真实口令解锁 PASS；**仅完整独占禁屏 / C-09 仍为 OS 层阻塞**。A-09 在 13 从「不可行」更新为「镜像模式 Path A 端到端 PASS（V-04a/b/c 等价）」。
+**A-07 最终口径（§5.30 更正后）**：client 全角色 PASS；host 镜像 / keep-main 虚拟屏全链路 PASS，真实输入注入 PASS，SPI 建屏 PASS，锁屏态看见登录界面 + 键盘注入 + 真实口令解锁 PASS；**完整独占禁屏 / C-09 也已 PASS（§5.30）**。A-09 在 13 从「不可行」更新为「镜像模式 Path A 端到端 PASS（V-04a/b/c 等价）」。
+
+### 5.30 13 完整独占禁屏 / C-09 通过：ScreensharingAgent 显示流竞态规避（2026-11-21 22:1x–22:3x）
+
+**§5.28 第 2 点「OS 层阻塞、不再重试」被本轮更正。** 崩溃报告与系统日志给出新证据：
+
+| 轮次 | 崩溃时刻 | 栈顶 | 触发点 |
+|---|---|---|---|
+| 原 r1/r4（20:38/20:41） | 虚拟屏 mode-commit 后 | `_platform_memmove` → `DisplayStreamStateSW::CopyFrame` → `CGXDisplayStreamStart` → `_XDisplayStreamStart` | 崩溃前 0.1–0.5s `ScreensharingAgent` 正在重启自己的 `CGDisplayStream` |
+| 本轮 v1 守卫（22:10） | 22:10:34，仍在建屏阶段、`C-09` 校验之前 | `layer_blit_byte_ANY` → `layer_blit_entry` → `_dispatch_root_queue_drain` | 同一显示重配置窗口，另一条 WindowServer 绘制路径；v1 守卫只覆盖「禁屏事务」，未覆盖建屏，故未生效 |
+
+⇒ 根因不是「禁屏 API 在 13 不可用」，而是 **屏幕共享 agent 的显示流与虚拟屏 mode 提交 / 禁屏重配置竞态**。
+
+**修复（C-17.40）**：`M1RDPDriver` 在 macOS 13 上把 `ScreensharingAgent` 的 `SIGSTOP` 窗口前移到 `createVirtualDisplays` 的 `createAll` 之前，一直保持到禁屏事务提交 + 1s settle 后 `SIGCONT`；建屏失败、无需禁屏、恢复物理屏及 guardian 异常兜底路径都无条件解冻。`M1_C09_QUIESCE_SS=0` 可关闭该规避。只冻结进程，不卸载/禁用屏幕共享服务。
+
+**验证（13 iMac host × 26 Mac mini client，LAN，1280×720@15，25s）**：
+
+```text
+[22:35:41] C-09: 冻结 ScreensharingAgent (26682)
+[独占] 虚拟屏就绪 ids=4128832  phase=Streaming  physicalDisabled=是
+[独占] C-09=verified  禁屏后 active=(4128832 仅虚拟屏)
+[22:35:45] C-09: 恢复 ScreensharingAgent (26682)
+[22:36:10] C-09: 恢复 ScreensharingAgent (26682)   # 会话收尾兜底
+[独占] 已恢复物理屏并销毁虚拟屏
+```
+
+- `host.json`：`sessionMode=exclusive`、`c09Status=verified`、`virtualDisplayIDs=[4128832]`、`activeDisplayIDsAfterDisable=[4128832]`、`sessionRecovered=true`、`sessionEnded=true`。
+- host 采集 172 / 编码 163 / 发出 163，`sendFailures=0`；client 收齐 163 / 解出 163 / 上屏 161，丢帧 0、解码失败 0，规格 1280×720 一致，`p2.sh summary` **PASS**。
+- 会话后 WindowServer PID 未变（25994）、`/dev/console` 仍为 `bemin`、物理主屏恢复 `1920x1080+0+0 active=1 main=1`、`ScreensharingAgent` 正常运行、TCP 5900 可达。**全程无崩溃**。
+- 证据：`P2-Dual/out/c09-quiesce-r3/`（两端 JSON/日志已同步到本机同名目录）。13.3 / 26.5 SDK 双构建 + 各 268 单测通过。
+
+**边界**：① 规避只在 `osMajor==13` 生效，26/Tahoe 不冻结任何进程；② 冻结窗口内屏幕共享会短暂停顿（本轮约 3.5s），会话结束即恢复；③ 本轮仅验证 1280×720 单屏，多屏/1080p 独占未在本轮覆盖；④ 崩溃后登录态恢复仍需人工登录或屏幕共享（SSH 侧无法在 loginwindow 启动 GUI 终端），属操作规程而非产品缺陷。
 
 ## 6. 状态汇总
 
@@ -1376,15 +1407,16 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 |---|---|---|---|
 | A-01 Tahoe SPI 可用 | — | ✅ 关闭 | — |
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 | — |
-| A-07 13–26 双角色 | — | — | ⚠️ 部分收敛：client 全角色 PASS（§5.24）；host 的 SCK 被系统拒绝但 CG 回退可用，镜像 + 虚拟屏 keep-main 双机全链路 PASS（§5.27/§5.28），真实系统输入注入 PASS（光标位移 >1000px），SPI 建虚拟屏 PASS，帧率 ~14.8fps@720p；锁屏态改用 CGDisplayCreateImage 后端后可看见登录界面并接受键入，14.9fps@720p（§5.29）。**仅完整独占禁屏/C-09 两次触发 WindowServer 崩溃，为 OS 层阻塞（§5.28）** |
+| A-07 13–26 双角色 | — | — | ⚠️ 部分收敛：client 全角色 PASS（§5.24）；host 的 SCK 被系统拒绝但 CG 回退可用，镜像 + 虚拟屏 keep-main 双机全链路 PASS（§5.27/§5.28），真实系统输入注入 PASS（光标位移 >1000px），SPI 建虚拟屏 PASS，帧率 ~14.8fps@720p；锁屏态改用 CGDisplayCreateImage 后端后可看见登录界面并接受键入，14.9fps@720p（§5.29）；**完整独占禁屏/C-09 加 ScreensharingAgent 竞态规避后已 PASS（§5.30）** |
 | A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
-| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） | ✅ 镜像模式 Path A 端到端 PASS（V-04a/b/c 等价）：锁屏且防睡眠下 CGDisplayCreateImage 后端看到完整登录界面（14.9fps），定向键入使密码框出现圆点，真实口令注入后 `locked=0 / ok=1`、回到桌面（§5.29）。完整独占禁屏下的登录窗迁移仍受 C-09 崩溃阻塞（V-04d 等价项未测） |
+| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） | ✅ 镜像模式 Path A 端到端 PASS（V-04a/b/c 等价）：锁屏且防睡眠下 CGDisplayCreateImage 后端看到完整登录界面（14.9fps），定向键入使密码框出现圆点，真实口令注入后 `locked=0 / ok=1`、回到桌面（§5.29）。镜像模式端到端已 PASS；独占禁屏下的登录窗迁移随 C-09 解决后已具备测试条件（V-04d 等价项仍未实测） |
 | A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。2026-11-19 跨公网已取得首批双机数据（§5.13，Tahoe host × Sequoia client）：1080p20 客户端渲染 84.7ms/帧、解码/发出 54/375；720p10 渲染 41.6ms、上屏 0 积压；补测 C/D 拿到完整配对（3440×1440 → 7 解出；720p15 → 136/443，丢包 4–6% + 严格按序重组等关键帧是主因）。无 60fps / glass-to-glass 证据，A-02 保持开放，见 D-10 |
 
 ---
 
 ## 7. 变更记录
 
+- v0.55-draft 2026-11-21 22:3x：**13 完整独占禁屏 / C-09 PASS（§5.30）**。WindowServer 崩溃报告证明两次旧崩溃与一次新崩溃都由 ScreensharingAgent 的 `CGDisplayStream` 与虚拟屏 mode 提交 / 禁屏重配置竞态触发（栈顶 `DisplayStreamStateSW::CopyFrame` 或 `layer_blit_byte_ANY`），且发生在建屏阶段，故把 `SIGSTOP` 窗口从禁屏事务前移到建屏前（C-17.40），提交 + settle 后 `SIGCONT`，所有异常/兜底路径解冻；`M1_C09_QUIESCE_SS=0` 可关闭。13 host × 26 client LAN 1280×720@15：C-09 verified、active 仅虚拟屏、采集 172/编码 163/发出 163、client 解出 163/上屏 161、summary PASS，WindowServer 未重启、物理屏恢复、屏幕共享仍可达。§5.28「OS 层阻塞、不再重试」结论作废。
 - v0.54-draft 2026-11-21 21:2x：**13 Path A 真实口令解锁 PASS（§5.29 补测）**。用户给出真实口令；发现合成 Unicode 事件投递过密导致 10 字符只落 2 个圆点，修复 `p0vprobe.m`：逐字符 30ms 间隔 + 键入前 32 次 Delete 清场，并从输出里去掉明文口令。复测 `p0vprobe lock` → 前置 `locked=1` → 注入 → 后置 `locked=0 / ok=1`，截图为已解锁桌面，证据 `P2-Dual/out/a07-unlock-real-r2/`。A-09 在 13 更新为镜像模式端到端 PASS；完整独占禁屏下的登录窗迁移仍受 C-09 阻塞。
 - v0.53-draft 2026-11-21 21:2x：**13 锁屏黑屏根因更正 + CGDisplayCreateImage 后端，见 §5.29**。用户指出锁屏数秒无输入会黑屏；对照实验证明有两层原因：① 显示睡眠时 `CGDisplayCreateImage` 直接返回 NULL（`caffeinate -d -u` 可解，Tahoe 早有此前置）；② 即使屏亮，CGDisplayStream 在锁屏态仍交付黑帧，而 `CGDisplayCreateImage` 能看到完整登录界面。`M1CapturePipeline.m` 新增第三条后端 `M1CGImageSource`（定时快照 → BGRA CVPixelBuffer），按 `CGSessionCopyCurrentDictionary()` 锁屏状态自动切换、解锁后恢复，`M1_CAPTURE_BACKEND=cgimage` 可强制；13/26 SDK 双构建 + 各 268 单测通过。13 host 锁屏 × Tahoe client 镜像 1280x720@15：359 帧上屏、14.9fps、落盘图含 `bemin`/密码框，PASS；`p0vprobe type --text zzzzzzzz` 后密码框出现圆点、截图哈希变化，确认登录 UI 收到键入。§5.28「13 Path A OS 层不可行」结论作废，A-09 更新为镜像模式视觉+注入 PASS、真实口令解锁未测；完整独占禁屏/C-09 仍是 OS 阻塞。
 - v0.52-draft 2026-11-21 21:0x：**A-07 剩余项收敛，见 §5.28**。13 上私有 SPI 探测与建虚拟屏 PASS；完整独占禁屏/C-09 两次触发 WindowServer 崩溃（崩溃栈 `DisplayStreamStateSW::CopyFrame / CGXRestoreDisplayConfiguration`），第二次踢回 loginwindow，判定 OS 层阻塞、不再重试。`--keep-main` 安全变体下虚拟屏 + CG 回退后端全链路 PASS（278 解出 / 251 上屏 / 0 丢帧），帧率 ~14.8fps@720p。用户手动给 Terminal 辅助功能授权后 `--inject real` PASS（6 收到 / 3–6 注入，光标位移 1055–1154px）。Path A 锁屏态 CG 帧全黑、`screencapture` 失败，远程看见登录界面不可行；为绕开 SCK verdict 给 `p0vprobe` 增加 `type` 子命令（只键入 + Return）。A-07 按 OS 分离收敛，13 的独占禁屏与 Path A 保持开放为 OS 限制。

@@ -12,12 +12,23 @@
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <libproc.h>
 #import <unistd.h>
+#import <strings.h>
 
 NSString * const M1RDPDriverErrorDomain = @"M1RDPDriver";
 
 static NSError *M1DrvErr(M1RDPDriverErrorCode code, NSString *desc) {
     return [NSError errorWithDomain:M1RDPDriverErrorDomain code:code
         userInfo:@{ NSLocalizedDescriptionKey: desc ?: @"M1RDPDriver error" }];
+}
+
+// macOS 13 实测：虚拟屏 mode 提交与禁屏重配置期间，ScreensharingAgent 的 CGDisplayStream
+// 会与 WindowServer 竞态，崩溃栈为 DisplayStreamStateSW::CopyFrame 或 layer_blit_byte_ANY
+// （见 RESULTS-BY-OS.md §5.28）。冻结窗口必须覆盖「建屏 → 禁屏提交 + settle」整段，
+// 只放在禁屏事务里太晚。M1_C09_QUIESCE_SS=0 可关闭该规避。
+static BOOL M1ShouldQuiesceScreenSharing(void) {
+    if ([P0OSPolicy()[@"osMajor"] integerValue] != 13) return NO;
+    const char *q = getenv("M1_C09_QUIESCE_SS");
+    return !(q && !strcasecmp(q, "0"));
 }
 
 #pragma mark - 进程查找（复用 P0V 的 libproc 路径，不依赖 shell）
@@ -56,6 +67,7 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
 @property (nonatomic, assign) IOPMAssertionID systemAssertion;
 @property (nonatomic, strong, readwrite, nullable) NSArray<NSNumber *> *lastActiveDisplayIDs;
 @property (nonatomic, copy, readwrite, nullable) NSString *snapshotPath;
+@property (nonatomic, assign) BOOL screenSharingQuiesced;
 @end
 
 @implementation M1RDPDriver
@@ -135,12 +147,23 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     NSDictionary *policy = P0OSPolicy();
     BOOL conservative = [policy[@"conservativeFirst"] boolValue];
     int modeWaitMs = [policy[@"modeWaitMs"] intValue];
+
+    // 冻结窗口从这里开始：13 上的崩溃发生在建屏/ mode 提交阶段，早于禁屏事务。
+    if (M1ShouldQuiesceScreenSharing()) {
+        P0VStopScreenSharingAgents();
+        self.screenSharingQuiesced = YES;
+    }
+
     _vd = [[VDManager alloc] initWithConfigs:specs
                               identityOffset:[VDManager savedIdentityOffset]
                            conservativeFirst:conservative];
     if (![_vd createAll] || ![_vd waitUntilUsableTimeoutMs:8000]) {
         [_vd destroyAll];
         _vd = nil;
+        if (self.screenSharingQuiesced) {
+            P0VResumeScreenSharingAgents();
+            self.screenSharingQuiesced = NO;
+        }
         if (error) *error = M1DrvErr(M1RDPDriverErrorNoDisplays, @"建屏失败或超时");
         return NO;
     }
@@ -233,18 +256,33 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     for (NSNumber *n in P0VActiveDisplayIDs()) {
         if (![keep containsObject:n]) [physical addObject:n];
     }
-    if (physical.count == 0) return YES; // 已全是目标虚拟屏，无需配置事务
+    if (physical.count == 0) {
+        if (self.screenSharingQuiesced) {
+            P0VResumeScreenSharingAgents();
+            self.screenSharingQuiesced = NO;
+        }
+        return YES; // 已全是目标虚拟屏，无需配置事务
+    }
+
+    // 13 上 CGDisplayStream 与显示重配置竞态的冻结窗口已从建屏开始（§5.28），
+    // 这里只负责在禁屏提交 + settle 后恢复。
 
     NSDictionary *detail = nil;
     NSError *disableErr = nil;
     BOOL ok = P0VApplyDisplayEnabledChanges(physical, @[], P0VCommitScopeSession,
                                             20, &detail, &disableErr);
+
+    [NSThread sleepForTimeInterval:1.0]; // 等登录 UI 迁移（D-08 实测触发条件）
+    if (self.screenSharingQuiesced) {
+        P0VResumeScreenSharingAgents();
+        self.screenSharingQuiesced = NO;
+    }
+
     if (!ok) {
         if (error) *error = M1DrvErr(M1RDPDriverErrorDisableFailed,
             disableErr.localizedDescription ?: @"禁用物理屏失败");
         return NO;
     }
-    [NSThread sleepForTimeInterval:1.0]; // 等登录 UI 迁移（D-08 实测触发条件）
 
     // 禁屏后自检：本会话虚拟屏必须还在 active list，否则等于把系统画布一起关了。
     NSArray *activeNow = P0VActiveDisplayIDs();
@@ -296,6 +334,9 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
 }
 
 - (BOOL)restorePhysicalAndDestroyDisplaysError:(NSError **)error {
+    // 兜底解除 C-09 窗口内可能残留的冻结；对未冻结的进程发 SIGCONT 是安全的空操作。
+    P0VResumeScreenSharingAgents();
+    self.screenSharingQuiesced = NO;
     BOOL ok = YES;
     // 1. 恢复物理屏快照（先启用物理屏）
     if (self.snapshot && self.snapshotPath && !P0VWindowServerHung()) {

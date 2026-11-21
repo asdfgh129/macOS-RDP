@@ -94,6 +94,14 @@ NSArray<NSDictionary *> *P0VDisplayDictionaries(NSArray<NSNumber *> *displayIDs)
 
 BOOL P0VPrivateDisplayControlAvailable(void);
 
+// C-09 竞态规避（macOS 13 专属）：禁物理屏会触发 WindowServer 重配置，
+// 此时 ScreensharingAgent 若恰好重启 CGDisplayStream，WindowServer 会崩在
+// DisplayStreamStateSW::CopyFrame（见 RESULTS-BY-OS.md §5.28 的崩溃栈）。
+// 在显示事务前后短暂 SIGSTOP / SIGCONT 该 agent，只冻结重配置窗口，不卸载服务。
+// 返回的是本次实际发出 SIGSTOP 的 PID，供调用方做兜底恢复。
+NSArray<NSNumber *> *P0VStopScreenSharingAgents(void);
+void P0VResumeScreenSharingAgents(void);
+
 #pragma mark - 变更 / 恢复
 
 // 在一个事务里禁用 toDisable、启用 toEnable。任一操作失败则取消整个事务。

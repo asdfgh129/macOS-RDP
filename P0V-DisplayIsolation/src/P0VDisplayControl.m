@@ -55,6 +55,51 @@ BOOL P0VPrivateDisplayControlAvailable(void) {
     return gConfigureDisplayEnabled != NULL;
 }
 
+#pragma mark - C-09 屏幕共享 agent 竞态规避
+
+static NSArray<NSNumber *> *P0VProcessPIDsWithBaseName(NSString *baseName) {
+    int count = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (count <= 0) return @[];
+    pid_t *pids = calloc((size_t)count, sizeof(pid_t));
+    if (!pids) return @[];
+    count = proc_listpids(PROC_ALL_PIDS, 0, pids, count * (int)sizeof(pid_t));
+    NSMutableArray *out = [NSMutableArray array];
+    for (int i = 0; i < count / (int)sizeof(pid_t); i++) {
+        pid_t p = pids[i];
+        if (p <= 0) continue;
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(p, path, sizeof(path)) <= 0) continue;
+        if ([[[NSString stringWithUTF8String:path] lastPathComponent] isEqualToString:baseName]) {
+            [out addObject:@(p)];
+        }
+    }
+    free(pids);
+    return out;
+}
+
+NSArray<NSNumber *> *P0VStopScreenSharingAgents(void) {
+    NSArray *pids = P0VProcessPIDsWithBaseName(@"ScreensharingAgent");
+    for (NSNumber *n in pids) {
+        pid_t p = (pid_t)n.intValue;
+        if (kill(p, SIGSTOP) != 0) {
+            P0Error(@"C-09: SIGSTOP ScreensharingAgent(%d) 失败: %s", p, strerror(errno));
+        }
+    }
+    if (pids.count) P0Log(@"C-09: 冻结 ScreensharingAgent %@（显示重配置窗口内）", pids);
+    return pids;
+}
+
+void P0VResumeScreenSharingAgents(void) {
+    NSArray *pids = P0VProcessPIDsWithBaseName(@"ScreensharingAgent");
+    for (NSNumber *n in pids) {
+        pid_t p = (pid_t)n.intValue;
+        if (kill(p, SIGCONT) != 0 && errno != ESRCH) {
+            P0Error(@"C-09: SIGCONT ScreensharingAgent(%d) 失败: %s", p, strerror(errno));
+        }
+    }
+    if (pids.count) P0Log(@"C-09: 恢复 ScreensharingAgent %@", pids);
+}
+
 #pragma mark - 记录
 
 @implementation P0VDisplayRecord
@@ -644,10 +689,13 @@ int P0VRunGuardian(NSString *snapshotPath, pid_t parentPID) {
     NSString *donePath = [snapshotPath stringByAppendingString:@".done"];
     if (P0VFileExists(donePath)) {
         P0Log(@"父进程已正常恢复并写 done，守护进程退出");
+        P0VResumeScreenSharingAgents();
         P0VWriteGuardianResult(snapshotPath, @{ @"acted": @NO, @"reason": @"parent-clean" });
         return 0;
     }
 
+    // 父进程若在禁屏窗口内死亡，agent 会一直处于 SIGSTOP；先解冻再做兜底恢复。
+    P0VResumeScreenSharingAgents();
     P0Error(@"父进程未正常收尾，守护进程开始兜底恢复物理屏");
     P0VDisplaySnapshot *snap = [P0VDisplaySnapshot loadFromFile:snapshotPath];
     if (!snap) {
