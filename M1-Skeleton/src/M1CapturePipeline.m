@@ -352,7 +352,10 @@ static CGFloat M1FrameScaleOf(CMSampleBufferRef sb) {
         if (error) *error = M1CaptureErr(M1PipelineErrorCaptureFailed,
             [NSString stringWithFormat:@"startCapture 失败: %@",
              startErr.localizedDescription ?: @"unknown"]);
-        [stream removeStreamOutput:output type:SCStreamOutputTypeScreen error:NULL];
+        // 不要在 startCapture 失败的 stream 上 removeStreamOutput：
+        // macOS 13 的 SCStream 在从未 start 成功时，底层 CG stream 为空，
+        // removeStreamOutput 会 EXC_BAD_ACCESS（实测 stream_probe 在 Ventura 崩溃）。
+        // stream/output 都是本方法内的强局部，return 后 ARC 会释放，无需手动摘 output。
         return NO;
     }
 
