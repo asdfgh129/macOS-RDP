@@ -1260,6 +1260,8 @@ host 镜像主屏 3440×1440 → 编码 1920×1080@20；a/b 轮动画窗口 1200
 
 **修复的真实 bug（与上述系统限制独立）**：原 `M1CapturePipeline.m:355` 在 `startCapture` 失败后调用 `[stream removeStreamOutput:...]`，macOS 13 上从未 start 成功的 SCStream 底层为空，该调用 `EXC_BAD_ACCESS` 崩溃（crash report：`-[M1CapturePipeline start:] (M1CapturePipeline.m:355)` → `SCStream removeStreamOutput`，`SIGSEGV / KERN_INVALID_ADDRESS at 0x0`）。已改为失败时直接返回、由 ARC 释放局部 stream/output（commit `52ab8b8`）。复测确认：host 现在优雅退出 `rc=5` + `管线启动失败: startCapture 失败: Start stream failed`，无 segfault、无新 crash report。
 
+**16:5x 复测（用户已恢复「屏幕共享」）**：本机 `nc -zvw3 192.168.34.213 5900` 成功，确认 VNC/Remote Management 已开。两端仍为 commit `1d1ef27`，iMac 从 GUI Terminal 以镜像模式重跑（1920×1080→1280×720@15、`P2_INJECT=record`、端口 46611），Tahoe 侧跑 client。结果与上表完全一致：iMac preflight `capture=1 locked=0 asleep=0 active=1 ok=1`，握手 `TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → STREAMING` 全过，随即 `[capture] ... res=auto` 后报 `管线启动失败: startCapture 失败: Start stream failed`，host rc=5、未写出 host.json；client 收到 0 帧包、解出 0 帧、上屏 0 帧、rc=2（`P2-Dual/out/ventura-host-recheck/`）。统一日志再次锁定同一系统层链路：`replayd` → `SLContentStreamCreate: Failed to create content stream (0x3e8)` → `-[SLContentStream initWithFilter:...]: stream = 0x0` → `-[SCCaptureSession startWithCompletionHandler:]:598 startError=CoreGraphicsErrorDomain Code=1003 "The stream is nil."`。⇒ **开启 Screen Sharing / Remote Management 并不改变 SCK 建流失败**；问题仍在 Ventura 13.6.7 的 SkyLight/replayd，而不是本项目的 TCC、配置、网络或 VNC 服务状态。
+
 **边界**：本节证明「13 已能完成 TCC 授权并在 GUI 会话启动 host，握手到 STREAMING 全程正常；但 13 的 SCK 无法创建采集流」，A-07 的 host 侧（建屏/禁屏/C-09）继续未验证。13 上 client 侧不受影响（§5.24 两轮 PASS）。`DECISIONS.md` C-17 关于 ad-hoc 签名只能产生 path 级 TCC 条目、正式形态需正确签名用户态 App 的结论与本结果一致，进一步说明 13 host 可能需要正式签名才能在 SCK 层通过。
 
 ## 6. 状态汇总
