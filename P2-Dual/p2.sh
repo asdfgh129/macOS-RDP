@@ -172,7 +172,7 @@ client)
   say "输出：$OUT"
   # shellcheck disable=SC2086
   ./stream_probe --client --connect "$PEER" --port "$PORT" --fingerprint "$FP" $SPEC_ARG \
-      "${EXTRA_ARGS[@]}" \
+      ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
       --handshake-ms "$HANDSHAKE_MS" --wait-ms "$WAIT_MS" \
       --duration-ms "$((SECS * 1000))" --window "$WIN" \
       --save-frames 0 --out "$OUT/client.json" 2>&1 | tee "$OUT/client.log"

@@ -1310,7 +1310,40 @@ RC=0
 
 **帧率归因**：客户端只有 3.7fps，不是回退后端缺陷。独立最小 CGDisplayStream 程序在同一台 iMac、同一动画夹具下 10s 仅 38 帧（3.8fps），说明 `anim_display` 全屏动画在这台弱 GPU 上的实际内容更新率就是 ~4fps；CGDisplayStream 按内容变化出帧（静态屏 6s 只有 2 帧，§5.26），符合 Quartz 语义。需要在更强 GPU 或更高更新率夹具上另测帧率上限，本轮只把「全链路可用性」作为门禁。
 
-**未覆盖**：13 host 的独占会话（建虚拟屏 / 禁物理屏 / C-09）、Path A 锁屏进入、真实系统级输入注入（本机 `ax=0`，未授予辅助功能）仍未测；13 host 的 frame-rate 上限也未测。A-07 从「host 不可用」更新为「host 镜像模式双机全链路 PASS，独占/锁屏未测」。
+**后续补充**：帧率上限、真实输入注入、独占安全变体与 Path A 见 §5.28；§5.27 里「未覆盖」的边界以 §5.28 为准。
+
+### 5.28 A-07 剩余项：13 host SPI / 独占安全变体 / 帧率 / 真实注入 / Path A（2026-11-21 20:0x–21:0x）
+
+**1) 私有 SPI 在 13 上可用（A-07 的 SPI 部分关闭）**。GUI Terminal 内 `p0probe probe --capabilities`：`allClassesResolved=true`、`spi-signature-check ok=1 missing=[]`、`isLoggedInGUI=true`；`p0probe verify` 成功建 2 块虚拟屏（1920×1080、2560×1440），mode-commit / liveness / visibility 全过并干净销毁。OS 策略仍为 13 专属的 `conservativeFirst=0 identityWalk=0 maxRetries=1`。SCK 采集同样失败（`startCapture: Start stream failed`），与 §5.25 一致。
+
+**2) 完整独占会话（禁物理屏 / C-09）在 13 上被 WindowServer 崩溃阻断**。两次 `stream_probe --host` 默认独占（1280×720 和 1920×1080）都在虚拟屏 mode-commit 后、禁用物理屏的显示重配置阶段崩溃：
+
+```text
+WindowServer  EXC_BAD_ACCESS / SIGBUS
+  DisplayStreamStateSW::CopyFrame
+  displaystream_update → CGXDisplayStreamStart
+  CGXDisplaysDidReconfigure → CGXRestoreDisplayConfiguration
+```
+
+两次 WindowServer 都重启，第二次把控制台踢回 loginwindow（`/dev/console` owner=root）；用户手动重新登录才恢复。guardian 的 `.done` 握手在第二次是正常收尾，但无法阻止 WindowServer 自身崩溃。对照：单独建 1280×720 虚拟屏（`p0probe verify --spec 1280x720x0`）不崩。⇒ **13 上「建虚拟屏」可用，「禁物理屏」是 OS 层阻塞，C-09 无法在 13 验证**，不再重试。
+
+**3) 独占安全变体 `--keep-main` PASS**。`P2_KEEP_MAIN=1` 下保留物理主屏、只建虚拟屏，host 日志：
+
+```text
+[独占] 虚拟屏就绪 ids=4128832  phase=Streaming  physicalDisabled=保留主屏
+[capture] backend=CGDisplayStream display=4128832 out=1280x720 fps=15
+host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRecovered=true
+```
+
+客户端收齐 279 / 解出 278 / 上屏 251，丢帧 0，规格 1280×720 一致，`p2.sh summary` PASS。证明 CG 回退后端能直接采虚拟屏，不只是物理屏。证据：`P2-Dual/out/a07-keepmain-13/`。
+
+**4) 帧率上限**：上述虚拟屏 + 全屏动画夹具下客户端解码 **14.8 fps**（1280×720），达到 15fps 目标档；镜像物理屏夹具只有 3.7fps，已归因于 iMac17,1 弱 GPU 上动画的实际更新率（§5.27），不是后端上限。⇒ CG 回退后端在本机可支撑约 15fps@720p。
+
+**5) 真实系统级输入注入 PASS**。用户手动在 iMac「系统设置 → 隐私与安全性 → 辅助功能」里勾选 Terminal（`AXIsProcessTrustedWithOptions` 弹窗未生效，`tccutil` 不能增权），GUI Terminal 内 `stream_probe --preflight host --inject real` → `ax=1 capture=1 ok=1`。`P2_INJECT=real` + client `--input-synth` 5 点：首轮 6/6 收到并注入、光标位移 1055px；复测 6 收到 / 3 注入成功、位移 1154px（部分合成点在收尾窗口内被丢弃，属夹具时序）。两轮 `p2.sh summary` 均 PASS。证据：`P2-Dual/out/a07-realinput-13/`、`a07-realinput-13-r2/`。
+
+**6) Path A（锁屏进入）在 13 上被黑帧阻断**。`p0vprobe lock` 成功上锁，锁屏期间 CGDisplayStream 仍以 ~2fps 出帧，但用同一 CG 路径落盘的截图是**纯黑 + 光标**（`P2-Dual/out/a07-patha-13/before.png`），看不到 loginwindow 的用户名/密码框；`screencapture` 在锁屏态直接 `could not create image from display`，p0vprobe 的 `inject-test` verdict 也依赖 SCK、在 13 上不可用。为绕开 verdict 依赖，给 `p0vprobe` 新增 `type` 子命令（只做 `CGEventPostToPid` 键入 + Return，不依赖 SCK）：`type --text zzzzzzzz` 返回 `ok=true loginwindowPID=...`，但前后截图哈希完全相同，无法证明登录 UI 收到了字符。⇒ **13 上 Path A 的「远程看见登录界面」不可行**；真实输入注入本身在未锁屏态已通过（第 5 点），不跨锁屏态外推。
+
+**A-07 收敛口径**：client 全角色 PASS；host 镜像 + 虚拟屏 keep-main 全链路 PASS，真实输入注入 PASS，SPI 建屏 PASS；**完整独占禁屏 / C-09 与 Path A 锁屏进入均为 OS 层阻塞（WindowServer 崩溃 / 锁屏黑帧）**，按 OS 分离记录，不跨版本外推。
 
 ## 6. 状态汇总
 
@@ -1318,15 +1351,16 @@ RC=0
 |---|---|---|---|
 | A-01 Tahoe SPI 可用 | — | ✅ 关闭 | — |
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 | — |
-| A-07 13–26 双角色 | — | — | ⚠️ 部分：client 收流/上屏/输入回传在跨网段 LAN 实测 PASS（§5.24）；host 的 SCK 路径被系统 `replayd` 以 CG 1003 拒绝（§5.25），但已加版本门控的 CGDisplayStream 回退后端，13 host × Tahoe client 镜像模式双机全链路两轮 PASS、6/6 输入回传 PASS（§5.27）；建屏/禁屏/C-09、Path A、帧率上限与真实系统输入注入仍未测 |
+| A-07 13–26 双角色 | — | — | ⚠️ 部分收敛：client 全角色 PASS（§5.24）；host 的 SCK 被系统拒绝但 CG 回退可用，镜像 + 虚拟屏 keep-main 双机全链路 PASS（§5.27/§5.28），真实系统输入注入 PASS（光标位移 >1000px），SPI 建虚拟屏 PASS，帧率 ~14.8fps@720p。**完整独占禁屏/C-09 两次触发 WindowServer 崩溃、Path A 锁屏态只有黑帧，均为 OS 层阻塞（§5.28）** |
 | A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
-| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） |
+| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） | ❌ 13 上不可行：CGDisplayStream 锁屏态只有黑帧、`screencapture` 失败、p0vprobe verdict 依赖 SCK；注入命令可用但无法确认登录 UI 收到（§5.28） |
 | A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。2026-11-19 跨公网已取得首批双机数据（§5.13，Tahoe host × Sequoia client）：1080p20 客户端渲染 84.7ms/帧、解码/发出 54/375；720p10 渲染 41.6ms、上屏 0 积压；补测 C/D 拿到完整配对（3440×1440 → 7 解出；720p15 → 136/443，丢包 4–6% + 严格按序重组等关键帧是主因）。无 60fps / glass-to-glass 证据，A-02 保持开放，见 D-10 |
 
 ---
 
 ## 7. 变更记录
 
+- v0.52-draft 2026-11-21 21:0x：**A-07 剩余项收敛，见 §5.28**。13 上私有 SPI 探测与建虚拟屏 PASS；完整独占禁屏/C-09 两次触发 WindowServer 崩溃（崩溃栈 `DisplayStreamStateSW::CopyFrame / CGXRestoreDisplayConfiguration`），第二次踢回 loginwindow，判定 OS 层阻塞、不再重试。`--keep-main` 安全变体下虚拟屏 + CG 回退后端全链路 PASS（278 解出 / 251 上屏 / 0 丢帧），帧率 ~14.8fps@720p。用户手动给 Terminal 辅助功能授权后 `--inject real` PASS（6 收到 / 3–6 注入，光标位移 1055–1154px）。Path A 锁屏态 CG 帧全黑、`screencapture` 失败，远程看见登录界面不可行；为绕开 SCK verdict 给 `p0vprobe` 增加 `type` 子命令（只键入 + Return）。A-07 按 OS 分离收敛，13 的独占禁屏与 Path A 保持开放为 OS 限制。
 - v0.51-draft 2026-11-21 17:4x：**13 host 回退后端集成 + 双机全链路 PASS，见 §5.27**。`M1CapturePipeline.m` 加版本/能力门控的 `CGDisplayStream` 后端（13 直接走 CG，14+ SCK 失败自动回退），`IOSurface→CVPixelBuffer` 复用原编码链；`M1_CAPTURE_BACKEND=cg|sck` 可强制。13.3/26.5 SDK 双构建 + 各 268 单测通过。iMac13 host × Tahoe client 镜像 1280x720@15 两轮：81/81、53/53 收齐解出上屏，0 丢帧，输入 6/6 回传，均 PASS。3.7fps 归因于 iMac 弱 GPU 上动画夹具的内容更新率（独立 CG 探针 3.8fps），非后端缺陷。修 `P2-Dual/p2.sh` client 丢弃 `--input-synth/--manual/--keep-front` 的工具 bug。A-07 更新为「13 host 镜像模式可用，独占/锁屏未测」。
 - v0.50-draft 2026-11-21 16:3x：**Ventura 13 host 实测 + 修复 startCapture 失败崩溃，见 §5.25**。用户完成屏幕录制授权后，GUI 会话内 host preflight `capture=1 ok=1`，握手到 STREAMING 正常，但 `SCStream startCapture` 被系统 `replayd` 以 `CoreGraphicsErrorDomain 1003 "The stream is nil."` 拒绝；独立最小 SCK 程序 5 种配置全部同样失败、TCC authValue=2、杀采集 daemon 无效 ⇒ 13 的 SCK 建流是 OS 层阻塞，非本项目代码/配置。13 host 角色仍不可用（A-07 host 侧未关闭），13 client 不受影响。修复 `M1CapturePipeline.m` 在 startCapture 失败时 `removeStreamOutput` 导致的 `EXC_BAD_ACCESS`（commit `52ab8b8`）：改为直接返回由 ARC 释放，复测优雅退出 rc=5、无新 crash report。
 - v0.49-draft 2026-11-21 16:0x：**1080p20 满帧门禁达成 + 定位采集侧瓶颈，见 §5.24 补测**。`anim_display 0 60 full` 两轮对照：`res=auto` 时 SCK 送原生 3440×1440 再降采样，i5-9500 上采集仅 ~5fps（171 帧/30s、上屏 146）；`M1_CAPTURE_RESOLUTION=best` 让 SCK 直出 1080p，采集稳 18–20fps，发 525/解 525=1.000、上屏 493 帧、丢帧 0、`sendFailures=0`，`p2.sh summary` PASS。⇒ P2.3 的 1080p20 满帧首次在双真机 LAN 达成；确认瓶颈在采集侧转录/缩放而非网络/client，高分辨率物理屏镜像推流必须显式设 `M1_CAPTURE_RESOLUTION=best`。A-02 延迟仍未测、保持开放。

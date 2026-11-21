@@ -462,6 +462,24 @@ static NSDictionary *P0VInjectTest(void) {
     return r;
 }
 
+// 只做定向键入 + Return，不依赖 SCK 前后截图判定。
+// 13 上 SCK 建流被系统拒绝，inject-test 的 verdict 拿不到；
+// 这个命令让外部用 CGDisplayCreateImage / screencapture 自行做前后对照。
+static int P0VCmdType(void) {
+    pid_t lw = P0VFindPID(@"loginwindow");
+    if (lw <= 0) {
+        printf("{\"ok\":false,\"error\":\"找不到 loginwindow\"}\n");
+        return 1;
+    }
+    P0VTypeToPid(lw, gInjectText);
+    P0VPostKeyToPid(lw, 36, true);
+    P0VPostKeyToPid(lw, 36, false);
+    printf("{\"ok\":true,\"loginwindowPID\":%d,\"textLength\":%lu,\"text\":\"%s\"}\n",
+           lw, (unsigned long)gInjectText.length,
+           [gInjectText UTF8String] ?: "");
+    return 0;
+}
+
 static int P0VCmdInject(void) {
     NSDictionary *r = P0VInjectTest();
     NSData *json = [NSJSONSerialization dataWithJSONObject:r options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:NULL];
@@ -524,8 +542,9 @@ int main(int argc, const char *argv[]) {
         if ([cmd isEqualToString:@"probe"])         return P0VCmdProbe();
         if ([cmd isEqualToString:@"capture"])       return P0VCmdCapture(ms);
         if ([cmd isEqualToString:@"inject-test"])   return P0VCmdInject();
+        if ([cmd isEqualToString:@"type"])          return P0VCmdType();
         if ([cmd isEqualToString:@"daemon-run"])    return P0VCmdDaemonRun();
-        fprintf(stderr, "用法: p0vprobe {lock|probe|capture|inject-test|daemon-run} [--ms N] [--display ID] [--text STR]\n");
+        fprintf(stderr, "用法: p0vprobe {lock|probe|capture|inject-test|type|daemon-run} [--ms N] [--display ID] [--text STR]\n");
         return 1;
     }
 }
