@@ -1449,6 +1449,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - 对照实验（恢复物理单屏后）：同样的 `p0vprobe lock` 在 GUI Terminal（Aqua session）里调用，8 秒后 `screenIsLocked=true`；而 SSH 进程直接调用同 API 静默无效（不在 Aqua session）。⇒ **`SACLockScreenImmediate` 必须在 Aqua/GUI session 中调用，且在物理屏全禁的独占态下不生效**。
 - 镜像模式 §5.29 的 Path A 成功，正是因为物理屏仍在、lock 在 GUI Terminal 有效；独占态禁掉物理屏后这条锁屏触发路径失效。⇒ 独占态 Path A 要成立，需另找触发锁屏/登录窗的路径（例如登录窗迁移本身应由「零 active 物理屏」触发，见 §5 V-04d Tahoe 结论；13 上该迁移是否自动发生尚未验证）。
 - 锁屏后一度进入「`screenIsLocked=true` 但登录框未呈现」的过渡态（`kCGSessionSecureInputPID=none`、截图纯壁纸），SSH 侧 `type` 注入无效；已清理残留进程。**该状态下恢复登录需人工/屏幕共享**。
+- 补充：在 r4 成功后，又连续做了多次 lock / lock-probe / 屏睡唤醒扰动显示栈，随后尝试独占态 lock 复现验证（`excl-locktest-r1`）时，720p 独占在建屏 `mode-commit ok=true` 后再次 WindowServer 崩溃（PID 37968→42282）。⇒ 再次印证 V-补3：显示栈对「显示重配置类操作」的累积扰动很敏感，健康态 PASS 之后也不宜连续叠加 lock/屏睡/建屏；崩溃后须重新登录充分恢复。该次复现验证失败不影响上面①②的独立证据（r4 PASS 与 Aqua-session lock 对照）。
 
 **边界口径不变**：13 上只有 1280×720 单屏独占 C-09 有真机 PASS；1080p 独占为 OS 层边界；多屏独占与独占态 Path A（V-04d 等价）仍未覆盖。本轮未改产品代码（仅 stream_probe 两个默认关闭的诊断环境变量 + 既有 p2.sh `P2_SAVE_FRAMES`）。
 
