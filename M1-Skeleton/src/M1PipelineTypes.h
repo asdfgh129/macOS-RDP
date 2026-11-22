@@ -38,8 +38,11 @@ typedef NS_ENUM(NSInteger, M1PipelineErrorCode) {
 // 发送器据此置 P1FrameFlagHasParamSets，接收端据此重建 formatDescription。
 @property (nonatomic, assign) BOOL carriesParamSets;
 
-// 编码完成时刻（wall clock ms），用于延迟打点。
+// 编码完成时刻（进程内单调时钟 ms），仅用于同机耗时打点。
 @property (nonatomic, assign) double encodedAtMs;
+
+// 采集时刻（Unix epoch 微秒），随帧头 v3 发给客户端做 capture→render 打点。
+@property (nonatomic, assign) uint64_t capturedAtUs;
 
 // VT 入队到回调产出的耗时，用于编码器健康度观测。
 @property (nonatomic, assign) double encodeLatencyMs;

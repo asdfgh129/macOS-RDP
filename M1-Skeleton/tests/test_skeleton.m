@@ -361,11 +361,13 @@ static void TestFrameSender(void) {
             OK((h.flags & P1FrameFlagLastFragment) != 0, "small-last-fragment-set");
             OK(h.displayID == 101, "small-display-id");
             OK(h.frameSeq == 0, "small-seq-zero");
-            // 帧头 v2 是 18B
-            OK(sink.datagrams[0].length == 18 + 100, "small-datagram-bytes");
+            // 帧头 v3 是 26B
+            OK(sink.datagrams[0].length == P1FrameHeaderSize + 100, "small-datagram-bytes");
+            OK(h.capturedAtUs == 0, "small-capture-ts-default");
         }
         OK(tx.stats.framesSent == 1 && tx.stats.fragmentsSent == 1, "small-stats");
-        OK(tx.stats.bytesSent == 118 && tx.stats.payloadBytesSent == 100, "small-stats-bytes");
+        OK(tx.stats.bytesSent == P1FrameHeaderSize + 100 && tx.stats.payloadBytesSent == 100,
+           "small-stats-bytes");
     }
 
     // --- 关键帧 + 参数集标志（由 M1EncodedFrame 翻译成 P1FrameFlags）---
@@ -376,6 +378,7 @@ static void TestFrameSender(void) {
         f.avccPayload = MakePayload(200, 1);
         f.isKeyframe = YES;
         f.carriesParamSets = YES;
+        f.capturedAtUs = 1763835600123456ULL;
         NSError *err = nil;
         OK([tx sendFrame:f displayID:7 error:&err], "keyframe-send-ok");
         if (sink.datagrams.count == 1) {
@@ -383,6 +386,7 @@ static void TestFrameSender(void) {
             P1UnpackFrameHeader(sink.datagrams[0], &h, NULL);
             OK((h.flags & P1FrameFlagKeyframe) != 0, "keyframe-flag");
             OK((h.flags & P1FrameFlagHasParamSets) != 0, "paramsets-flag");
+            OK(h.capturedAtUs == f.capturedAtUs, "keyframe-capture-ts");
             OK(!(h.flags & P1FrameFlagLastFragment) == NO, "keyframe-single-is-last");
         }
         OK(tx.stats.keyframesSent == 1, "keyframe-stat");
@@ -1175,6 +1179,42 @@ static void TestControlSessionKeyframe(void) {
        err.code == M1ControlSessionErrorInvalidState, "kf-pre-streaming-rejected");
 }
 
+#pragma mark - 控制会话（时钟同步）
+
+static void TestControlSessionTimeSync(void) {
+    printf("=== control session (time sync) ===\n");
+    NSDictionary *r = RunPair(nil, nil, FP(@"ab"), FP(@"cd"));
+    M1ControlSession *client = r[@"client"];
+    M1ControlSession *host = r[@"host"];
+    NSMutableArray<NSArray *> *pending = r[@"pending"];
+    OK(client.reachedStreaming && host.reachedStreaming, "ts-both-streaming");
+
+    NSError *err = nil;
+    OK(![host requestTimeSyncWithError:&err] &&
+       err.code == M1ControlSessionErrorProtocol, "ts-host-cannot-send");
+    OK(!client.hasClockOffset && client.timeSyncSamples == 0, "ts-no-sample-initially");
+
+    err = nil;
+    OK([client requestTimeSyncWithError:&err], "ts-send-probe");
+    Pump(pending);
+    OK(client.timeSyncSamples == 1, "ts-reply-counted");
+    OK(client.hasClockOffset, "ts-offset-set");
+    // 同机同进程时钟，offset 应接近 0；只验数量级，避免依赖 CI 机器负载。
+    OK(llabs((long long)client.clockOffsetUs) < 500000, "ts-offset-small");
+    OK(client.timeSyncRttMs >= 0 && client.timeSyncRttMs < 1000, "ts-rtt-sane");
+
+    // 未进 STREAMING 的 Client 不能发
+    M1MemoryMessageSink *deadSink = [M1MemoryMessageSink new];
+    M1ControlChannel *deadCh = [[M1ControlChannel alloc] initWithSink:deadSink];
+    M1ControlSessionConfig *cfg = [M1ControlSessionConfig new];
+    cfg.role = M1ControlRoleClient;
+    cfg.heartbeatIntervalMs = 0;
+    M1ControlSession *lone = [[M1ControlSession alloc] initWithChannel:deadCh config:cfg];
+    err = nil;
+    OK(![lone requestTimeSyncWithError:&err] &&
+       err.code == M1ControlSessionErrorInvalidState, "ts-pre-streaming-rejected");
+}
+
 #pragma mark - 窗口布局
 
 @interface FakeWindowLayoutProvider : NSObject <M1WindowLayoutProvider>
@@ -1332,6 +1372,7 @@ int main(void) {
         TestControlSessionPairingCode();
         TestControlSessionInput();
         TestControlSessionKeyframe();
+        TestControlSessionTimeSync();
         TestWindowLayout();
         printf("\n=== %d passed, %d failed ===\n", gPass, gFail);
         printf("%s\n", gFail == 0 ? "ALL PASS" : "FAILURES");

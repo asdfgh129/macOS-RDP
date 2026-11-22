@@ -10,8 +10,8 @@ NSString * const P1ProtocolErrorDomain = @"P1ProtocolErrorDomain";
 const NSUInteger P1ControlMaxFrameBytes = 1024 * 1024;  // 1 MiB
 const uint16_t P1FrameMagic = 0x4D52;                   // 'MR'
 const uint8_t  P1ProtocolVersion = 1;      // 控制通道 JSON 版本，与帧头版本相互独立
-const uint8_t  P1FrameHeaderVersion = 2;   // v2：fragIdx/fragCount 扩到 uint16
-const NSUInteger P1FrameHeaderSize = 18;
+const uint8_t  P1FrameHeaderVersion = 3;   // v3：新增 64-bit 采集墙钟（epoch 微秒）
+const NSUInteger P1FrameHeaderSize = 26;
 // QUIC short header + AEAD tag 约 20–30 B，1200 B MTU 下留足头空间（D-01）
 const NSUInteger P1FrameMaxPayload = 1150;
 // fragCount 是 uint16，故单帧最多 65535 片（≈75MB）。v1 的 255 片上限已在 3440×1440
@@ -35,6 +35,14 @@ static uint16_t P1GetU16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1
 static uint32_t P1GetU32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+static void P1PutU64(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (56 - 8 * i));
+}
+static uint64_t P1GetU64(const uint8_t *p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+    return v;
 }
 
 #pragma mark - 控制通道
@@ -163,13 +171,14 @@ NSDictionary *P1DecodeControlMessage(NSData *jsonBytes, NSError **error) {
 #pragma mark - 帧通道
 
 NSData *P1PackFrameHeader(P1FrameHeader h) {
-    // 用字面量 18：P1FrameHeaderSize 是 const NSUInteger（运行期只读），
+    // 用字面量 26：P1FrameHeaderSize 是 const NSUInteger（运行期只读），
     // 不能用作 C 数组长度，否则会退化成 VLA 并触发 -Wgnu-folding-constant。
     //
-    // v2 布局（大端）：
+    // v3 布局（大端）：
     //   0..1 magic | 2 ver | 3 flags | 4..7 displayID | 8..11 frameSeq
     //   | 12..13 fragIdx | 14..15 fragCount | 16..17 payloadLen
-    uint8_t b[18] = {0};
+    //   | 18..25 capturedAtUs（主机 epoch 微秒，用于 A-02 capture→render 打点）
+    uint8_t b[26] = {0};
     P1PutU16(b + 0, P1FrameMagic);
     b[2] = P1FrameHeaderVersion;
     b[3] = h.flags;
@@ -178,13 +187,14 @@ NSData *P1PackFrameHeader(P1FrameHeader h) {
     P1PutU16(b + 12, h.fragIdx);
     P1PutU16(b + 14, h.fragCount);
     P1PutU16(b + 16, h.payloadLen);
+    P1PutU64(b + 18, h.capturedAtUs);
     return [NSData dataWithBytes:b length:P1FrameHeaderSize];
 }
 
 BOOL P1UnpackFrameHeader(NSData *data, P1FrameHeader *out, NSError **error) {
     if (error) *error = nil;
     if (data.length < P1FrameHeaderSize) {
-        if (error) *error = P1Err(P1ProtocolErrorTruncated, @"header shorter than 16 bytes");
+        if (error) *error = P1Err(P1ProtocolErrorTruncated, @"header shorter than 26 bytes");
         return NO;
     }
     const uint8_t *b = data.bytes;
@@ -194,8 +204,8 @@ BOOL P1UnpackFrameHeader(NSData *data, P1FrameHeader *out, NSError **error) {
         return NO;
     }
     if (b[2] != P1FrameHeaderVersion) {
-        // v1 帧头（16B、fragIdx/fragCount 各 1B）不再接受：位宽不够，3440×1440 的关键帧
-        // 会被切成 255 片以上而整帧丢失，属于必须换格式才能修的缺陷，不做兼容回退。
+        // 旧帧头不再接受：v1 位宽不够（3440×1440 关键帧会超过 255 片），
+        // v2 没有采集时间戳（A-02 无法结算 capture→render），都属于必须换格式的缺陷。
         if (error) *error = P1Err(P1ProtocolErrorBadVersion, @"bad frame version");
         return NO;
     }
@@ -206,6 +216,7 @@ BOOL P1UnpackFrameHeader(NSData *data, P1FrameHeader *out, NSError **error) {
     h.fragIdx = P1GetU16(b + 12);
     h.fragCount = P1GetU16(b + 14);
     h.payloadLen = P1GetU16(b + 16);
+    h.capturedAtUs = P1GetU64(b + 18);
 
     if (h.fragCount == 0 || h.fragIdx >= h.fragCount) {
         if (error) *error = P1Err(P1ProtocolErrorBadHeader, @"fragIdx out of range");
@@ -256,6 +267,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 @property (nonatomic, readwrite) uint32_t frameSeq;
 @property (nonatomic, readwrite) BOOL keyframe;
 @property (nonatomic, readwrite) BOOL carriesParamSets;
+@property (nonatomic, readwrite) uint64_t capturedAtUs;
 @property (nonatomic, readwrite, copy) NSData *payload;
 @end
 
@@ -269,6 +281,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
 @property (nonatomic, assign) uint16_t fragCount;
 @property (nonatomic, assign) BOOL keyframe;
 @property (nonatomic, assign) BOOL carriesParamSets;
+@property (nonatomic, assign) uint64_t capturedAtUs;
 @property (nonatomic, assign) double lastProgressMs;   // 最近一次收到新分片的时刻
 @property (nonatomic, assign) BOOL repairEmitted;      // 本帧是否已请求过定向补片
 @property (nonatomic, assign) NSUInteger repairAttempts;  // 已请求次数（含重问）
@@ -713,6 +726,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
         p.displayID = header.displayID;
         p.frameSeq = seq;
         p.fragCount = header.fragCount;
+        p.capturedAtUs = header.capturedAtUs;
         p.lastProgressMs = nowMs;
         p.slots = [NSMutableArray arrayWithCapacity:header.fragCount];
         for (uint16_t i = 0; i < header.fragCount; i++) [p.slots addObject:[NSNull null]];
@@ -757,6 +771,7 @@ NSArray<NSData *> *P1FragmentPayload(NSData *payload, P1FrameHeader proto, NSErr
     frame.frameSeq = p.frameSeq;
     frame.keyframe = p.keyframe;
     frame.carriesParamSets = p.carriesParamSets;
+    frame.capturedAtUs = p.capturedAtUs;
     frame.payload = whole;
     [_partials removeObjectForKey:@(seq)];
     if (p.repairEmitted && p.repairRequestedAtMs > 0 && nowMs > p.repairRequestedAtMs) {

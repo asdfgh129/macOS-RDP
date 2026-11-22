@@ -4,6 +4,7 @@
 //
 
 #import "M1FrameReceiver.h"
+#import "M1WallClock.h"
 #import "ProtocolCodec.h"
 #import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
@@ -84,7 +85,7 @@ static BOOL M1SplitAVCC(NSData *payload,
 @end
 
 @interface M1FrameReceiver () {
-    void (^_onFrame)(CVPixelBufferRef, uint32_t);
+    void (^_onFrame)(CVPixelBufferRef, uint32_t, uint64_t);
     void (^_onNeedKeyframe)(void);
     P1FrameReassembler *_reassembler;
     VTDecompressionSessionRef _decoder;
@@ -117,7 +118,8 @@ static BOOL M1SplitAVCC(NSData *payload,
     _Atomic double _lastDecodeLatencyMs;
     _Atomic double _decoderCreateMs;
 }
-- (void)handleDecodedImage:(CVImageBufferRef)image status:(OSStatus)status;
+- (void)handleDecodedImage:(CVImageBufferRef)image status:(OSStatus)status
+        presentationTimeStamp:(CMTime)pts;
 - (void)absorbReassembledFrame:(P1ReassembledFrame *)frame;
 @end
 
@@ -132,7 +134,7 @@ static void M1DecoderOutput(void *decompressionOutputRefCon,
                             CMTime presentationDuration) {
     @autoreleasepool {
         M1FrameReceiver *rx = (__bridge M1FrameReceiver *)decompressionOutputRefCon;
-        [rx handleDecodedImage:imageBuffer status:status];
+        [rx handleDecodedImage:imageBuffer status:status presentationTimeStamp:presentationTimeStamp];
     }
 }
 
@@ -171,7 +173,7 @@ static double gPrewarmMs = -1;
     });
 }
 
-- (instancetype)initWithOnFrame:(void (^)(CVPixelBufferRef, uint32_t))onFrame
+- (instancetype)initWithOnFrame:(void (^)(CVPixelBufferRef, uint32_t, uint64_t))onFrame
                   onNeedKeyframe:(void (^)(void))onNeedKeyframe {
     NSParameterAssert(onFrame);
     self = [super init];
@@ -231,7 +233,7 @@ static double gPrewarmMs = -1;
 
     if (datagram.length < P1FrameHeaderSize) {
         atomic_fetch_add(&_malformed, 1);
-        if (error) *error = M1RxErr(M1PipelineErrorDecodeFailed, @"datagram 短于 18B 帧头");
+        if (error) *error = M1RxErr(M1PipelineErrorDecodeFailed, @"datagram 短于 26B 帧头");
         return NO;
     }
 
@@ -338,7 +340,7 @@ static double gPrewarmMs = -1;
         return;
     }
 
-    [self decodeFrameData:frameData frameSeq:frame.frameSeq];
+    [self decodeFrameData:frameData frameSeq:frame.frameSeq capturedAtUs:frame.capturedAtUs];
 }
 
 - (void)rebuildFormatDescriptionWithParamSets:(NSArray<NSData *> *)paramSets {
@@ -396,7 +398,8 @@ static double gPrewarmMs = -1;
     CFRelease(fmt);
 }
 
-- (void)decodeFrameData:(NSData *)frameData frameSeq:(uint32_t)frameSeq {
+- (void)decodeFrameData:(NSData *)frameData frameSeq:(uint32_t)frameSeq
+           capturedAtUs:(uint64_t)capturedAtUs {
     if (!_decoder || frameData.length == 0) {
         atomic_fetch_add(&_framesDropped, 1);
         return;
@@ -418,8 +421,10 @@ static double gPrewarmMs = -1;
 
     CMSampleTimingInfo timing = {
         .duration = kCMTimeInvalid,
-        .presentationTimeStamp = CMTimeMakeWithSeconds(
-            [[NSDate date] timeIntervalSince1970], 1000),
+        // PTS 直接承载主机采集 epoch：解码输出回调原样带回，避免另建
+        // 「解码提交 → 输出」映射表（VT 异步且可能重排）。
+        .presentationTimeStamp = CMTimeMake(
+            capturedAtUs > 0 ? (int64_t)capturedAtUs : (int64_t)M1WallClockUs(), 1000000),
         .decodeTimeStamp = kCMTimeInvalid,
     };
     size_t sizes[1] = { frameData.length };
@@ -444,13 +449,19 @@ static double gPrewarmMs = -1;
     (void)frameSeq;
 }
 
-- (void)handleDecodedImage:(CVImageBufferRef)image status:(OSStatus)status {
+- (void)handleDecodedImage:(CVImageBufferRef)image status:(OSStatus)status
+        presentationTimeStamp:(CMTime)pts {
     if (status != noErr || !image) {
         atomic_fetch_add(&_decodeFailures, 1);
         return;
     }
     atomic_fetch_add(&_framesDecoded, 1);
-    if (_onFrame) _onFrame((CVPixelBufferRef)image, _reassembler.lastCompletedSeq);
+    uint64_t capturedAtUs = 0;
+    if (CMTIME_IS_VALID(pts) && pts.timescale > 0 && pts.value > 0) {
+        capturedAtUs = (uint64_t)CMTimeConvertScale(
+            pts, 1000000, kCMTimeRoundingMethod_RoundHalfAwayFromZero).value;
+    }
+    if (_onFrame) _onFrame((CVPixelBufferRef)image, _reassembler.lastCompletedSeq, capturedAtUs);
 }
 
 - (void)reset {

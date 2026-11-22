@@ -62,10 +62,12 @@ NS_ASSUME_NONNULL_BEGIN
 + (void)prewarmDecoder;
 
 // onFrame 在调用 acceptDatagram 的线程上同步回调，pixelBuffer 仅回调期间有效。
-- (instancetype)initWithOnFrame:(void (^)(CVPixelBufferRef pixelBuffer, uint32_t frameSeq))onFrame
+// capturedAtUs 是主机采集 epoch 微秒（帧头 v3），0 表示旧版/未知。
+- (instancetype)initWithOnFrame:(void (^)(CVPixelBufferRef pixelBuffer, uint32_t frameSeq,
+                                          uint64_t capturedAtUs))onFrame
                   onNeedKeyframe:(void (^ _Nullable)(void))onNeedKeyframe;
 
-// 交入一个完整 datagram（16B 帧头 + 载荷）。
+// 交入一个完整 datagram（26B 帧头 + 载荷）。
 // 返回 YES 表示该 datagram 被正确解析并吸收（不代表已出画面）。
 - (BOOL)acceptDatagram:(NSData *)datagram error:(NSError * _Nullable * _Nullable)error;
 

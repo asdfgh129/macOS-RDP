@@ -45,6 +45,11 @@ static NSError *M1PipeErr(M1PipelineErrorCode code, NSString *msg) {
 @property (nonatomic, strong) NSMutableArray<NSNumber *> *fragCacheOrder;
 @property (nonatomic, strong) NSLock *cacheLock;
 @property (nonatomic, assign) uint64_t fragmentsResent;
+- (BOOL)sendPayload:(NSData *)payload
+          displayID:(uint32_t)displayID
+              flags:(P1FrameFlags)flags
+       capturedAtUs:(uint64_t)capturedAtUs
+              error:(NSError **)error;
 @end
 
 @implementation M1FrameSender
@@ -81,12 +86,21 @@ static NSError *M1PipeErr(M1PipelineErrorCode code, NSString *msg) {
     P1FrameFlags flags = 0;
     if (frame.isKeyframe) flags |= P1FrameFlagKeyframe;
     if (frame.carriesParamSets) flags |= P1FrameFlagHasParamSets;
-    return [self sendPayload:frame.avccPayload displayID:displayID flags:flags error:error];
+    return [self sendPayload:frame.avccPayload displayID:displayID flags:flags
+                capturedAtUs:frame.capturedAtUs error:error];
 }
 
 - (BOOL)sendPayload:(NSData *)payload
           displayID:(uint32_t)displayID
               flags:(P1FrameFlags)flags
+              error:(NSError **)error {
+    return [self sendPayload:payload displayID:displayID flags:flags capturedAtUs:0 error:error];
+}
+
+- (BOOL)sendPayload:(NSData *)payload
+          displayID:(uint32_t)displayID
+              flags:(P1FrameFlags)flags
+       capturedAtUs:(uint64_t)capturedAtUs
               error:(NSError **)error {
     if (error) *error = nil;
     if (payload.length == 0) {
@@ -99,6 +113,7 @@ static NSError *M1PipeErr(M1PipelineErrorCode code, NSString *msg) {
     proto.flags = (uint8_t)(flags & (uint8_t)~P1FrameFlagLastFragment);
     proto.displayID = displayID;
     proto.frameSeq = _seq;
+    proto.capturedAtUs = capturedAtUs;
     uint32_t seq = _seq;
 
     NSError *fragErr = nil;

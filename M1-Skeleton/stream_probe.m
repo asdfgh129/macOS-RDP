@@ -425,6 +425,20 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     self.streaming = YES;
     if (self.streamStartMs == 0) self.streamStartMs = NowMs();
     dispatch_semaphore_signal(self.streamingSem);
+
+    // A-02：进入 STREAMING 后打 8 个时钟同步探针（200ms 起步、150ms 间隔）。
+    // 取 RTT 最小的样本，避免控制队列排队时间被误算成时钟差。
+    if (!self.isHost) {
+        for (int i = 0; i < 8; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(200 + i * 150) * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                if (session.stateMachine.state == P1SessionStateStreaming) {
+                    [session requestTimeSyncWithError:NULL];
+                }
+            });
+        }
+    }
 }
 
 - (void)controlSession:(M1ControlSession *)session didFailWithError:(NSError *)error {
@@ -492,7 +506,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 @property (nonatomic, assign) int32_t decodedHeight;
 @property (nonatomic, copy) NSMutableArray<NSString *> *savedPaths;
 // 每一帧解码结果的直通出口（窗口上屏用）。在帧队列上回调，实现方需自行切线程。
-@property (nonatomic, copy, nullable) void (^onPixelBuffer)(CVPixelBufferRef pb, uint32_t frameSeq);
+@property (nonatomic, copy, nullable) void (^onPixelBuffer)(CVPixelBufferRef pb, uint32_t frameSeq,
+                                                            uint64_t capturedAtUs);
 @end
 
 @implementation StreamClientNode
@@ -510,7 +525,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 - (void)prepareReceiver {
     __weak typeof(self) weakSelf = self;
     self.receiver = [[M1FrameReceiver alloc]
-        initWithOnFrame:^(CVPixelBufferRef pb, uint32_t frameSeq) {
+        initWithOnFrame:^(CVPixelBufferRef pb, uint32_t frameSeq, uint64_t capturedAtUs) {
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
             double now = NowMs();
@@ -519,7 +534,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
             self.decodedWidth = (int32_t)CVPixelBufferGetWidth(pb);
             self.decodedHeight = (int32_t)CVPixelBufferGetHeight(pb);
             // 上屏：M1FrameView 内部自己 Retain + 转线程，这里直接递过去
-            if (self.onPixelBuffer) self.onPixelBuffer(pb, frameSeq);
+            if (self.onPixelBuffer) self.onPixelBuffer(pb, frameSeq, capturedAtUs);
 
             // PNG 编码必须离开接收/解码线程。
             //
@@ -1487,8 +1502,8 @@ int main(int argc, char **argv) {
             __weak M1FrameView *weakView = frameView;
             __weak StreamClientNode *weakClient = client;
             __block BOOL printedAnchors = NO;
-            client.onPixelBuffer = ^(CVPixelBufferRef pb, uint32_t seq) {
-                [weakView presentPixelBuffer:pb];
+            client.onPixelBuffer = ^(CVPixelBufferRef pb, uint32_t seq, uint64_t capturedAtUs) {
+                [weakView presentPixelBuffer:pb capturedAtUs:capturedAtUs];
                 // 首帧到了才有 videoSize，才能算「画面中心」的全局坐标。
                 // 驱动端不能拿「屏幕中心」当「画面中心」：窗口内容里视频是按比例
                 // letterbox 的，屏幕中心很可能落在黑边上，而黑边按设计不产生输入
@@ -1724,12 +1739,38 @@ int main(int argc, char **argv) {
         PrintFlowStats(client, "client");
         printf("  状态序列: %s\n", [client.stateLog componentsJoinedByString:@" → "].UTF8String);
         if (frameView) {
-            printf("  上屏：%lu 帧（丢 %lu 积压 / 跳过 %lu 不可见），"
-                   "单帧渲染最近 %.1f ms / 峰值 %.1f ms\n",
+            printf("  上屏：%lu 帧（积压丢 %lu / 无 surface %lu / 跳过 %lu 不可见），"
+                   "单帧渲染最近 %.1f ms / 峰值 %.1f ms，p50 %.1f / p95 %.1f ms\n",
                    (unsigned long)frameView.framesRendered,
-                   (unsigned long)frameView.framesDropped,
+                   (unsigned long)frameView.renderDropped,
+                   (unsigned long)frameView.renderFailed,
                    (unsigned long)frameView.framesSkippedOccluded,
-                   frameView.lastRenderMs, frameView.maxRenderMs);
+                   frameView.lastRenderMs, frameView.maxRenderMs,
+                   frameView.renderP50Ms, frameView.renderP95Ms);
+            BOOL hasOffset = client.session.hasClockOffset;
+            double offsetMs = hasOffset ? (double)client.session.clockOffsetUs / 1000.0 : 0;
+            double p50 = frameView.presentLatencyP50Ms + offsetMs;
+            double p95 = frameView.presentLatencyP95Ms + offsetMs;
+            double last = frameView.lastPresentLatencyMs + offsetMs;
+            double maxLat = frameView.maxPresentLatencyMs + offsetMs;
+            if (frameView.presentLatencySamples == 0) {
+                printf("  capture→render：无样本（帧头未携带采集时间戳）\n");
+            } else if (!hasOffset) {
+                printf("  capture→render：样本 %lu，时钟差未同步，"
+                       "原始 p50 %.1f / p95 %.1f / 最大 %.1f ms（含两端墙钟偏差）\n",
+                       (unsigned long)frameView.presentLatencySamples,
+                       frameView.presentLatencyP50Ms, frameView.presentLatencyP95Ms,
+                       frameView.maxPresentLatencyMs);
+            } else {
+                printf("  capture→render：样本 %lu，主机时钟差 %+.1f ms"
+                       "（RTT %.1f ms / %lu 样本），p50 %.1f / p95 %.1f / 最近 %.1f / 最大 %.1f ms\n",
+                       (unsigned long)frameView.presentLatencySamples, offsetMs,
+                       client.session.timeSyncRttMs, (unsigned long)client.session.timeSyncSamples,
+                       MAX(0.0, p50), MAX(0.0, p95), MAX(0.0, last), MAX(0.0, maxLat));
+            }
+            printf("  渲染队列：pending 峰值 %lu，入队等待峰值 %.1f ms，主线程贴层等待峰值 %.1f ms\n",
+                   (unsigned long)frameView.maxPendingRenders,
+                   frameView.maxQueueWaitMs, frameView.maxMainWaitMs);
             printf("  输入：窗口采集 %lu 条 → 发出 %lu / 丢弃 %lu / 拒绝 %lu\n",
                    (unsigned long)frameView.inputEventsEmitted,
                    (unsigned long)client.session.inputEventsSent,
@@ -1789,6 +1830,10 @@ int main(int argc, char **argv) {
                                             client.decodedHeight == effectiveH);
         }
         json[@"decodeFps"] = @(round(decodeFps * 10) / 10.0);
+        json[@"timeSyncOffsetUs"] = @((long long)client.session.clockOffsetUs);
+        json[@"timeSyncRttMs"] = @(round(client.session.timeSyncRttMs * 10) / 10.0);
+        json[@"timeSyncSamples"] = @(client.session.timeSyncSamples);
+        json[@"hasClockOffset"] = @(client.session.hasClockOffset);
         json[@"lastDecodeLatencyMs"] = @(round(rs.lastDecodeLatencyMs * 10) / 10.0);
         json[@"firstFrameLatencyMs"] = @(round(firstFrameLatency));
         json[@"decoderPrewarmMs"] = @(round(rs.decoderPrewarmMs));
@@ -1805,9 +1850,25 @@ int main(int argc, char **argv) {
             json[@"windowed"] = @YES;
             json[@"framesRendered"] = @(frameView.framesRendered);
             json[@"renderDropped"] = @(frameView.framesDropped);
+            json[@"renderDroppedBacklog"] = @(frameView.renderDropped);
+            json[@"renderFailed"] = @(frameView.renderFailed);
+            json[@"maxPendingRenders"] = @(frameView.maxPendingRenders);
+            json[@"renderP50Ms"] = @(round(frameView.renderP50Ms * 10) / 10.0);
+            json[@"renderP95Ms"] = @(round(frameView.renderP95Ms * 10) / 10.0);
+            json[@"maxRenderQueueWaitMs"] = @(round(frameView.maxQueueWaitMs * 10) / 10.0);
+            json[@"maxRenderMainWaitMs"] = @(round(frameView.maxMainWaitMs * 10) / 10.0);
             json[@"renderSkippedOccluded"] = @(frameView.framesSkippedOccluded);
             json[@"lastRenderMs"] = @(round(frameView.lastRenderMs * 10) / 10.0);
             json[@"maxRenderMs"] = @(round(frameView.maxRenderMs * 10) / 10.0);
+            BOOL hasOffset = client.session.hasClockOffset;
+            double offsetMs = hasOffset ? (double)client.session.clockOffsetUs / 1000.0 : 0;
+            json[@"presentLatencySamples"] = @(frameView.presentLatencySamples);
+            json[@"captureToRenderClockCorrected"] = @(hasOffset);
+            BOOL latHasSamples = frameView.presentLatencySamples > 0;
+            json[@"captureToRenderP50Ms"] = @(latHasSamples ? round(MAX(0.0, frameView.presentLatencyP50Ms + offsetMs) * 10) / 10.0 : 0.0);
+            json[@"captureToRenderP95Ms"] = @(latHasSamples ? round(MAX(0.0, frameView.presentLatencyP95Ms + offsetMs) * 10) / 10.0 : 0.0);
+            json[@"captureToRenderLastMs"] = @(latHasSamples ? round(MAX(0.0, frameView.lastPresentLatencyMs + offsetMs) * 10) / 10.0 : 0.0);
+            json[@"captureToRenderMaxMs"] = @(latHasSamples ? round(MAX(0.0, frameView.maxPresentLatencyMs + offsetMs) * 10) / 10.0 : 0.0);
             json[@"inputEmitted"] = @(frameView.inputEventsEmitted);
             json[@"inputSynthPosted"] = @(synthPosted);
             json[@"inputDriver"] = manualSecs > 0 ? @"manual"

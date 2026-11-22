@@ -4,6 +4,7 @@
 //
 
 #import "M1ControlSession.h"
+#import "M1WallClock.h"
 #import "ProtocolCodec.h"
 #import "P1InputCodec.h"
 #include <stdatomic.h>
@@ -53,6 +54,10 @@ static NSString *M1ArchName(void) {
     atomic_uint_fast64_t _nacksReceived;
     _Atomic double _lastNackMs;
     _Atomic double _lastWholeNackMs;
+    atomic_bool _hasClockOffset;
+    _Atomic int64_t _clockOffsetUs;
+    _Atomic double _timeSyncRttMs;
+    atomic_uint_fast64_t _timeSyncSamples;
 }
 @property (nonatomic, strong) M1ControlChannel *channel;
 @property (nonatomic, strong) M1ControlSessionConfig *config;
@@ -96,6 +101,10 @@ static NSString *M1ArchName(void) {
         atomic_init(&_nacksReceived, 0);
         atomic_store(&_lastNackMs, 0.0);
         atomic_store(&_lastWholeNackMs, 0.0);
+        atomic_init(&_hasClockOffset, false);
+        atomic_init(&_clockOffsetUs, 0);
+        atomic_store(&_timeSyncRttMs, 0.0);
+        atomic_init(&_timeSyncSamples, 0);
         _inputLimiter = [[P1InputRateLimiter alloc] initWithEventsPerSecond:P1InputMaxEventsPerSecond];
         channel.delegate = self;
     }
@@ -202,6 +211,8 @@ static NSString *M1ArchName(void) {
     else if ([type isEqualToString:@"keyframe-request"]) [self handleKeyframeRequest:message];
     else if ([type isEqualToString:@"frame-nack"])       [self handleFrameNack:message];
     else if ([type isEqualToString:@"keyframe-sent"])    { /* Host 的确认，统计不依赖它 */ }
+    else if ([type isEqualToString:@"time-sync"])        [self handleTimeSync:message];
+    else if ([type isEqualToString:@"time-sync-reply"])  [self handleTimeSyncReply:message];
     else if ([type isEqualToString:@"bye"] || [type isEqualToString:@"session-error"]) {
         self.closed = YES;
         [self stopHeartbeat];
@@ -645,6 +656,62 @@ static NSString *M1ArchName(void) {
                                indices:indices];
     }
 }
+
+#pragma mark - 时钟同步
+
+- (BOOL)requestTimeSyncWithError:(NSError **)error {
+    if (error) *error = nil;
+    if (self.role != M1ControlRoleClient) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorProtocol,
+            @"只有 Client 发起 time-sync");
+        return NO;
+    }
+    if (self.closed || self.stateMachine.state != P1SessionStateStreaming) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorInvalidState,
+            @"会话未处于 STREAMING，time-sync 未发送");
+        return NO;
+    }
+    return [self sendPayload:@{ @"type": @"time-sync", @"t0": @(M1WallClockUs()) }];
+}
+
+- (void)handleTimeSync:(NSDictionary *)msg {
+    if (self.role != M1ControlRoleHost) return;   // Client 收到同向探针说明对端实现错位
+    if (self.closed || self.stateMachine.state != P1SessionStateStreaming) return;
+    NSNumber *t0 = msg[@"t0"];
+    if (![t0 isKindOfClass:[NSNumber class]]) return;
+    [self sendPayload:@{ @"type": @"time-sync-reply",
+                         @"t0": t0,
+                         @"t1": @(M1WallClockUs()) }];
+}
+
+- (void)handleTimeSyncReply:(NSDictionary *)msg {
+    if (self.role != M1ControlRoleClient) return;
+    NSNumber *t0n = msg[@"t0"];
+    NSNumber *t1n = msg[@"t1"];
+    if (![t0n isKindOfClass:[NSNumber class]] ||
+        ![t1n isKindOfClass:[NSNumber class]]) return;
+    uint64_t t0 = t0n.unsignedLongLongValue;
+    uint64_t t1 = t1n.unsignedLongLongValue;
+    uint64_t t2 = M1WallClockUs();
+    if (t0 == 0 || t1 == 0 || t2 <= t0) return;
+    double rttMs = (double)(t2 - t0) / 1000.0;
+    // 超长样本多半是控制队列被阻塞，偏移包含排队噪声，直接丢弃。
+    if (rttMs > 5000.0) return;
+    int64_t offsetUs = (int64_t)t1 - (int64_t)((t0 + t2) / 2);
+    @synchronized (self) {
+        if (!atomic_load(&_hasClockOffset) || rttMs <= atomic_load(&_timeSyncRttMs)) {
+            atomic_store(&_clockOffsetUs, offsetUs);
+            atomic_store(&_timeSyncRttMs, rttMs);
+            atomic_store(&_hasClockOffset, true);
+        }
+        atomic_fetch_add(&_timeSyncSamples, 1);
+    }
+}
+
+- (BOOL)hasClockOffset { return atomic_load(&_hasClockOffset); }
+- (int64_t)clockOffsetUs { return atomic_load(&_clockOffsetUs); }
+- (double)timeSyncRttMs { return atomic_load(&_timeSyncRttMs); }
+- (NSUInteger)timeSyncSamples { return (NSUInteger)atomic_load(&_timeSyncSamples); }
 
 #pragma mark - 心跳
 

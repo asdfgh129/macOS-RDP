@@ -160,6 +160,18 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 @property (nonatomic, readonly) NSUInteger frameNacksSent;            // Client 发出的补片请求
 @property (nonatomic, readonly) NSUInteger frameNacksReceived;        // Host 收到并回调
 
+#pragma mark - 时钟同步（A-02）
+
+// Client：发一条 time-sync 探针；Host 收到后立刻回带 host epoch 微秒。
+// 只应在 STREAMING 态调用；非 STREAMING 返回 NO（INVALID_STATE）。
+// 取多次样本中 RTT 最小的一次估 offset，避免把排队延迟算进时钟差。
+- (BOOL)requestTimeSyncWithError:(NSError * _Nullable * _Nullable)error;
+
+@property (nonatomic, readonly) BOOL hasClockOffset;
+@property (nonatomic, readonly) int64_t clockOffsetUs;   // host epoch - client epoch
+@property (nonatomic, readonly) double timeSyncRttMs;    // 当前 offset 样本的往返时延
+@property (nonatomic, readonly) NSUInteger timeSyncSamples;
+
 @end
 
 NS_ASSUME_NONNULL_END

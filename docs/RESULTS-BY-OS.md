@@ -1472,6 +1472,12 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - 真实 client 1080p20 镜像 30s（Tahoe 26.5.2 host 主屏 3440×1440→1920×1080 + 全屏动画）：host `complete=20/s idle=0`、framesCaptured 589 / sent 588；client 解码 19.2fps、上屏 504、积压丢弃 66、`lastRenderMs=3.9`、`maxRenderMs=209.4`（启动尖峰）、规格断言 PASS、`p2.sh summary` PASS。
 - ⇒ 1080p20 的客户端渲染下限约 **4ms**，相对 50ms 帧预算有 10× 余量；积压丢弃来自重组/队列而非渲染成本。当前 harness 只有 last/max，p50/p95 需后续加分位数统计。
 
+**P2.3 上屏积压收口（2026-11-22 22:0x，同环境，1080p20 镜像 30s）**：
+- 复现与定位：上轮 `renderDropped=66`，但转换 p50 仅 4.5ms、主线程贴层等待约 0.2ms，说明不是渲染慢。根因是积压上限 2 帧：网络/解码突发时转换队列短暂超过 2，新帧被误判丢弃；且主线程贴层完成前槽位不释放，进一步压缩余量。将槽位改为转换完成即释放（主线程等待单独计量）后，上限 2 仍丢 67；上限 8 降至 2；上限 12 为 0，保留 12（极端突发理论排队上限约 54ms，实测峰值 8 帧）。
+- 新增观测：`presentPixelBuffer` 记录 pending 峰值、转换耗时 1ms 直方图 p50/p95、入队等待、主线程贴层等待；client JSON/log 输出 `renderDroppedBacklog`、`renderFailed`、`maxPendingRenders`、`renderP50Ms/P95Ms`、`maxRenderQueueWaitMs/MainWaitMs`。
+- 最终 `p23-client-1122f` / `p23-mirror-1122f`：host 589 采集 / 588 发出，client 587/587 解出并上屏，积压丢 0、无 surface 0，`maxPendingRenders=8`，转换 p50/p95 = **4.5/20.5ms**，主线程贴层等待峰值 0.1ms，解码 **19.8fps**，summary PASS。`maxQueueWaitMs=241.5`（`maxRenderMs=242.6`）只出现在首帧 1080p 冷转换，之后稳态无积压；`render_selftest` ALL PASS，单测 280/280。
+- ⇒ P2.3「1080p20 跨机满帧 + 上屏队列 0 积压」达成；A-02 glass-to-glass 仍开放。
+
 **P2.3 测量环境要点**：Qoder 常驻时即使 `nice -20` 也会出现 500–875ms 调度尖峰（nice 不约束 GPU/WindowServer）；把 Qoder 窗口最小化后 WindowServer 从 24% 降到 5%，配合暂停 mds 才能得到上述稳定值。专用户会话是更彻底的隔离方式。
 
 ### 5.34 M1 窗口布局快照/恢复落地：纯逻辑计划器 + AX 注入 + Tahoe 独占闭环（2026-11-22 21:1x 实现与 Sequoia 只读验证；22:0x–22:3x Tahoe 26.5.2 闭环）
@@ -1498,6 +1504,39 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 **仍未覆盖**：Ventura 13 的独占窗口恢复（今晚不测 Ventura）；多屏独占下的窗口布局恢复；AX 未授权时整轮 skip 的产品态行为（单测覆盖，未在 Tahoe 真机验证）。Sequoia 本机未跑完整独占（禁物理屏会黑屏），采集/计划/执行链路已由单测 + 只读探针 + Tahoe 闭环覆盖。
 
+### 5.35 A-02 打点落地：帧头 v3 内嵌采集时刻 + time-sync，单机环回冒烟与首轮跨机 capture→render（2026-11-22 22:1x–23:0x）
+
+**结论先说**：A-02 的测量手段（capture→render）已落地，并在 Tahoe 26.5.2 host 解锁后取得**首轮跨机数据**：1080p20 镜像、WAN 路径，p50 ≈ **94–95ms**（两轮 583/767 帧），p95 206–231ms。测量路径本身先暴露了一个符号错误（见下），修正后样本完整。**glass-to-glass 仍未测**（无相机/硬件打点），A-02 保持开放。
+
+**实现（协议 + 两端）**：
+- 帧头 **v2(18B) → v3(26B)**：偏移 18 起 8 字节大端 `capturedAtUs`（Host 采集时的 Unix epoch 微秒，0=未知）。Host 在像素缓冲进编码器时打点，编码回调按 PTS 回填 `M1EncodedFrame`；Client 把它作为解码 sample buffer 的 PTS，VT 输出回调带回，`M1FrameView` 在主线程贴层时与本地 `CLOCK_REALTIME` 相减。
+- 控制通道新增 `time-sync {t0}` / `time-sync-reply {t0,t1}`，仅 STREAMING 态；Client 收 `t2` 后算 `offset=t1−(t0+t2)/2`，只保留最小 RTT 样本，RTT>5s 丢弃。v3 与 v2 不兼容，双端必须同版本重建。
+- `M1FrameView` 新增 256×1ms 原始延迟直方图、样本数、last/max；`stream_probe` client JSON 新增 `timeSyncOffsetUs/RttMs/Samples/hasClockOffset` 与 `captureToRenderP50Ms/P95Ms/LastMs/MaxMs`。
+- 验证：本机与 Tahoe host 单测均 **291/291 PASS**；host 构建无错误（仅两条无害 VLA 折叠 warning）。
+
+**Sequoia 15.5 单机环回（host/client 同机，1080p20 镜像，25s/20s，`/tmp/m1-clock` 制造动态内容，Qoder 最小化，Screen Sharing 窗口隐藏但连接保持）**：
+- host：SCK `3008x1692@60`、`scale=2.00`、`out=1920x1080`、`res=best`；captured 385 / encoded 383 / sent 383，`dropPreEnc=0 encFail=0 sendFail=0`，firstFrame 288ms。
+- client：382/382 解出并上屏、积压丢 0、无 surface 0，解码 **19.8fps**，规格断言 PASS，`p2.sh summary` PASS；转换 p50/p95 = 29.5/47.5ms，pending 峰值 4，主线程贴层等待 0.2ms。
+- capture→render：样本 382，时钟差 **+54µs**（RTT 0.7ms / 8 样本），p50 **49.4ms**、p95 187.4ms、last 45.6ms、max 429.3ms（首帧冷启动尖峰）。
+- 前一环回（Screen Sharing 可见、静态桌面）host 25s 仅 97 帧、解码 5.0fps、capture→render p50 255.5ms（时钟差 39µs / RTT 1.3ms），仅证明打点通路，**数值作废**。
+
+**首次跨机运行暴露符号错误（2026-11-22 22:5x，Tahoe host 已从锁屏恢复：console=bemin、`IOConsoleLocked=No`）**：
+- r1（修正前）1080p20 镜像 30s：client 586/586 解出、19.7fps、0 丢、summary PASS，但 `capture→render` 只有 **380/586** 样本且 p50=0.0。原因有二：① 原始差 `client_now − capturedAtUs` 在主机时钟超前时为负，旧直方图直接丢弃负样本（被丢的 206 帧恰是延迟较低的帧，样本偏向慢帧）；② 报告端把 host−client 时钟差 **减去**了，正确方向是 **加回**（`capturedAtUs` 是主机时钟）。r1 的 raw p50 恰好≈时钟差 87.2ms，减去后归零。
+- 修正：`M1FrameView` 的 capture→render 直方图改为 **-512ms 起的 2048 桶有符号 1ms 直方图**，`stream_probe` 报告端改为 `raw + offset` 并钳到 ≥0。双端重建后单测仍 291/291。
+
+**跨机复测（修正后，Tahoe 26.5.2 host × Sequoia 15.5 client，WAN `112.5.32.34:46600`，host 主屏 `2026701824` 全屏彩条动画，镜像 1080p20，Qoder 最小化、Screen Sharing 隐藏）**：
+
+| 轮次 | host 采集/编码/发出 | client 解出/上屏 | 解码 fps | 时钟差 / RTT | capture→render p50 / p95 / max | 渲染 p50 / p95 | summary |
+|---|---|---|---|---|---|---|---|
+| r2 30s | 588 / 587 / 587 | 583 / 583（丢 0） | 19.7 | +88.6ms / 7.1ms | **95.1 / 231.1 / 549.2ms** | 4.5 / 37.5ms | PASS |
+| r3 40s | 785 / 784 / 784 | 767 / 767（丢 0） | 19.2 | +87.7ms / 8.7ms | **94.2 / 206.2 / 637.7ms** | 4.5 / 6.5ms | PASS |
+
+- 两轮 p50 稳定在 94–95ms；样本数与上屏帧数一致（583/583、767/767），说明负样本丢失已修掉。r3 入队等待峰值仅 38.3ms、主线程贴层等待 1.5ms，渲染不是瓶颈；r2 有一次 434ms 入队尖峰（对应 p95 尾部）。
+- 主机时钟比客户端快约 **88ms**（两轮一致），控制通道 RTT 7–9ms，说明这段 WAN 单程很低；p95 的 200ms 级尾部更像编码/SCK 批次与偶发排队，而不是网络 RTT。
+- 首帧延迟 105ms（r2）/ 93ms（r3），补片 36/64 次全部命中，关键帧请求 0。
+
+**口径**：① 单机环回中采集编码与解码渲染争同一条 GPU/WindowServer，且 Screen Sharing 仍在解码 Tahoe 3440×1440 画面，p50≈一个帧间隔（50ms）更像排队节拍，p95 尾部是竞争噪声，**仅作冒烟**；② 跨机数字是 **capture→render**，不含显示器扫描、摄像头采样，**不等于 glass-to-glass**；③ 跨机样本仅来自一轮会话的两种时长（30s/40s），尚未做多时段/多网络条件采样。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
@@ -1507,13 +1546,15 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 | A-07 13–26 双角色 | — | — | ⚠️ 部分收敛：client 全角色 PASS（§5.24）；host 的 SCK 被系统拒绝但 CG 回退可用，镜像 + 虚拟屏 keep-main 双机全链路 PASS（§5.27/§5.28），真实系统输入注入 PASS（光标位移 >1000px），SPI 建虚拟屏 PASS，帧率 ~14.8fps@720p；锁屏态改用 CGDisplayCreateImage 后端后可看见登录界面并接受键入，14.9fps@720p（§5.29）；**1280×720 完整独占禁屏/C-09 加 ScreensharingAgent 竞态规避后已 PASS（§5.30）**，健康态复测再次全链路 PASS（§5.32）；1920×1080 独占触发 WindowServer layer-blit 崩溃为该机型 OS 层边界、不重试；多屏独占未覆盖（§5.31） |
 | A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
 | A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） | ✅ 镜像模式 Path A 端到端 PASS（V-04a/b/c 等价）：锁屏且防睡眠下 CGDisplayCreateImage 后端看到完整登录界面（14.9fps），定向键入使密码框出现圆点，真实口令注入后 `locked=0 / ok=1`、回到桌面（§5.29）。**独占禁屏下的登录窗迁移（V-04d 等价）仍未实测**：补测被建屏阶段的控制通道重传放弃与 WindowServer layer-blit 崩溃阻断（§5.31）；健康态独占全链路虽 PASS，但独占态下 `SACLockScreenImmediate` 静默失效（须 Aqua session 且物理屏全禁时不生效），登录 UI 未呈现（§5.32） |
-| A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。2026-11-19 跨公网已取得首批双机数据（§5.13，Tahoe host × Sequoia client）：1080p20 客户端渲染 84.7ms/帧、解码/发出 54/375；720p10 渲染 41.6ms、上屏 0 积压；补测 C/D 拿到完整配对（3440×1440 → 7 解出；720p15 → 136/443，丢包 4–6% + 严格按序重组等关键帧是主因）。无 60fps / glass-to-glass 证据，A-02 保持开放，见 D-10 |
+| A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。2026-11-19 跨公网已取得首批双机数据（§5.13，Tahoe host × Sequoia client）：1080p20 客户端渲染 84.7ms/帧、解码/发出 54/375；720p10 渲染 41.6ms、上屏 0 积压；补测 C/D 拿到完整配对（3440×1440 → 7 解出；720p15 → 136/443，丢包 4–6% + 严格按序重组等关键帧是主因）。无 60fps / glass-to-glass 证据，A-02 保持开放，见 D-10。**2026-11-22 打点落地（§5.35）**：帧头 v3 内嵌 `capturedAtUs` + 控制通道 `time-sync`；Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，1080p20 镜像）两轮 capture→render **p50 94–95ms / p95 206–231ms**（时钟差 ~88ms、RTT 7–9ms），玻璃到玻璃仍未测 |
 
 ---
 
 ## 7. 变更记录
 
-- v0.61-draft 2026-11-22 21:5x：**P2.3 干净基线（§5.33）**。Qoder 最小化 + mds 暂停 + nice -20 后，离屏 8 轮：720p 3.2ms、1080p 5.3ms（p95 10.4ms）、ultrawide 13.2ms，0 失败；真实 client 1080p20 镜像 30s：host complete=20/idle=0、589→588 帧，client 19.2fps、上屏 504、`lastRenderMs=3.9`、`maxRenderMs=209.4`（启动尖峰）、summary PASS。⇒ 1080p20 渲染下限 ~4ms，积压丢弃不来自渲染；Qoder 常驻时的 500–875ms 尖峰是 WindowServer/GPU 竞争，nice 无法消除，需最小化或专用户隔离。
+- v0.63-draft 2026-11-22 23:0x：**A-02 打点落地 + 首轮跨机 capture→render（§5.35）**。帧头 v2→v3（26B，偏移 18 起 8B `capturedAtUs`），Host 采集打点经编码 PTS 回填、Client 用其作解码 PTS 并在贴层处算原始差；控制通道新增 `time-sync`/`time-sync-reply`（最小 RTT 估时钟差）。首次跨机暴露符号错误：原始差为负的帧被直方图丢弃、报告端又减了时钟差，导致 p50=0、样本仅 380/586；改为 -512ms 起的有符号直方图并改回 `raw+offset` 后，Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，1080p20 镜像）两轮：r2 583 帧 p50/p95 95.1/231.1ms、r3 767 帧 94.2/206.2ms，时钟差 ~88ms、RTT 7–9ms、解码 19.2–19.7fps、0 丢、summary PASS。单测双端 291/291。glass-to-glass 仍开放。
+- v0.62-draft 2026-11-22 22:1x：**P2.3 上屏积压收口（§5.33）**。上轮 66 帧丢弃来自 2 帧积压上限而非渲染成本（转换 p50 4.5ms）：槽位改为转换完成即释放，上限 8 时剩 2 帧、12 时归零。1080p20 镜像最终轮 host 589 采集/588 发出，client 587/587 解出并上屏、积压丢 0、`maxPendingRenders=8`、p50/p95 4.5/20.5ms、主线程等待 0.1ms、解码 19.8fps、summary PASS；新增 pending/直方图/入队与主线程等待指标及 client JSON 字段。单测 280/280、render_selftest ALL PASS。⇒ P2.3 完成判据达成，A-02 仍开放。
+- v0.61-draft 2026-11-22 21:5x：**P2.3 干净基线（§5.33）**。Qoder 最小化 + mds 暂停 + nice -20 后，离屏 8 轮：720p 3.2ms、1080p 5.3ms（p95 10.4ms）、ultrawide 13.2ms，0 失败；真实 client 1080p20 镜像 30s：host complete=20/idle=0、589→588 帧，client 19.2fps、上屏 504、`lastRenderMs=3.9`、`maxRenderMs=209.4`（启动尖峰）、summary PASS。⇒ 1080p20 渲染下限 ~4ms，积压丢弃不来自渲染；Qoder 常驻时的 500–875ms 尖峰是 WindowServer/GPU 竞争，nice 无法消除，需最小化或专用户隔离。该轮 66 帧积压已在 v0.62 收口。
 - v0.60-draft 2026-11-22 22:4x：**M1 窗口布局恢复 Tahoe 独占闭环（§5.34）+ best 镜像真机复测（§5.33）**。Tahoe 26.5.2 host 独占：r5 自然场景 `planned=0`（该版本 WindowServer 自动还原，D-05 未复现）；r6 强移 Terminal 窗口到 (150,306) 后 `captured=23 planned=7 restored=7 failed=0`，恢复后窗口回到快照位置 (464,131)，C-09 verified、client PASS。修复：AX 枚举空重试、当前 CG frame + 8pt 容差匹配、2s 单窗超时、预算 `max(3,min(10,0.7N))` 秒、恢复 settle 1.0s。3440×1440→1080p20 镜像真机 `res=best` 生效，20fps 采集、client 19.6fps 全 PASS；P2.3 空闲渲染基线仍被本机负载污染，未收口。
 - v0.59-draft 2026-11-22 21:1x：**M1 窗口布局快照/恢复落地（§5.34）**。新增 `M1WindowLayout`：禁屏前采集 CGWindowList 窗口布局 + 屏幕 bounds，恢复后按 `pid#windowNumber` 精确匹配、只搬被禁屏上位移过的窗口，目标 frame 夹取到可见区域；AX 未授权时只计划不搬。驱动接线在建屏前拍快照、恢复并销毁虚拟屏后执行搬窗，`stream_probe` 输出 `windowLayoutRestore` 摘要。单测 280/280（新增 12 条），四个构建目标无 warning；本机 Sequoia 只读探针 `axTrusted=true`、4 窗口全部映射到已知屏。真实禁屏闭环留待下一轮 Tahoe 独占会话验证。
 - v0.58-draft 2026-11-22 20:3x：**采集分辨率默认 best，见 §5.33**。`M1FramePipelineConfig.captureResolution` 默认 0→1，macOS 14+ 直接让 SCK 输出目标尺寸（13 由编译期守卫忽略）；`M1_CAPTURE_RESOLUTION=auto|nominal` 保留为诊断覆盖。本机 Sequoia 镜像环回 720p15/20s：69/69 解出、0 丢帧、summary PASS、`res=best` 生效；同负载 best 22 帧 vs auto 6 帧（负载污染，仅排除回退）。单测 268/268。P2.3 空闲渲染基线仍待测。

@@ -68,8 +68,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)start:(NSError * _Nullable * _Nullable)error;
 
 // 送一帧。pixelBuffer 由调用方持有，本方法同步入队后即返回（VT 内部异步编码）。
+// capturedAtUs 为采集 epoch 微秒，随编码结果回传并写入帧头（A-02 打点）。
 - (BOOL)encodePixelBuffer:(CVPixelBufferRef)pixelBuffer
                     ptsMs:(double)ptsMs
+             capturedAtUs:(uint64_t)capturedAtUs
                     error:(NSError * _Nullable * _Nullable)error;
 
 // 请求下一帧编码为关键帧（接收端丢帧/新客户端加入时调用）。

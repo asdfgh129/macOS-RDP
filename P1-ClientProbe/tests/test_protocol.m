@@ -119,9 +119,10 @@ int main(void) {
         // ---------------- 帧头 ----------------
         P1FrameHeader h = MakeHeader(4128835, 100, 0, 1, P1FrameFlagKeyframe | P1FrameFlagHasParamSets);
         h.payloadLen = 900;
+        h.capturedAtUs = 1763835600123456ULL;   // 2025-11-22T12:20:00.123456Z 附近的 epoch us
         NSData *packed = P1PackFrameHeader(h);
-        // v2：帧头 18B（fragIdx/fragCount 各 16 位）
-        ExpectInt((long)packed.length, 18, "header-size-18");
+        // v3：帧头 26B（新增 64-bit 采集墙钟）
+        ExpectInt((long)packed.length, 26, "header-size-26");
 
         const uint8_t *hb2 = packed.bytes;
         Expect(hb2[0] == 0x4D && hb2[1] == 0x52, "header-magic-bytes");
@@ -135,7 +136,8 @@ int main(void) {
         Expect(P1UnpackFrameHeader(packed, &back, &err), "header-unpack-ok");
         Expect(back.displayID == h.displayID && back.frameSeq == h.frameSeq &&
                back.fragIdx == h.fragIdx && back.fragCount == h.fragCount &&
-               back.payloadLen == h.payloadLen && back.flags == h.flags,
+               back.payloadLen == h.payloadLen && back.flags == h.flags &&
+               back.capturedAtUs == h.capturedAtUs,
                "header-roundtrip-fields");
 
         // 坏 magic
@@ -248,9 +250,14 @@ int main(void) {
             h0.payloadLen = (uint16_t)f0.length;
             h1.payloadLen = (uint16_t)f1.length;
             h2.payloadLen = (uint16_t)f2.length;
+            h0.capturedAtUs = 1763835600111000ULL;
+            h1.capturedAtUs = 1763835600112000ULL;
+            h2.capturedAtUs = 1763835600113000ULL;
             NSArray *d0 = [ro acceptHeader:h0 payload:f0 nowMs:1000 error:NULL];
             NSArray *d2 = [ro acceptHeader:h2 payload:f2 nowMs:1010 error:NULL];
             Expect(d0.count == 1, "reorder-seq0-delivered");
+            Expect(d0.count == 1 && d0[0].capturedAtUs == h0.capturedAtUs,
+                   "reorder-seq0-capture-ts");
             Expect(d2.count == 0, "reorder-seq2-held");
             Expect(!ro.needsKeyframe, "reorder-not-lost-before-deadline");
             NSArray<P1ReassembledFrame *> *d1 = [ro acceptHeader:h1 payload:f1 nowMs:1020 error:NULL];
@@ -258,6 +265,9 @@ int main(void) {
             if (d1.count == 2) {
                 Expect(d1[0].frameSeq == 1 && [d1[0].payload isEqualToData:f1], "reorder-seq1-first");
                 Expect(d1[1].frameSeq == 2 && [d1[1].payload isEqualToData:f2], "reorder-seq2-second");
+                Expect(d1[0].capturedAtUs == h1.capturedAtUs &&
+                       d1[1].capturedAtUs == h2.capturedAtUs,
+                       "reorder-release-capture-ts");
             }
             ExpectInt((long)ro.droppedFrames, 0, "reorder-no-drops");
         }

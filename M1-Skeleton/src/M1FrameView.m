@@ -5,17 +5,50 @@
 
 #import "M1FrameView.h"
 #import "M1InputLogic.h"
+#import "M1WallClock.h"
 #import "P1InputCodec.h"
 #import <CoreImage/CoreImage.h>
 #import <QuartzCore/QuartzCore.h>
 #include <stdatomic.h>
 
-// 渲染积压多少帧就不再接新帧。到这一步说明渲染跟不上解码，
-// 继续排队只会把「看到的画面」越拖越旧。
-static const uint32_t kM1RenderBacklogLimit = 2;
+// 渲染转换队列允许的峰值深度。1080p 转换 p50 ~4.5ms，12 帧在极端突发下
+// 最多引入 ~54ms；实测峰值 8 帧。限制过小（2）会把网络/解码突发误判成
+// 「渲染跟不上」而丢弃本可正常转换的帧。
+static const uint32_t kM1RenderBacklogLimit = 12;
 
 static double M1ViewNowMs(void) {
     return CFAbsoluteTimeGetCurrent() * 1000.0;
+}
+
+// 1ms 直方图，256 桶；只增不减，进程内近似分位数足够定位积压来源。
+static const uint32_t kM1RenderHistBuckets = 256;
+
+// capture→render 的原始差值可能为负：帧头时刻是主机时钟，客户端时钟更快时
+// raw 会小于 0。直方图从 -512ms 起算，报告端再加回时钟差（host-client）。
+static const uint32_t kM1PresentHistBuckets = 2048;
+static const int32_t  kM1PresentHistBaseMs = 512;
+
+static void M1AtomicMaxU32(atomic_uint_fast32_t *slot, uint32_t v) {
+    uint32_t old = atomic_load(slot);
+    while (v > old && !atomic_compare_exchange_weak(slot, &old, v)) {}
+}
+
+static void M1AtomicMaxU64(atomic_uint_fast64_t *slot, uint64_t v) {
+    uint64_t old = atomic_load(slot);
+    while (v > old && !atomic_compare_exchange_weak(slot, &old, v)) {}
+}
+
+static double M1HistPercentile(atomic_uint_fast32_t *hist, uint32_t n, double p) {
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < n; i++) total += atomic_load(&hist[i]);
+    if (total == 0) return 0;
+    uint64_t target = (uint64_t)(p * (double)total + 0.999); // 向上取整
+    uint64_t seen = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        seen += atomic_load(&hist[i]);
+        if (seen >= target) return (double)i + 0.5;
+    }
+    return (double)n - 0.5;
 }
 
 // 色彩空间只建一次：createCGImage:...colorSpace: 不会接管所有权，
@@ -43,9 +76,19 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 @interface M1FrameView () {
     atomic_uint_fast64_t _framesRendered;
     atomic_uint_fast64_t _framesDropped;
+    atomic_uint_fast64_t _renderDropped;
+    atomic_uint_fast64_t _renderFailed;
     atomic_uint_fast64_t _inputEmitted;
     atomic_uint_fast64_t _skippedOccluded;
     atomic_uint_fast32_t _pendingRenders;
+    atomic_uint_fast32_t _maxPendingRenders;
+    atomic_uint_fast32_t _renderHist[kM1RenderHistBuckets];
+    atomic_uint_fast32_t _presentLatHist[kM1PresentHistBuckets];
+    atomic_uint_fast64_t _presentLatSamples;
+    atomic_uint_fast64_t _maxQueueWaitUs;
+    atomic_uint_fast64_t _maxMainWaitUs;
+    _Atomic double _lastPresentLatencyMs;
+    _Atomic double _maxPresentLatencyMs;
     CVPixelBufferRef _outBuffer;      // 复用的 BGRA 输出（IOSurface 承载），只在 renderQueue 上动
     CGSize _outSize;
 }
@@ -78,9 +121,19 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
         }];
         atomic_init(&_framesRendered, 0);
         atomic_init(&_framesDropped, 0);
+        atomic_init(&_renderDropped, 0);
+        atomic_init(&_renderFailed, 0);
         atomic_init(&_inputEmitted, 0);
         atomic_init(&_skippedOccluded, 0);
         atomic_init(&_pendingRenders, 0);
+        atomic_init(&_maxPendingRenders, 0);
+        atomic_init(&_maxQueueWaitUs, 0);
+        atomic_init(&_maxMainWaitUs, 0);
+        atomic_init(&_presentLatSamples, 0);
+        atomic_store(&_lastPresentLatencyMs, 0.0);
+        atomic_store(&_maxPresentLatencyMs, -60000.0);
+        for (uint32_t i = 0; i < kM1RenderHistBuckets; i++) atomic_init(&_renderHist[i], 0);
+        for (uint32_t i = 0; i < kM1PresentHistBuckets; i++) atomic_init(&_presentLatHist[i], 0);
         self.wantsLayer = YES;
         self.layer.backgroundColor = [NSColor blackColor].CGColor;
         // 与 M1AspectFitRect 的几何一致：等比适配 + 居中，黑边由 layer 自己补。
@@ -146,14 +199,21 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 #pragma mark - 上屏
 
 - (void)presentPixelBuffer:(CVPixelBufferRef)pb {
+    [self presentPixelBuffer:pb capturedAtUs:0];
+}
+
+- (void)presentPixelBuffer:(CVPixelBufferRef)pb capturedAtUs:(uint64_t)capturedAtUs {
     if (!pb) return;
 
-    // 积压保护：渲染跟不上就丢新帧（保留屏幕上已有的旧帧）。
+    // 积压保护只约束转换队列：主线程贴层慢不应被算成「渲染跟不上解码」。
     if (atomic_load(&_pendingRenders) >= kM1RenderBacklogLimit) {
         atomic_fetch_add(&_framesDropped, 1);
+        atomic_fetch_add(&_renderDropped, 1);
         return;
     }
-    atomic_fetch_add(&_pendingRenders, 1);
+    double tPresent = M1ViewNowMs();
+    uint32_t pending = (uint32_t)atomic_fetch_add(&_pendingRenders, 1) + 1;
+    M1AtomicMaxU32(&_maxPendingRenders, pending);
 
     CVPixelBufferRef held = CVPixelBufferRetain(pb);
     CGSize size = CGSizeMake((CGFloat)CVPixelBufferGetWidth(pb),
@@ -161,6 +221,7 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 
     dispatch_async(self.renderQueue, ^{
         double t0 = M1ViewNowMs();
+        M1AtomicMaxU64(&self->_maxQueueWaitUs, (uint64_t)((t0 - tPresent) * 1000.0));
         CIImage *image = [CIImage imageWithCVPixelBuffer:held];
         CVPixelBufferRef out = image ? [self ensureOutputBufferForSize:image.extent.size] : NULL;
         if (image && out) {
@@ -172,24 +233,32 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
                           colorSpace:M1ViewSRGBColorSpace()];
         }
         double costMs = M1ViewNowMs() - t0;
+        uint32_t bucket = costMs >= (double)kM1RenderHistBuckets
+                        ? kM1RenderHistBuckets - 1 : (uint32_t)costMs;
+        atomic_fetch_add(&self->_renderHist[bucket], 1);
         CVPixelBufferRelease(held);
 
         IOSurfaceRef surface = out ? CVPixelBufferGetIOSurface(out) : NULL;
         if (!surface) {
             atomic_fetch_sub(&self->_pendingRenders, 1);
             atomic_fetch_add(&self->_framesDropped, 1);
+            atomic_fetch_add(&self->_renderFailed, 1);
             return;
         }
+        // 转换已完成，先释放转换槽位；主线程贴层单独计量等待。
+        atomic_fetch_sub(&self->_pendingRenders, 1);
+        double tDone = M1ViewNowMs();
         // 主线程赋值期间缓冲可能因尺寸变化被换掉，先把 surface 自己留住。
         CFRetain(surface);
         dispatch_async(dispatch_get_main_queue(), ^{
+            M1AtomicMaxU64(&self->_maxMainWaitUs,
+                           (uint64_t)((M1ViewNowMs() - tDone) * 1000.0));
             // 窗口不可见时不要贴帧：CALayer 的 contents 赋值会等合成器提交，
             // 窗口被遮住/锁屏时实测阻塞到 0.3~3 s，把整条渲染队列堵死。
             NSWindow *win = self.window;
             if (win && (win.occlusionState & NSWindowOcclusionStateVisible) == 0) {
                 CFRelease(surface);
                 atomic_fetch_add(&self->_skippedOccluded, 1);
-                atomic_fetch_sub(&self->_pendingRenders, 1);
                 return;
             }
             if (self.videoSize.width != size.width || self.videoSize.height != size.height) {
@@ -202,7 +271,25 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
             self.lastRenderMs = costMs;
             if (costMs > self.maxRenderMs) self.maxRenderMs = costMs;
             atomic_fetch_add(&self->_framesRendered, 1);
-            atomic_fetch_sub(&self->_pendingRenders, 1);
+
+            // A-02：贴层完成即结算。这里不含显示器扫描，也不含相机，
+            // 得到的是 capture→render，而不是严格 glass-to-glass。
+            if (capturedAtUs > 0) {
+                double rawMs = ((double)M1WallClockUs() - (double)capturedAtUs) / 1000.0;
+                double idx = rawMs + (double)kM1PresentHistBaseMs;
+                if (idx >= 0 && idx < (double)kM1PresentHistBuckets) {
+                    uint32_t bucket = (uint32_t)idx;
+                    atomic_fetch_add(&self->_presentLatHist[bucket], 1);
+                    atomic_fetch_add(&self->_presentLatSamples, 1);
+                    atomic_store(&self->_lastPresentLatencyMs, rawMs);
+                    double prevMax = atomic_load(&self->_maxPresentLatencyMs);
+                    while (rawMs > prevMax &&
+                           !atomic_compare_exchange_weak(&self->_maxPresentLatencyMs,
+                                                         &prevMax, rawMs)) {
+                        // 重试直到写入更大的值
+                    }
+                }
+            }
         });
     });
 }
@@ -217,6 +304,24 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 
 - (NSUInteger)framesRendered { return (NSUInteger)atomic_load(&_framesRendered); }
 - (NSUInteger)framesDropped  { return (NSUInteger)atomic_load(&_framesDropped); }
+- (NSUInteger)renderDropped  { return (NSUInteger)atomic_load(&_renderDropped); }
+- (NSUInteger)renderFailed   { return (NSUInteger)atomic_load(&_renderFailed); }
+- (NSUInteger)maxPendingRenders { return (NSUInteger)atomic_load(&_maxPendingRenders); }
+- (double)renderP50Ms { return M1HistPercentile(_renderHist, kM1RenderHistBuckets, 0.50); }
+- (double)renderP95Ms { return M1HistPercentile(_renderHist, kM1RenderHistBuckets, 0.95); }
+- (double)maxQueueWaitMs { return (double)atomic_load(&_maxQueueWaitUs) / 1000.0; }
+- (double)maxMainWaitMs  { return (double)atomic_load(&_maxMainWaitUs) / 1000.0; }
+- (NSUInteger)presentLatencySamples { return (NSUInteger)atomic_load(&_presentLatSamples); }
+- (double)presentLatencyP50Ms {
+    return M1HistPercentile(_presentLatHist, kM1PresentHistBuckets, 0.50)
+         - (double)kM1PresentHistBaseMs;
+}
+- (double)presentLatencyP95Ms {
+    return M1HistPercentile(_presentLatHist, kM1PresentHistBuckets, 0.95)
+         - (double)kM1PresentHistBaseMs;
+}
+- (double)lastPresentLatencyMs { return atomic_load(&_lastPresentLatencyMs); }
+- (double)maxPresentLatencyMs  { return atomic_load(&_maxPresentLatencyMs); }
 - (NSUInteger)inputEventsEmitted { return (NSUInteger)atomic_load(&_inputEmitted); }
 - (NSUInteger)framesSkippedOccluded { return (NSUInteger)atomic_load(&_skippedOccluded); }
 

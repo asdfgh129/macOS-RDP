@@ -13,7 +13,7 @@
 //
 //  线程约定：
 //    · presentPixelBuffer: 可从任意线程调用（解码回调线程），内部转到渲染队列 +
-//      主线程；积压超过 2 帧直接丢旧帧，不让延迟滚雪球。
+//      主线程；转换队列峰值超过 12 帧才丢新帧，用来吸收网络/解码突发。
 //    · onInputEvent / onCloseRequest 都在主线程回调。
 //
 
@@ -34,7 +34,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy, nullable) void (^onCloseRequest)(void);
 @property (nonatomic, assign) BOOL closesOnEscape;
 
-// 把一帧贴到屏幕上。
+// 把一帧贴到屏幕上。capturedAtUs 为帧头 v3 携带的主机采集 epoch 微秒；
+// 传 0 表示不统计端到端延迟。
+- (void)presentPixelBuffer:(CVPixelBufferRef)pb capturedAtUs:(uint64_t)capturedAtUs;
 - (void)presentPixelBuffer:(CVPixelBufferRef)pb;
 
 // 强制同步一次修饰键状态（重连后必须复位，PROTOCOL §3.1）。
@@ -43,7 +45,21 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) CGSize videoSize;       // 最近一帧的像素尺寸
 @property (nonatomic, readonly) CGRect videoRect;        // letterbox 后的画面矩形（视图坐标）
 @property (nonatomic, readonly) NSUInteger framesRendered;
-@property (nonatomic, readonly) NSUInteger framesDropped; // 渲染积压丢掉的帧
+@property (nonatomic, readonly) NSUInteger framesDropped; // 积压保护丢掉的新帧 + 输出缓冲失败
+@property (nonatomic, readonly) NSUInteger renderDropped; // 仅积压保护丢掉的新帧
+@property (nonatomic, readonly) NSUInteger renderFailed;  // 拿不到输出 IOSurface 的帧
+@property (nonatomic, readonly) NSUInteger maxPendingRenders; // 渲染转换队列峰值深度
+@property (nonatomic, readonly) double renderP50Ms;      // 转换耗时近似分位数（1ms 直方图）
+@property (nonatomic, readonly) double renderP95Ms;
+@property (nonatomic, readonly) double maxQueueWaitMs;   // 入队到开始转换的最长等待
+@property (nonatomic, readonly) double maxMainWaitMs;    // 转换完成到主线程贴层的最长等待
+// 原始端到端延迟 = 客户端贴层时的 epoch - 帧头 capturedAtUs。含两端墙钟偏差，
+// 需要先减去控制通道估出的 offset 才是 capture→render。
+@property (nonatomic, readonly) NSUInteger presentLatencySamples;
+@property (nonatomic, readonly) double presentLatencyP50Ms;
+@property (nonatomic, readonly) double presentLatencyP95Ms;
+@property (nonatomic, readonly) double lastPresentLatencyMs;
+@property (nonatomic, readonly) double maxPresentLatencyMs;
 // 窗口不可见（被遮住/锁屏）而没贴的帧。这个数不为 0 说明画面根本没上屏，
 // 此时 framesRendered 会偏低且渲染耗时统计不可信。
 @property (nonatomic, readonly) NSUInteger framesSkippedOccluded;

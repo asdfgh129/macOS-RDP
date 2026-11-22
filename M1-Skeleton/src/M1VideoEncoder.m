@@ -86,6 +86,7 @@ static double M1EncNowMs(void) {
     _Atomic double _sessionCreateMs;
     BOOL _running;
     atomic_bool _forceNextKeyframe;   // 下一帧强制 IDR（帧级选项，用完即复位；跨线程请求）
+    NSMutableDictionary<NSNumber *, NSNumber *> *_captureUsByPtsMs;   // PTS(ms) → 采集 epoch(us)
 }
 // C 回调转进来的入口，仅在 VT 内部队列执行。
 - (void)handleStatus:(OSStatus)status sampleBuffer:(CMSampleBufferRef)sampleBuffer;
@@ -164,6 +165,7 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
         atomic_store(&_maxEncodeCallMs, 0.0);
         atomic_store(&_sessionCreateMs, 0.0);
         atomic_init(&_forceNextKeyframe, false);
+        _captureUsByPtsMs = [NSMutableDictionary dictionary];
         _running = NO;
     }
     return self;
@@ -233,6 +235,7 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
 
 - (BOOL)encodePixelBuffer:(CVPixelBufferRef)pixelBuffer
                     ptsMs:(double)ptsMs
+             capturedAtUs:(uint64_t)capturedAtUs
                     error:(NSError **)error {
     if (error) *error = nil;
     if (!_session || !_running) {
@@ -255,6 +258,13 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
     }
 
     CMTime pts = CMTimeMakeWithSeconds(ptsMs / 1000.0, 1000);
+
+    // VT 回调在内部队列异步执行，只能靠 PTS 把采集时刻配回对应帧。
+    NSNumber *ptsKey = @(llround(ptsMs));
+    @synchronized (self) {
+        if (_captureUsByPtsMs.count > 1024) [_captureUsByPtsMs removeAllObjects];
+        _captureUsByPtsMs[ptsKey] = @(capturedAtUs);
+    }
 
     // 关键帧请求是「帧级选项」，不是会话属性：只在本次 EncodeFrame 生效。
     // 请求来自控制收包队列，这里用 exchange 取走，避免漏帧/重复置位。
@@ -282,6 +292,9 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
     }
 
     if (st != noErr) {
+        @synchronized (self) {
+            [_captureUsByPtsMs removeObjectForKey:ptsKey];
+        }
         atomic_fetch_add(&_encodeFailures, 1);
         if (error) *error = M1EncoderErr(M1PipelineErrorEncoderFailed,
             [NSString stringWithFormat:@"EncodeFrame 失败: %d", (int)st]);
@@ -306,6 +319,9 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
         _running = NO;
         draining = _session;
         _session = NULL;
+    }
+    @synchronized (self) {
+        [_captureUsByPtsMs removeAllObjects];
     }
     if (!draining) return;
     VTCompressionSessionCompleteFrames(draining, kCMTimeInvalid);
@@ -376,6 +392,17 @@ static BOOL M1AppendParameterSets(CMFormatDescriptionRef fmt, NSMutableData *out
     frame.carriesParamSets = hasPS;
     frame.encodedAtMs = CACurrentMediaTime() * 1000.0;
     frame.encodeLatencyMs = atomic_load(&_lastEncodeCallMs);
+
+    CMTime outPts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    if (CMTIME_IS_VALID(outPts) && outPts.timescale > 0) {
+        NSNumber *ptsKey = @(llround(CMTimeGetSeconds(outPts) * 1000.0));
+        NSNumber *capture = nil;
+        @synchronized (self) {
+            capture = _captureUsByPtsMs[ptsKey];
+            [_captureUsByPtsMs removeObjectForKey:ptsKey];
+        }
+        frame.capturedAtUs = capture.unsignedLongLongValue;
+    }
 
     atomic_fetch_add(&_framesEncoded, 1);
     if (isKey) atomic_fetch_add(&_keyframes, 1);

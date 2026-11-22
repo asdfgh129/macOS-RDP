@@ -50,7 +50,14 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 | `keyframe-request` | C→H | `displayID` | 丢帧/解码失败/重连后 |
 | `keyframe-sent` | H→C | `displayID, frameSeq` | 响应确认 |
 | `heartbeat` | 双向 | `ts` | 1s |
+| `time-sync` | C→H | `t0` | 客户端本地 epoch 微秒；仅 STREAMING 态 |
+| `time-sync-reply` | H→C | `t0, t1` | Host 收到即回：原样带回 `t0`，`t1` 为 Host 本地 epoch 微秒 |
 | `bye` | 双向 | `reason` | 正常关闭 |
+
+**时钟差估计（A-02 打点）**：客户端发送记 `t0`，Host 收到即回并记 `t1`，客户端收到记 `t2`；
+`RTT = t2 − t0`（含 Host 处理，通常 <1 ms），`offset = t1 − (t0+t2)/2`，只保留 **最小 RTT** 的样本，
+`RTT > 5000 ms` 丢弃。该 offset 用于把帧头里的采集时刻换算到客户端时基；不逐帧修正，
+也不参与渲染调度。
 
 ### 3.1 input 载荷
 
@@ -75,26 +82,34 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 - 修饰键采用**状态同步**而非逐事件转发：Client 维护状态机，变化时发 `kind:"flags"` 全量；重连后必发一次全量复位。
 - Host 注入速率限制：单会话 ≤ 1000 event/s，超限丢弃 move 类（保留 down/up/key）。
 
-## 4. 帧通道二进制头（v2：18 字节，大端）
+## 4. 帧通道二进制头（v3：26 字节，大端）
 
 | 偏移 | 字段 | 宽度 | 说明 |
 |---|---|---|---|
 | 0 | magic `MR` | 2 | 0x4D52 |
-| 2 | version | 1 | 当前 **2**（与控制通道 JSON 的 `v` 相互独立） |
+| 2 | version | 1 | 当前 **3**（与控制通道 JSON 的 `v` 相互独立） |
 | 3 | flags | 1 | bit0=keyframe, bit1=帧末分片, bit2=含 SPS/PPS |
 | 4 | displayID | 4 | 对应虚拟屏（`CGDirectDisplayID` 是 32 位，实测可达 0x78CD0400，不能压成 16 位） |
 | 8 | frameSeq | 4 | 单调递增，重组与丢帧判据 |
 | 12 | fragIdx | 2 | 分片序号 |
 | 14 | fragCount | 2 | 总分片数（≤65535，单帧 ≈75MB） |
 | 16 | payloadLen | 2 | 本分片载荷字节数（≤1150，见下方 D-01 说明） |
+| 18 | capturedAtUs | 8 | Host 采集时刻（Unix epoch 微秒）；0 表示未知 |
 
 **v1 → v2 变更（2026-11-18）**：`fragIdx/fragCount` 由 1 字节扩为 2 字节，帧头 16B→18B。
 原因是 v1 的单帧上限 255×1150 B ≈ 286 KB，而 3440×1440 的关键帧会超过它，
 `P1FragmentPayload` 直接拒发 ⇒ 整帧发不出去 ⇒ 接收端只能等下一个关键帧（实测首帧 4069 ms）。
-v1 帧头一律按 `BadVersion` 拒绝，不做兼容回退（双端始终同版本构建）。
-`payloadLen` 上限仍是 1150，分片预算不变：18+1150=1168 < 1497 协商下限。
 
-载荷：AVCC（长度前缀 NALU）；关键帧分片带 SPS/PPS（flags bit2）。pts 不随帧传——实时流以到达时间渲染，延迟统计走控制通道 `heartbeat.ts` 回环。
+**v2 → v3 变更（2026-11-22，A-02 打点）**：新增 64-bit `capturedAtUs`，帧头 18B→26B。
+Host 在把像素缓冲交给编码器时打点，编码回调按 PTS 回填到 `M1EncodedFrame`；Client 用该值作为
+解码 sample buffer 的 PTS，VT 输出回调带回，最终在 `M1FrameView` 贴层处与本地 epoch 相减，
+得到 **capture→render** 延迟（原始差可能为负，报告时再加回 `time-sync` 估出的 host−client 时钟差）。
+该指标不含显示器扫描与摄像头采样，不能等同于 glass-to-glass，只用于定位管线内延迟。
+
+v2 及更早帧头一律按 `BadVersion` 拒绝，不做兼容回退（双端始终同版本构建）。
+`payloadLen` 上限仍是 1150，分片预算不变：26+1150=1176 < 1497 协商下限。
+
+载荷：AVCC（长度前缀 NALU）；关键帧分片带 SPS/PPS（flags bit2）。`capturedAtUs` 随帧头传，仅用于延迟打点，不参与渲染调度。
 
 丢帧策略：FrameReceiver 检测 frameSeq 缺口 → 丢弃该帧全部分片 → `keyframe-request`；解码器在关键帧到达前不产出。旧帧迟到直接丢弃（实时性优先）。已由 `P1FrameReassembler` 实现并单测。
 
@@ -122,4 +137,4 @@ v1 帧头一律按 `BadVersion` 拒绝，不做兼容回退（双端始终同版
 
 - D-01 已决（2026-11-17，QUIC datagram）；**v1 已冻结（2026-11-18 11:20）**。帧通道实现细则（ALPN `macos-rdp-v1`、idle timeout 30s、max UDP payload 1200B、分片上限 1150B）见 D-01 与 §4，由 M1 按此实现，不再作为冻结前置；拥塞控制使用 Network.framework 默认策略，P2 双机实测后再评估调优。
 - 光标通道（FR-10, P2）预留 `type:"cursor"`，本期不实现。
-- 变更记录：v1.1-draft 2026-11-18 **§3.1 明确 `displayID` 位置（两处都带）+ 只在 STREAMING 态收发**，实现见 D-17；v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram）；2026-11-18 分片上限由 1200 下调为 1150 B，并补齐 §3.1 输入编解码与 §2 状态机的单测实现；2026-11-18 11:20 **冻结为 v1**（评审通过，M1 基线），QUIC 实现细则以 D-01 为准，双机端到端实测转入 P2 验收。
+- 变更记录：v1.1-draft 2026-11-18 **§3.1 明确 `displayID` 位置（两处都带）+ 只在 STREAMING 态收发**，实现见 D-17；v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram）；2026-11-18 分片上限由 1200 下调为 1150 B，并补齐 §3.1 输入编解码与 §2 状态机的单测实现；2026-11-18 11:20 **冻结为 v1**（评审通过，M1 基线），QUIC 实现细则以 D-01 为准，双机端到端实测转入 P2 验收；2026-11-22 **帧头 v3（26B，内嵌 `capturedAtUs`）+ 控制通道 `time-sync`/`time-sync-reply`**，为 A-02 提供 capture→render 打点（JSON `v` 不变）。

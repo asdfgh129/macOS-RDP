@@ -80,9 +80,16 @@
 |---|---|---|
 | 3.1 | ✅ 已完成（早前落地）：`M1FrameView` 已是 `CIContext render:toCVPixelBuffer:`（IOSurface 承载）+ `layer.contents = IOSurface` 零拷贝上屏，无 CGImage 回读；本轮 1080p 离屏单帧 13.9ms（预算 41.7ms）。Sequoia 真实窗口 ≥24fps 仍需跨机实测 | `M1-Skeleton/src/M1FrameView.m` |
 | 3.2 | ✅ 完成（2026-11-20）：`render_selftest` 重构为 `RunCase` 多档位，覆盖 640×360 / 720p / 1080p / 3440×1440，每档校验 color/尺寸/IOSurface/letterbox + 耗时；letterbox 期望独立公式计算（不复用被测函数），两种受限方向都覆盖。本机 ALL PASS | `M1-Skeleton/tools/render_selftest.m` |
-| 3.3 | ✅ 2026-11-22 20:3x：采集分辨率默认改 `best`（`M1FramePipelineConfig`），高分辨率物理屏镜像不再需要手动设 `M1_CAPTURE_RESOLUTION`；本机 Sequoia 镜像环回 69/69 解出、summary PASS（`RESULTS §5.33`），Tahoe 3440×1440→1080p20 真机复测同样 `res=best`、20fps 采集、client 19.6fps PASS。**P2.3 干净基线已取得**（Qoder 最小化 + mds 暂停）：离屏 720p 3.2ms / 1080p 5.3ms（p95 10.4）；真实 client 1080p20 镜像 host 20fps、client 19.2fps、`lastRenderMs=3.9`、summary PASS。进行中：**WAN 行已齐**（2b9ec03：720p15 镜像 0.998 / 独占 1.000 + C-09，1080p20 镜像 0.998 / 独占 1.000，见 `RESULTS-BY-OS.md` §5.20–5.21）；**LAN 行不可得**（无双机同 LAN），只保留环回历史数据；分位数统计（p50/p95）尚未加到 harness | `docs/RESULTS-BY-OS.md` |
+| 3.3 | ✅ **2026-11-22 22:1x 完成**：采集分辨率默认改 `best`（`M1FramePipelineConfig`），高分辨率物理屏镜像不再需要手动设 `M1_CAPTURE_RESOLUTION`；本机 Sequoia 镜像环回 69/69 解出、summary PASS（`RESULTS §5.33`），Tahoe 3440×1440→1080p20 真机复测同样 `res=best`、20fps 采集、client 19.6fps PASS。**P2.3 干净基线**（Qoder 最小化 + mds 暂停）：离屏 720p 3.2ms / 1080p 5.3ms（p95 10.4）。**上屏积压已收口**：66 帧丢弃源于 2 帧积压上限而非渲染成本，槽位改为转换完成即释放，上限 2/8/12 分别丢 67/2/0；最终 1080p20 镜像 host 589 采集/588 发出，client 587/587 解出并上屏、积压丢 0、p50/p95 4.5/20.5ms、主线程贴层等待 0.1ms、19.8fps、summary PASS。harness 已加 pending/直方图/入队与主线程等待指标及对应 JSON 字段。**WAN 行已齐**（2b9ec03：720p15 镜像 0.998 / 独占 1.000 + C-09，1080p20 镜像 0.998 / 独占 1.000，见 `RESULTS-BY-OS.md` §5.20–5.21）；**LAN 行不可得**（无双机同 LAN），只保留环回历史数据。⇒ 完成判据达成 | `docs/RESULTS-BY-OS.md` |
 
 **完成判据**：1080p20 跨机跑满 20fps 且上屏队列 0 积压；`A-02` 只在拿到 glass-to-glass 实测后关闭（相机同框方案见 `P2-CHECKLIST` §7）。
+
+### A-02 打点进度（2026-11-22）
+
+- ✅ 帧头 v3（26B，`capturedAtUs`）+ 控制通道 `time-sync` 已落地，双端单测 291/291。
+- ✅ 单机环回冒烟：382 样本，capture→render p50 49.4ms、时钟差 54µs（同机竞争，仅证明通路），见 `RESULTS-BY-OS.md` §5.35。
+- ✅ **跨机首轮**（Tahoe 26.5.2 host × Sequoia 15.5 client，WAN，1080p20 镜像）：两轮 p50/p95 = 95.1/231.1ms（583 帧）与 94.2/206.2ms（767 帧），解码 19.2–19.7fps、0 丢、summary PASS；期间修掉负样本丢弃与时钟差方向两个测量 bug。
+- ⏸ glass-to-glass 本身仍需相机同框或硬件打点，capture→render 不能替代；后续可补多时段/多网络条件采样。
 
 ---
 

@@ -4,6 +4,7 @@
 //
 
 #import "M1FramePipeline.h"
+#import "M1WallClock.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <time.h>
@@ -243,7 +244,8 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
         return;
     }
     NSError *err = nil;
-    if (![enc encodePixelBuffer:pb ptsMs:ptsMs error:&err]) {
+    uint64_t capturedAtUs = M1WallClockUs();
+    if (![enc encodePixelBuffer:pb ptsMs:ptsMs capturedAtUs:capturedAtUs error:&err]) {
         atomic_fetch_add(&_encodeFailures, 1);
     }
 }
