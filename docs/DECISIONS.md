@@ -214,6 +214,7 @@ Host 不为每个会话预先创建虚拟屏。会话开始时的供给顺序是
   - 顺带修复：WindowServer 残留虚拟屏槽位会让新建屏继承镜像态、mode 卡死；`VDManager` 已加单屏自愈（详见 `P0-TahoeProbe/README.md` §17）。
   - **2026-11-18 Tahoe 26.5.2 新增风险**：V-01 全项 PASS；V-03 的禁屏、指针、注入、20–30s 无重新 enable、恢复全部通过，但同一状态下 **SCK 送帧多数为黑**（4 次：1 次全黑、2 次多数黑、1 次放白色 TextEdit 窗口仍全黑），而 `screencapture` 能抓到完整桌面 ⇒ 合成正常、SCK 路径异常。**C-09 的「全部物理屏退出 active」在 Tahoe 上目前不能与 SCK 采集同时成立**；M1 前必须新增替代采集对照（`CGDisplayCreateImage` / `CGWindowListCreateImage`）或启用本决定第 3 条降级。2026-11-18 后续实测：两条公开抓屏 API 在 Tahoe 零 active 物理屏下**稳定 `HAS_CONTENT`**（`minMean=37–39`、`maxVar≈1500`、0 黑采样，恢复 OK，见 `/tmp/p0v-alt-tahoe3.json` 与 `/tmp/p0v-alt-tahoe-1080.json`），可优先作为 M1 采集候选；SCK 同场景不稳定（V-03 全黑/多数黑，altprobe 中仅 2–4fps），不能再作为该场景唯一路径。并把「非绝对安全」写入产品说明。Sequoia 的 V-03 `HAS_CONTENT` 结论不可外推到 Tahoe。
 - **窗口重排副作用**：物理屏被移出空间时 WindowServer 会把原在该屏的窗口搬到剩余屏；断开后**不会**自动回原位。必须会话前快照 display 布局 + 各窗口 frame，断开后还原。这是 M1 的一个独立工作项，不是"顺手就能好"的细节。
+  - 已实现 `M1WindowLayout`（2026-11-22）：建屏前采集 CGWindowList 快照，恢复并销毁虚拟屏后按 `pid#windowNumber` 搬回，目标 frame 夹取到可见区；AX 未授权时只计划不搬。单测 12 条通过。Tahoe 26.5.2 独占闭环已验证（RESULTS §5.34）：该版本 WindowServer 自然恢复显示时多数窗口会自动回位（r5 `planned=0`），但强移窗口后仍由本模块复位（r6 `planned=7 restored=7`，窗口从注入的 (150,306) 回到快照 (464,131)）。⇒ 「不自动还原」是版本相关现象，本模块作为兜底保留，不能依赖系统自动还原。
 - **`disable` 权限**：`SLSConfigureDisplayEnabled` 的符号可调已实测（`P0V-SessionRecon`），V-01/V-03 均已在事务内真正生效并恢复。若运行环境（非 Intel / 非 Sequoia）被 WindowServer 拒绝，走决定第 3 条 + `CGDisplayCapture` 降级。
 
 ---

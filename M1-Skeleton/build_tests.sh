@@ -10,6 +10,7 @@ SOURCES=(
   "src/M1Takeover.m"
   "src/M1SessionCoordinator.m"
   "src/M1DriverLogic.m"
+  "src/M1WindowLayout.m"
   "src/M1InputLogic.m"
   "src/M1InputInjector.m"
   "src/M1PipelineTypes.m"

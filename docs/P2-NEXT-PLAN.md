@@ -80,7 +80,7 @@
 |---|---|---|
 | 3.1 | ✅ 已完成（早前落地）：`M1FrameView` 已是 `CIContext render:toCVPixelBuffer:`（IOSurface 承载）+ `layer.contents = IOSurface` 零拷贝上屏，无 CGImage 回读；本轮 1080p 离屏单帧 13.9ms（预算 41.7ms）。Sequoia 真实窗口 ≥24fps 仍需跨机实测 | `M1-Skeleton/src/M1FrameView.m` |
 | 3.2 | ✅ 完成（2026-11-20）：`render_selftest` 重构为 `RunCase` 多档位，覆盖 640×360 / 720p / 1080p / 3440×1440，每档校验 color/尺寸/IOSurface/letterbox + 耗时；letterbox 期望独立公式计算（不复用被测函数），两种受限方向都覆盖。本机 ALL PASS | `M1-Skeleton/tools/render_selftest.m` |
-| 3.3 | 进行中（2026-11-20 23:2x）：**WAN 行已齐**（2b9ec03：720p15 镜像 0.998 / 独占 1.000 + C-09，1080p20 镜像 0.998 / 独占 1.000，见 `RESULTS-BY-OS.md` §5.20–5.21）；**LAN 行不可得**（无双机同 LAN），只保留环回历史数据；**P2.3 渲染基线被本机负载污染**（Screen Sharing/Qoder），需空闲环境重测 | `docs/RESULTS-BY-OS.md` |
+| 3.3 | ✅ 2026-11-22 20:3x：采集分辨率默认改 `best`（`M1FramePipelineConfig`），高分辨率物理屏镜像不再需要手动设 `M1_CAPTURE_RESOLUTION`；本机 Sequoia 镜像环回 69/69 解出、summary PASS（`RESULTS §5.33`），Tahoe 3440×1440→1080p20 真机复测同样 `res=best`、20fps 采集、client 19.6fps PASS。进行中：**WAN 行已齐**（2b9ec03：720p15 镜像 0.998 / 独占 1.000 + C-09，1080p20 镜像 0.998 / 独占 1.000，见 `RESULTS-BY-OS.md` §5.20–5.21）；**LAN 行不可得**（无双机同 LAN），只保留环回历史数据；**P2.3 渲染基线被本机负载污染**（Screen Sharing/Qoder），需空闲环境重测 | `docs/RESULTS-BY-OS.md` |
 
 **完成判据**：1080p20 跨机跑满 20fps 且上屏队列 0 积压；`A-02` 只在拿到 glass-to-glass 实测后关闭（相机同框方案见 `P2-CHECKLIST` §7）。
 

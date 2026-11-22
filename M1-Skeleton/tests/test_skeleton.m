@@ -15,6 +15,7 @@
 #import "M1MessageSink.h"
 #import "M1ControlChannel.h"
 #import "M1ControlSession.h"
+#import "M1WindowLayout.h"
 #import "P1InputCodec.h"
 #import <math.h>
 
@@ -1174,6 +1175,149 @@ static void TestControlSessionKeyframe(void) {
        err.code == M1ControlSessionErrorInvalidState, "kf-pre-streaming-rejected");
 }
 
+#pragma mark - 窗口布局
+
+@interface FakeWindowLayoutProvider : NSObject <M1WindowLayoutProvider>
+@property (nonatomic, assign) BOOL accessibilityTrusted;
+@property (nonatomic, strong) M1WindowLayoutSnapshot *current;
+@property (nonatomic, strong) NSMutableArray<NSValue *> *moves;
+@end
+
+@implementation FakeWindowLayoutProvider
+
+- (instancetype)init {
+    self = [super init];
+    if (self) _moves = [NSMutableArray array];
+    return self;
+}
+
+- (M1WindowLayoutSnapshot *)captureLayoutExcludingPIDs:(NSSet<NSNumber *> *)pids {
+    return self.current;
+}
+
+- (BOOL)moveWindow:(M1WindowInfo *)window
+         fromFrame:(CGRect)currentFrame
+           toFrame:(CGRect)targetFrame
+             error:(NSError **)error {
+    [self.moves addObject:M1RectValue(targetFrame)];
+    return YES;
+}
+
+@end
+
+static M1WindowInfo *Win(pid_t pid, uint32_t num, CGRect frame, uint32_t disp) {
+    return [M1WindowInfo infoWithOwnerPID:pid windowNumber:num ownerName:@"App"
+                                    title:@"W" frame:frame displayID:disp layer:0];
+}
+
+static void TestWindowLayout(void) {
+    printf("=== window layout ===\n");
+    CGRect d1 = CGRectMake(0, 0, 1920, 1080);
+    CGRect d2 = CGRectMake(1920, 0, 1280, 720);
+    NSDictionary *bounds = @{ @1: M1RectValue(d1),
+                              @2: M1RectValue(d2) };
+
+    M1WindowLayoutSnapshot *snap = [M1WindowLayoutSnapshot new];
+    snap.displayBounds = @{ @1: M1RectValue(d1),
+                            @3: M1RectValue(CGRectMake(-1280, -200, 1280, 720)) };
+    snap.mainDisplayID = 1;
+    snap.windows = @[ Win(100, 7, CGRectMake(100, 120, 800, 600), 1),
+                      Win(101, 9, CGRectMake(-1000, -100, 640, 480), 3) ];
+
+    M1WindowLayoutSnapshot *rt =
+        [M1WindowLayoutSnapshot snapshotWithDictionary:[snap dictionaryRepresentation]];
+    OK(rt && rt.windows.count == 2 && rt.mainDisplayID == 1, "layout-json-roundtrip");
+    OK(rt && CGRectEqualToRect(rt.windows[1].frame, snap.windows[1].frame) &&
+       rt.windows[1].displayID == 3, "layout-json-negative-frame");
+    OK(rt && CGRectEqualToRect(M1RectGetValue(rt.displayBounds[@3]),
+                               CGRectMake(-1280, -200, 1280, 720)),
+       "layout-json-display-bounds");
+
+    // 被禁屏（1）上的窗口被搬到了 2 → 需要搬回原位
+    M1WindowInfo *moved = Win(100, 7, CGRectMake(2300, 40, 800, 600), 2);
+    NSArray<M1WindowRestoreTask *> *tasks =
+        [M1WindowLayoutPlanner planFromSnapshot:snap
+                                        windows:@[moved]
+                             disabledDisplayIDs:[NSSet setWithObject:@1]
+                                  currentBounds:bounds];
+    OK(tasks.count == 1 &&
+       CGRectEqualToRect(tasks.firstObject.targetFrame, snap.windows[0].frame),
+       "layout-plan-displaced");
+
+    // 仍在原位 → 跳过
+    M1WindowInfo *inPlace = Win(100, 7, CGRectMake(100, 120, 800, 600), 1);
+    tasks = [M1WindowLayoutPlanner planFromSnapshot:snap
+                                            windows:@[inPlace]
+                                 disabledDisplayIDs:[NSSet setWithObject:@1]
+                                      currentBounds:bounds];
+    OK(tasks.count == 0, "layout-plan-inplace-skip");
+
+    // 快照时在保留屏（2）上的窗口即使位置变了也不是本模块的责任
+    M1WindowLayoutSnapshot *keptSnap = [M1WindowLayoutSnapshot new];
+    keptSnap.displayBounds = snap.displayBounds;
+    keptSnap.windows = @[ Win(102, 11, CGRectMake(2000, 100, 600, 400), 2) ];
+    M1WindowInfo *keptNow = Win(102, 11, CGRectMake(100, 100, 600, 400), 1);
+    tasks = [M1WindowLayoutPlanner planFromSnapshot:keptSnap
+                                            windows:@[keptNow]
+                                 disabledDisplayIDs:[NSSet setWithObject:@1]
+                                      currentBounds:bounds];
+    OK(tasks.count == 0, "layout-plan-kept-display-skip");
+
+    // 窗口已关闭 → 跳过
+    tasks = [M1WindowLayoutPlanner planFromSnapshot:snap
+                                            windows:@[]
+                                 disabledDisplayIDs:[NSSet setWithObject:@1]
+                                      currentBounds:bounds];
+    OK(tasks.count == 0, "layout-plan-vanished-skip");
+
+    // 同 pid 不同 windowNumber 不能误匹配
+    M1WindowInfo *otherWin = Win(100, 8, CGRectMake(2300, 40, 800, 600), 2);
+    tasks = [M1WindowLayoutPlanner planFromSnapshot:snap
+                                            windows:@[otherWin]
+                                 disabledDisplayIDs:[NSSet setWithObject:@1]
+                                      currentBounds:bounds];
+    OK(tasks.count == 0, "layout-plan-window-number-match");
+
+    // 原位在屏外（负坐标）→ 夹回至少 120pt 可见
+    M1WindowLayoutSnapshot *offSnap = [M1WindowLayoutSnapshot new];
+    offSnap.displayBounds = snap.displayBounds;
+    offSnap.windows = @[ Win(103, 13, CGRectMake(-700, 100, 800, 600), 1) ];
+    M1WindowInfo *offNow = Win(103, 13, CGRectMake(2300, 40, 800, 600), 2);
+    tasks = [M1WindowLayoutPlanner planFromSnapshot:offSnap
+                                            windows:@[offNow]
+                                 disabledDisplayIDs:[NSSet setWithObject:@1]
+                                      currentBounds:bounds];
+    OK(tasks.count == 1 && fabs(tasks.firstObject.targetFrame.origin.x + 680) < 0.01 &&
+       fabs(tasks.firstObject.targetFrame.origin.y - 100) < 0.01,
+       "layout-plan-clamp-visible");
+
+    // 恢复器：授权时执行搬窗
+    FakeWindowLayoutProvider *fake = [FakeWindowLayoutProvider new];
+    fake.accessibilityTrusted = YES;
+    M1WindowLayoutSnapshot *nowSnap = [M1WindowLayoutSnapshot new];
+    nowSnap.displayBounds = bounds;
+    nowSnap.windows = @[ moved ];
+    fake.current = nowSnap;
+    M1WindowLayoutRestorer *restorer = [[M1WindowLayoutRestorer alloc] initWithProvider:fake];
+    NSDictionary *summary = [restorer restoreSnapshot:snap
+                                   disabledDisplayIDs:[NSSet setWithObject:@1]];
+    OK([summary[@"planned"] unsignedIntegerValue] == 1 &&
+       [summary[@"restored"] unsignedIntegerValue] == 1 && fake.moves.count == 1,
+       "layout-restore-applies");
+    OK(CGRectEqualToRect(M1RectGetValue(fake.moves.firstObject), snap.windows[0].frame),
+       "layout-restore-target-frame");
+
+    // 未授权：只计划不搬，不算失败
+    FakeWindowLayoutProvider *noAX = [FakeWindowLayoutProvider new];
+    noAX.accessibilityTrusted = NO;
+    noAX.current = nowSnap;
+    restorer = [[M1WindowLayoutRestorer alloc] initWithProvider:noAX];
+    summary = [restorer restoreSnapshot:snap disabledDisplayIDs:[NSSet setWithObject:@1]];
+    OK([summary[@"trusted"] boolValue] == NO &&
+       [summary[@"skipped"] unsignedIntegerValue] == 1 && noAX.moves.count == 0,
+       "layout-restore-untrusted-skip");
+}
+
 int main(void) {
     @autoreleasepool {
         TestPairing();
@@ -1188,6 +1332,7 @@ int main(void) {
         TestControlSessionPairingCode();
         TestControlSessionInput();
         TestControlSessionKeyframe();
+        TestWindowLayout();
         printf("\n=== %d passed, %d failed ===\n", gPass, gFail);
         printf("%s\n", gFail == 0 ? "ALL PASS" : "FAILURES");
         return gFail == 0 ? 0 : 1;

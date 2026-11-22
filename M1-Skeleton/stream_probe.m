@@ -969,6 +969,7 @@ int main(int argc, char **argv) {
             __block NSString *exclusiveC09Status = @"not-started";  // verified / skipped-keep-main
             __block NSString *exclusivePhaseAtReady = nil;          // 建屏后的会话阶段
             __block BOOL exclusiveRecoveryOK = YES;
+            __block NSDictionary *exclusiveWindowRestore = nil;     // 窗口布局搬回摘要
 
             // 独占会话（P2.2）：在 session-start 到达时同步建虚拟屏/禁物理屏，
             // 让 session-ready 带的是真实 displayID；失败会回 session-error 并结束会话。
@@ -1060,6 +1061,7 @@ int main(int argc, char **argv) {
                     exclusiveCoordinator = nil;
                     NSError *endErr = nil;
                     exclusiveRecoveryOK = [coord endSessionError:&endErr];
+                    exclusiveWindowRestore = [exclusiveDriver.lastWindowRestoreSummary copy];
                     if (!exclusiveRecoveryOK) {
                         printf("  [独占] 恢复失败: %s\n",
                                endErr.localizedDescription.UTF8String ?: "unknown");
@@ -1384,6 +1386,9 @@ int main(int argc, char **argv) {
                 json[@"sessionPhase"] = exclusivePhaseAtReady ?: @"";
                 json[@"sessionRecovered"] = @(exclusiveRecoveryOK);
                 json[@"sessionEnded"] = @(exclusiveEnded);
+                if (exclusiveWindowRestore) {
+                    json[@"windowLayoutRestore"] = exclusiveWindowRestore;
+                }
             }
             json[@"keyframeRequestsReceived"] = @(host.session.keyframeRequestsReceived);
             json[@"frameNacksReceived"] = @(host.session.frameNacksReceived);

@@ -28,6 +28,9 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
         _maxBitrate = 0;
         _keyframeIntervalSec = 2.0;
         _showsCursor = NO;
+        // auto 在高分辨率物理屏降采样时把缩放压给 host，采集会跌到 ~5fps；
+        // best 让 SCK 直接出目标尺寸（§5.24）。macOS 13 编译期/运行期均忽略。
+        _captureResolution = 1;
     }
     return self;
 }

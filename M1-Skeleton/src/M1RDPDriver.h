@@ -48,6 +48,10 @@ typedef NS_ENUM(NSInteger, M1RDPDriverErrorCode) {
 @property (nonatomic, strong, readonly, nullable) NSArray<NSNumber *> *lastActiveDisplayIDs;
 @property (nonatomic, copy, readonly, nullable) NSString *snapshotPath;
 
+// 会话结束时窗口布局恢复摘要（captured/planned/restored/failed/skipped/trusted）。
+// 未禁屏或没有窗口需要搬回时为 nil。
+@property (nonatomic, copy, readonly, nullable) NSDictionary *lastWindowRestoreSummary;
+
 // 只读侦察：返回当前 active display / 私有符号可用性 / 守护状态，不改动显示配置。
 - (NSDictionary *)probeEnvironment;
 

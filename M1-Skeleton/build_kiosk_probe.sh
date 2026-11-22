@@ -27,6 +27,7 @@ SOURCES=(
   "$SRC/M1Takeover.m"
   "$SRC/M1ScreenLock.m"
   "$SRC/M1SessionCoordinator.m"
+  "$SRC/M1WindowLayout.m"
   "$SRC/M1RDPDriver.m"
   # P0/P0V 底座
   "$P0SRC/ProbeUtil.m"

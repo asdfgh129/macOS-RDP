@@ -6,6 +6,7 @@
 #import "M1RDPDriver.h"
 #import "M1DriverLogic.h"
 #import "M1ScreenLock.h"
+#import "M1WindowLayout.h"
 #import "VDManager.h"
 #import "P0VDisplayControl.h"
 #import "ProbeUtil.h"
@@ -68,6 +69,10 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
 @property (nonatomic, strong, readwrite, nullable) NSArray<NSNumber *> *lastActiveDisplayIDs;
 @property (nonatomic, copy, readwrite, nullable) NSString *snapshotPath;
 @property (nonatomic, assign) BOOL screenSharingQuiesced;
+@property (nonatomic, strong, nullable) M1WindowLayoutSnapshot *windowLayoutSnapshot;
+@property (nonatomic, strong) M1WindowLayoutAXProvider *windowLayoutProvider;
+@property (nonatomic, copy, nullable) NSSet<NSNumber *> *disabledDisplayIDs;
+@property (nonatomic, copy, readwrite, nullable) NSDictionary *lastWindowRestoreSummary;
 @end
 
 @implementation M1RDPDriver
@@ -78,6 +83,7 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
         _snapshotBasePath = NSTemporaryDirectory();
         _displayAssertion = kIOPMNullAssertionID;
         _systemAssertion = kIOPMNullAssertionID;
+        _windowLayoutProvider = [M1WindowLayoutAXProvider new];
     }
     return self;
 }
@@ -85,6 +91,14 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
 - (NSDictionary *)probeEnvironment {
     NSError *e = nil;
     NSArray *shareable = P0VActiveDisplayIDs();
+    // 只读：验证窗口布局采集链路与 AX 授权，不做任何搬窗。
+    M1WindowLayoutSnapshot *layout =
+        [_windowLayoutProvider captureLayoutExcludingPIDs:[NSSet setWithObject:@(getpid())]];
+    NSArray *layoutWindows = layout.windows ?: @[];
+    uint32_t onSnapshotDisplays = 0;
+    for (M1WindowInfo *w in layoutWindows) {
+        if (w.displayID != 0) onSnapshotDisplays++;
+    }
     return @{
         @"activeDisplayIDs": shareable ?: @[],
         @"privateDisplayControl": @(P0VPrivateDisplayControlAvailable()),
@@ -94,6 +108,12 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
         @"staleVirtualSlots": P0VStaleVirtualSlotIDs() ?: @[],
         @"identityOffset": @([VDManager savedIdentityOffset]),
         @"snapshotBasePath": _snapshotBasePath,
+        @"windowLayout": @{
+            @"axTrusted": @(_windowLayoutProvider.accessibilityTrusted),
+            @"captured": @(layoutWindows.count),
+            @"onKnownDisplay": @(onSnapshotDisplays),
+            @"knownDisplayCount": @(layout.displayBounds.count ?: 0),
+        },
         @"error": e.localizedDescription ?: [NSNull null],
     };
 }
@@ -191,6 +211,15 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
         if (error) *error = M1DrvErr(M1RDPDriverErrorSnapshotFailed,
             @"当前没有任何 active display，快照无意义");
         return NO;
+    }
+    // 窗口布局与显示快照同时拍：建虚拟屏/禁物理屏之后 WindowServer 就会重排窗口。
+    if (!self.windowLayoutSnapshot) {
+        self.windowLayoutSnapshot =
+            [_windowLayoutProvider captureLayoutExcludingPIDs:[NSSet setWithObject:@(getpid())]];
+        printf("  [窗口布局] 快照 %lu 个窗口（AX trusted=%d）\n",
+               (unsigned long)self.windowLayoutSnapshot.windows.count,
+               self.windowLayoutProvider.accessibilityTrusted ? 1 : 0);
+        fflush(stdout);
     }
     NSString *path = [NSString stringWithFormat:@"%@m1-session-snapshot-%d.json",
                       _snapshotBasePath, getpid()];
@@ -299,6 +328,7 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
         return NO;
     }
     self.lastActiveDisplayIDs = activeNow;
+    self.disabledDisplayIDs = [NSSet setWithArray:physical];
     return YES;
 }
 
@@ -363,7 +393,31 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     self.snapshot = nil;
     self.lastActiveDisplayIDs = P0VActiveDisplayIDs();
 
-    // 4. 收尾自检：恢复完必须至少还有一块 active 屏，否则说明拓扑没回来。
+    // 4. 窗口搬回：物理屏已恢复、虚拟屏已销毁，WindowServer 的重排已发生。
+    //    best-effort，失败不影响显示恢复结论；摘要留给上层落盘。
+    if (self.windowLayoutSnapshot && self.disabledDisplayIDs.count > 0) {
+        // WindowServer 恢复显示后还会继续搬窗口；0.3s 时 AX 查询常超时（§5.34 实测）。
+        [NSThread sleepForTimeInterval:1.0];
+        M1WindowLayoutRestorer *restorer =
+            [[M1WindowLayoutRestorer alloc] initWithProvider:self.windowLayoutProvider];
+        self.lastWindowRestoreSummary =
+            [restorer restoreSnapshot:self.windowLayoutSnapshot
+                   disabledDisplayIDs:self.disabledDisplayIDs];
+        NSDictionary *s = self.lastWindowRestoreSummary;
+        printf("  [窗口布局] 恢复 captured=%lu planned=%lu restored=%lu failed=%lu "
+               "skipped=%lu trusted=%d\n",
+               (unsigned long)[s[@"captured"] unsignedIntegerValue],
+               (unsigned long)[s[@"planned"] unsignedIntegerValue],
+               (unsigned long)[s[@"restored"] unsignedIntegerValue],
+               (unsigned long)[s[@"failed"] unsignedIntegerValue],
+               (unsigned long)[s[@"skipped"] unsignedIntegerValue],
+               [s[@"trusted"] boolValue] ? 1 : 0);
+        fflush(stdout);
+    }
+    self.windowLayoutSnapshot = nil;
+    self.disabledDisplayIDs = nil;
+
+    // 5. 收尾自检：恢复完必须至少还有一块 active 屏，否则说明拓扑没回来。
     if (ok && self.lastActiveDisplayIDs.count == 0) {
         ok = NO;
         if (error) *error = M1DrvErr(M1RDPDriverErrorRestoreFailed,

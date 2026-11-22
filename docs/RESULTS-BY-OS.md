@@ -1453,6 +1453,44 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 **边界口径不变**：13 上只有 1280×720 单屏独占 C-09 有真机 PASS；1080p 独占为 OS 层边界；多屏独占与独占态 Path A（V-04d 等价）仍未覆盖。本轮未改产品代码（仅 stream_probe 两个默认关闭的诊断环境变量 + 既有 p2.sh `P2_SAVE_FRAMES`）。
 
+### 5.33 采集分辨率默认改 `best` + 本机 Sequoia 镜像环回冒烟（2026-11-22 20:3x，本机环回）
+
+**变更**：`M1FramePipelineConfig.captureResolution` 默认值 0（auto）→ **1（best）**。macOS 14+ 走 `SCCaptureResolutionBest`；macOS 13 由既有编译期守卫忽略，行为不变。`M1_CAPTURE_RESOLUTION=auto|nominal|0|2` 仍可覆盖（诊断用）。依据 §5.24：3440×1440 物理屏镜像到 1080p 时，auto 把缩放压给 host，采集跌到 5.7fps，best 让 SCK 直出目标尺寸、稳在 18–20fps。这样 host 启动不再依赖手动环境变量。
+
+**验证（本机 Sequoia 15.5，镜像模式环回，不建屏/不禁屏）**：
+- `build_stream_probe.sh` 无 warning；`test_skeleton` **268/268 PASS**。
+- 720p15 × 20s：采集 71 / 编码 69 / 发出 69，客户端收齐 69 / 解出 69、丢帧 0、解码失败 0，`p2.sh summary` **PASS**；`[capture]` 行确认 `res=best`（`mode=3008x1692@60`、`out=1280x720`、`scale=2.00`）。
+- 同负载 A/B（10s，主机仍在 mds 索引 + Qoder 渲染负载下）：best 22 帧、auto 6 帧。绝对吞吐远低于正常基线（WindowServer 被负载拖慢），**不能作为性能结论**，但可排除 `best` 在当前内容/负载下比 auto 更差。
+- 客户端渲染 189.8ms/帧仍是负载污染值（Qoder + mds），P2.3 空闲基线继续留待本机安静时重测；解码 16.4ms 正常。
+
+**部署含义**：高分辨率物理屏镜像推流默认即用 best；只有排查 SCK 分辨率选择时才显式设 `auto`/`nominal`。
+
+**Tahoe 真机复测（2026-11-22 22:3x，Tahoe 26.5.2 host × Sequoia 15.5 client，WAN）**：3440×1440 → 1920×1080 镜像 20fps / 20s，host `backend=ScreenCaptureKit`、`mode=3440x1440`、`out=1920x1080`、**`res=best`**，capture complete=20/s、idle=0，framesCaptured 488 / encoded 487 / sent 487；client decoded 485 / 19.6fps、规格断言 PASS、summary PASS、首帧 106ms。确认 `best` 在 Tahoe + 超宽屏镜像路径生效且不掉帧。**P2.3 仍不能收口**：client 渲染 192.6ms 是本机 Qoder/mds 负载下的污染值（不是空闲基线），留待两端安静时重测。
+
+### 5.34 M1 窗口布局快照/恢复落地：纯逻辑计划器 + AX 注入 + Tahoe 独占闭环（2026-11-22 21:1x 实现与 Sequoia 只读验证；22:0x–22:3x Tahoe 26.5.2 闭环）
+
+**背景**：D-05 的副作用——物理屏被移出空间时 WindowServer 把窗口搬到剩余屏，恢复后不会自动回原位。此前只有 display 快照，没有窗口级还原。
+
+**实现**（`M1-Skeleton/src/M1WindowLayout.{h,m}`，新模块）：
+- 采集：`CGWindowListCopyWindowInfo(OnScreenOnly|ExcludeDesktopElements)`，取 `layer==0`、非本进程、alpha>0.01 的窗口；frame 换算到全局左上坐标，按「中心所在屏 → 最大交叠屏」映射 `displayID`；同时记录各 active 屏 bounds。
+- 计划（纯逻辑，可离线测）：以 `pid#windowNumber` 精确匹配；只处理「快照时在本次被禁物理屏上、当前 frame 已变、窗口仍存在」的窗口；目标位置按快照所在屏夹取，至少保留 120pt 宽 × 40pt 高可见（负坐标屏也能正确夹回）。
+- 执行：`AXUIElement` 按 `AXWindowNumber` 匹配；Terminal 与系统设置不暴露该属性（`AXError=-25205`），回退用 position/size，并以 `CGWindowListCopyWindowInfo(IncludingWindow)` 取**当前** frame 做 8pt 容差比对（不再用快照 frame 比当前 AX 窗口）。先 size 后 position，单窗口消息超时 2.0s；`AXWindows` 枚举为空时 150ms 后重试一次（恢复显示后立即查询常返回空）。AX 未授权时只计划不搬，计 `skipped` 而非 `failed`。整轮预算 `max(3, min(10, 0.7×N))` 秒，best-effort。
+- 接线（`M1RDPDriver`）：窗口快照与 display 快照同在 `prepareSessionShieldError` 内、建虚拟屏之前拍摄；恢复顺序为「启用物理屏 → 销毁虚拟屏 → settle **1.0s** → 搬窗」（0.3s 时 AX 查询仍频繁超时，见 §5.34 现场记录），摘要写入 `lastWindowRestoreSummary`，`stream_probe` 的 host JSON 新增 `windowLayoutRestore` 字段。
+- 快照 JSON 与 display bounds 用 `valueWithBytes:objCType:@encode(CGRect)` 装箱，保持 Foundation-only 单测可编译。
+
+**验证**：
+- `build_tests.sh` **280/280 PASS**，新增 12 条：JSON 往返（含负坐标 frame / 负原点屏）、位移计划、原位跳过、保留屏跳过、窗口已关闭跳过、同 pid 不同 windowNumber 不误配、负坐标夹取（期望 x=-680）、授权执行搬窗与目标 frame、未授权 skip。
+- `build_stream_probe.sh` / `build_driver.sh` / `build_kiosk_probe.sh` 均无 warning。
+- `driver_probe` 只读环境（本机 Sequoia 15.5）：`axTrusted=true`、采集到 4 个窗口、`knownDisplayCount=3`、4 个窗口均映射到已知屏，证明采集链路在本机真实环境可用。
+
+**Tahoe 26.5.2 host 独占闭环（2026-11-22 22:0x–22:3x，WAN，Sequoia 15.5 client）**：
+- r3/r4 首次接入暴露两处实现问题：Terminal 的 AX 窗口枚举返回「应用没有可访问窗口」后整轮 `deadline`；系统设置窗口因拿快照 frame 比当前 AX frame 而误判「窗口已不存在」。按上面「当前 CG frame + 8pt 容差」「2s 超时 + 枚举重试」「预算随 N 缩放」修复。
+- **r5（自然场景）**：`captured=18 planned=0 restored=0 failed=0 trusted=1`。Tahoe 26.5.2 的 WindowServer 在显示恢复约 1s 内已把窗口全部搬回原位，**D-05 的「不还原」现象在该版本未复现**；因此自然会话无法证明我们的搬回逻辑，只能证明它不误搬。
+- **r6（诱导场景）**：在快照前用 AX 把 Terminal 窗口 `m1-gui-excl-r6.command` 从 (0,186) 强移到 (150,306)，再跑独占会话。host `captured=23 planned=7 restored=7 failed=0 skipped=0 trusted=1`，`C-09=verified`、`sessionRecovered=true`；client PASS。恢复后的 AX dump 显示该窗口位于 **464,131（即快照位置）**、已不在 150,306，其余 6 个被计划窗口也都复位。⇒「禁屏 → 窗口被搬走 → 恢复 → 搬回快照位置」端到端成立。
+- 7 个 planned 除被强移窗口外，还包含恢复瞬间被 WindowServer 挪动过的几个 Terminal 窗口；全部 restored，说明计划器不会误伤未位移窗口，也能处理位移方向/幅度不一致的情况。
+
+**仍未覆盖**：Ventura 13 的独占窗口恢复（今晚不测 Ventura）；多屏独占下的窗口布局恢复；AX 未授权时整轮 skip 的产品态行为（单测覆盖，未在 Tahoe 真机验证）。Sequoia 本机未跑完整独占（禁物理屏会黑屏），采集/计划/执行链路已由单测 + 只读探针 + Tahoe 闭环覆盖。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
@@ -1468,6 +1506,9 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
+- v0.60-draft 2026-11-22 22:4x：**M1 窗口布局恢复 Tahoe 独占闭环（§5.34）+ best 镜像真机复测（§5.33）**。Tahoe 26.5.2 host 独占：r5 自然场景 `planned=0`（该版本 WindowServer 自动还原，D-05 未复现）；r6 强移 Terminal 窗口到 (150,306) 后 `captured=23 planned=7 restored=7 failed=0`，恢复后窗口回到快照位置 (464,131)，C-09 verified、client PASS。修复：AX 枚举空重试、当前 CG frame + 8pt 容差匹配、2s 单窗超时、预算 `max(3,min(10,0.7N))` 秒、恢复 settle 1.0s。3440×1440→1080p20 镜像真机 `res=best` 生效，20fps 采集、client 19.6fps 全 PASS；P2.3 空闲渲染基线仍被本机负载污染，未收口。
+- v0.59-draft 2026-11-22 21:1x：**M1 窗口布局快照/恢复落地（§5.34）**。新增 `M1WindowLayout`：禁屏前采集 CGWindowList 窗口布局 + 屏幕 bounds，恢复后按 `pid#windowNumber` 精确匹配、只搬被禁屏上位移过的窗口，目标 frame 夹取到可见区域；AX 未授权时只计划不搬。驱动接线在建屏前拍快照、恢复并销毁虚拟屏后执行搬窗，`stream_probe` 输出 `windowLayoutRestore` 摘要。单测 280/280（新增 12 条），四个构建目标无 warning；本机 Sequoia 只读探针 `axTrusted=true`、4 窗口全部映射到已知屏。真实禁屏闭环留待下一轮 Tahoe 独占会话验证。
+- v0.58-draft 2026-11-22 20:3x：**采集分辨率默认 best，见 §5.33**。`M1FramePipelineConfig.captureResolution` 默认 0→1，macOS 14+ 直接让 SCK 输出目标尺寸（13 由编译期守卫忽略）；`M1_CAPTURE_RESOLUTION=auto|nominal` 保留为诊断覆盖。本机 Sequoia 镜像环回 720p15/20s：69/69 解出、0 丢帧、summary PASS、`res=best` 生效；同负载 best 22 帧 vs auto 6 帧（负载污染，仅排除回退）。单测 268/268。P2.3 空闲渲染基线仍待测。
 - v0.57-draft 2026-11-22 14:0x：**健康态独占复测 PASS + Path A 根因定位（§5.32）**。iMac 充分恢复后 13 host × 26 client 1280×720 独占 C-09 全链路再次 PASS（C-09=verified、511 帧解出/0 丢弃、8 张 PNG、WS 未崩），修正 §5.31「连续建屏必崩」的悲观判断。定位独占态 Path A 失败根因：`SACLockScreenImmediate` 须在 Aqua session 调用且物理屏全禁的独占态下静默失效，登录 UI 未呈现——非 OS 崩溃。harness 增 `M1_CTRL_RETRY_MS`/`M1_CTRL_MAX_ATTEMPTS` 两个默认关闭的诊断开关缓解建屏阻塞 ACK；产品代码未动。1080p 独占 OS 边界、多屏与独占态 Path A 未覆盖的口径不变。
 - v0.56-draft 2026-11-22 13:4x：**C-09 剩余边界补测遇 OS 层崩溃，收敛为边界（§5.31）**。尝试 1080p 独占、独占态 Path A、多屏独占：1080p（1920×1080）虚拟屏 mode-commit 后 WindowServer 崩在 `layer_blit_byte_ARGB8_ARGB8_RGB8`（SIGBUS），与已修复的 ScreensharingAgent/`CopyFrame` 竞态是两条独立问题，`M1_C09_QUIESCE_SS` 无效；首次 720p 独占态 Path A 因建屏期间控制通道 `seq=2 重传 8 次` 踩线提前放弃（未进流）；带病态重跑 720p 又崩在 `layer_blit_byte_ANY`（SIGSEGV，WS 进程自 1080p 崩溃后带病运行）。⇒ 新增三条 Ventura 13/此机型边界（1080p 独占层 blit 崩溃、mode-commit 阻塞控制 ACK、连续 mode-commit 累积不稳定），停止连续真机重试；独占态 Path A（V-04d 等价）与多屏独占保持未覆盖。harness 仅加 `P2_SAVE_FRAMES` 可选参数，产品代码未动。
 - v0.55-draft 2026-11-21 22:3x：**13 完整独占禁屏 / C-09 PASS（§5.30）**。WindowServer 崩溃报告证明两次旧崩溃与一次新崩溃都由 ScreensharingAgent 的 `CGDisplayStream` 与虚拟屏 mode 提交 / 禁屏重配置竞态触发（栈顶 `DisplayStreamStateSW::CopyFrame` 或 `layer_blit_byte_ANY`），且发生在建屏阶段，故把 `SIGSTOP` 窗口从禁屏事务前移到建屏前（C-17.40），提交 + settle 后 `SIGCONT`，所有异常/兜底路径解冻；`M1_C09_QUIESCE_SS=0` 可关闭。13 host × 26 client LAN 1280×720@15：C-09 verified、active 仅虚拟屏、采集 172/编码 163/发出 163、client 解出 163/上屏 161、summary PASS，WindowServer 未重启、物理屏恢复、屏幕共享仍可达。§5.28「OS 层阻塞、不再重试」结论作废。
