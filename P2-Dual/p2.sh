@@ -27,6 +27,7 @@
 #   P2_INJECT=real      host 的注入方式：real（真注入，需辅助功能授权）/ record
 #   P2_WINDOW=1280x720  client 窗口尺寸
 #   P2_SPEC=1280x720    client 请求 host 的推流规格（独占模式下解码尺寸必须与之相同）
+#   P2_SAVE_FRAMES=0    client 保存前 N 帧到 $OUT（锁屏/登录 UI 视觉证据用；默认 0）
 #   P2_EXCLUSIVE=1      host 建虚拟屏并禁物理屏（现已是默认；保留兼容）
 #   P2_MIRROR=1         host 采物理主屏（诊断用；旧默认）
 #   P2_KEEP_MAIN=1      独占时保留物理主屏（诊断模式，不满足 C-09）
@@ -170,12 +171,15 @@ client)
   do_preflight client "$PEER"
   say "client：连 ${PEER}:${PORT}，窗口 ${WIN}，接收 ${SECS}s"
   say "输出：$OUT"
+  # P2_SAVE_FRAMES：保存客户端解码前 N 帧到 $OUT，默认 0（不改变既有行为）。
+  # 用于锁屏 / 登录 UI 等需要视觉证据的场景；帧名 frame-001.png 递增。
+  SAVE_FRAMES="${P2_SAVE_FRAMES:-0}"
   # shellcheck disable=SC2086
   ./stream_probe --client --connect "$PEER" --port "$PORT" --fingerprint "$FP" $SPEC_ARG \
       ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
       --handshake-ms "$HANDSHAKE_MS" --wait-ms "$WAIT_MS" \
       --duration-ms "$((SECS * 1000))" --window "$WIN" \
-      --save-frames 0 --out "$OUT/client.json" 2>&1 | tee "$OUT/client.log"
+      --outdir "$OUT" --save-frames "$SAVE_FRAMES" --out "$OUT/client.json" 2>&1 | tee "$OUT/client.log"
   rc=${PIPESTATUS[0]}
   say ""
   say "client 结束（rc=${rc}），产物：${OUT}/client.json"
