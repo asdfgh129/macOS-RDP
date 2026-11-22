@@ -1465,7 +1465,14 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 **部署含义**：高分辨率物理屏镜像推流默认即用 best；只有排查 SCK 分辨率选择时才显式设 `auto`/`nominal`。
 
-**Tahoe 真机复测（2026-11-22 22:3x，Tahoe 26.5.2 host × Sequoia 15.5 client，WAN）**：3440×1440 → 1920×1080 镜像 20fps / 20s，host `backend=ScreenCaptureKit`、`mode=3440x1440`、`out=1920x1080`、**`res=best`**，capture complete=20/s、idle=0，framesCaptured 488 / encoded 487 / sent 487；client decoded 485 / 19.6fps、规格断言 PASS、summary PASS、首帧 106ms。确认 `best` 在 Tahoe + 超宽屏镜像路径生效且不掉帧。**P2.3 仍不能收口**：client 渲染 192.6ms 是本机 Qoder/mds 负载下的污染值（不是空闲基线），留待两端安静时重测。
+**Tahoe 真机复测（2026-11-22 22:3x，Tahoe 26.5.2 host × Sequoia 15.5 client，WAN）**：3440×1440 → 1920×1080 镜像 20fps / 20s，host `backend=ScreenCaptureKit`、`mode=3440x1440`、`out=1920x1080`、**`res=best`**，capture complete=20/s、idle=0，framesCaptured 488 / encoded 487 / sent 487；client decoded 485 / 19.6fps、规格断言 PASS、summary PASS、首帧 106ms。确认 `best` 在 Tahoe + 超宽屏镜像路径生效且不掉帧。
+
+**P2.3 干净基线（2026-11-22 21:39–21:47，本机 Sequoia 15.5；Qoder 最小化 + mds 暂停 + 测试进程 nice -20）**：
+- 离屏 `render_selftest` 8 轮（每档 n=8）：vga min/p50/p95 = 2.3/2.3/2.4ms，720p = 3.0/3.2/3.4ms，1080p = 5.2/5.3/10.4ms，ultrawide = 10.3/13.2/22.2ms，**0 条失败**。此前 20–50ms 的离屏值主要是 Qoder UI/WindowServer 竞争，不是 CI 转换成本。
+- 真实 client 1080p20 镜像 30s（Tahoe 26.5.2 host 主屏 3440×1440→1920×1080 + 全屏动画）：host `complete=20/s idle=0`、framesCaptured 589 / sent 588；client 解码 19.2fps、上屏 504、积压丢弃 66、`lastRenderMs=3.9`、`maxRenderMs=209.4`（启动尖峰）、规格断言 PASS、`p2.sh summary` PASS。
+- ⇒ 1080p20 的客户端渲染下限约 **4ms**，相对 50ms 帧预算有 10× 余量；积压丢弃来自重组/队列而非渲染成本。当前 harness 只有 last/max，p50/p95 需后续加分位数统计。
+
+**P2.3 测量环境要点**：Qoder 常驻时即使 `nice -20` 也会出现 500–875ms 调度尖峰（nice 不约束 GPU/WindowServer）；把 Qoder 窗口最小化后 WindowServer 从 24% 降到 5%，配合暂停 mds 才能得到上述稳定值。专用户会话是更彻底的隔离方式。
 
 ### 5.34 M1 窗口布局快照/恢复落地：纯逻辑计划器 + AX 注入 + Tahoe 独占闭环（2026-11-22 21:1x 实现与 Sequoia 只读验证；22:0x–22:3x Tahoe 26.5.2 闭环）
 
@@ -1506,6 +1513,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
+- v0.61-draft 2026-11-22 21:5x：**P2.3 干净基线（§5.33）**。Qoder 最小化 + mds 暂停 + nice -20 后，离屏 8 轮：720p 3.2ms、1080p 5.3ms（p95 10.4ms）、ultrawide 13.2ms，0 失败；真实 client 1080p20 镜像 30s：host complete=20/idle=0、589→588 帧，client 19.2fps、上屏 504、`lastRenderMs=3.9`、`maxRenderMs=209.4`（启动尖峰）、summary PASS。⇒ 1080p20 渲染下限 ~4ms，积压丢弃不来自渲染；Qoder 常驻时的 500–875ms 尖峰是 WindowServer/GPU 竞争，nice 无法消除，需最小化或专用户隔离。
 - v0.60-draft 2026-11-22 22:4x：**M1 窗口布局恢复 Tahoe 独占闭环（§5.34）+ best 镜像真机复测（§5.33）**。Tahoe 26.5.2 host 独占：r5 自然场景 `planned=0`（该版本 WindowServer 自动还原，D-05 未复现）；r6 强移 Terminal 窗口到 (150,306) 后 `captured=23 planned=7 restored=7 failed=0`，恢复后窗口回到快照位置 (464,131)，C-09 verified、client PASS。修复：AX 枚举空重试、当前 CG frame + 8pt 容差匹配、2s 单窗超时、预算 `max(3,min(10,0.7N))` 秒、恢复 settle 1.0s。3440×1440→1080p20 镜像真机 `res=best` 生效，20fps 采集、client 19.6fps 全 PASS；P2.3 空闲渲染基线仍被本机负载污染，未收口。
 - v0.59-draft 2026-11-22 21:1x：**M1 窗口布局快照/恢复落地（§5.34）**。新增 `M1WindowLayout`：禁屏前采集 CGWindowList 窗口布局 + 屏幕 bounds，恢复后按 `pid#windowNumber` 精确匹配、只搬被禁屏上位移过的窗口，目标 frame 夹取到可见区域；AX 未授权时只计划不搬。驱动接线在建屏前拍快照、恢复并销毁虚拟屏后执行搬窗，`stream_probe` 输出 `windowLayoutRestore` 摘要。单测 280/280（新增 12 条），四个构建目标无 warning；本机 Sequoia 只读探针 `axTrusted=true`、4 窗口全部映射到已知屏。真实禁屏闭环留待下一轮 Tahoe 独占会话验证。
 - v0.58-draft 2026-11-22 20:3x：**采集分辨率默认 best，见 §5.33**。`M1FramePipelineConfig.captureResolution` 默认 0→1，macOS 14+ 直接让 SCK 输出目标尺寸（13 由编译期守卫忽略）；`M1_CAPTURE_RESOLUTION=auto|nominal` 保留为诊断覆盖。本机 Sequoia 镜像环回 720p15/20s：69/69 解出、0 丢帧、summary PASS、`res=best` 生效；同负载 best 22 帧 vs auto 6 帧（负载污染，仅排除回退）。单测 268/268。P2.3 空闲渲染基线仍待测。
