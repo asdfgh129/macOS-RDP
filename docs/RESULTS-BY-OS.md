@@ -1431,21 +1431,43 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 **环境收尾**：iMac 两次回到 loginwindow，均以 `kickstart -activate -restart -agent -console` 恢复屏幕共享，TCP 5900 / RFB 003.889 可达；临时口令文件 `/tmp/c09pw` 待登录后清理。本机与 iMac 仓库均在 `7054bc5` 基线，本机仅有 p2.sh 未提交改动。
 
+### 5.32 健康态独占复测 PASS + Path A 根因定位（2026-11-22 13:5x–14:0x）
+
+用户手动登录后 iMac 显示栈已充分恢复（WS PID 37968 稳定运行、console=bemin、ScreensharingAgent 正常、5900 可达）。据此重跑并定位根因。
+
+**① 健康态 720p 独占 C-09 全链路 PASS（推翻 §5.31「连续建屏必崩」的悲观判断）**：
+- `P2-Dual/out/patha-exclusive-r4/`，13 host × 26 client LAN 1280×720@15、50s：
+  - host：`C-09=verified`，禁屏后 active 仅虚拟屏 `4128832`，`sessionRecovered=true`；冻结窗口 13:54:53 起、13:54:57 恢复；**全程 WindowServer PID 37968 未变，无崩溃**。
+  - client：状态序列 `DISCOVERED→…→STREAMING`，datagrams=3623 / decoded=511 / dropped=0 / decodeFail=0；上屏 25 帧；规格断言 PASS；`p2.sh` 判定 **PASS**；保存 8 张 PNG 作为视觉证据。
+- ⇒ **V-补3 修正**：连续 mode-commit 的累积不稳定不是必然；健康态（充分恢复）下 720p 独占可稳定 PASS。真机纪律仍是「崩溃后须充分恢复再测」，但不因历史崩溃否定健康态结果。
+
+**② 建屏阻塞控制 ACK 的稳健规避（V-补2 缓解）**：
+- `M1-Skeleton/stream_probe.m` 在 `attachSessionTo:` 增两个诊断开关 `M1_CTRL_RETRY_MS`、`M1_CTRL_MAX_ATTEMPTS`（默认 250ms×8 不变）。r4 客户端设 `500ms×16`（8s 窗口）后，实测控制通道最大到达间隔 1018ms 未踩线，进流成功。属 harness 诊断开关，默认行为不变。
+
+**③ Path A 独占态根因定位（V-04d 等价仍未通过，但已从「OS 崩溃」改为「明确的 API 上下文限制」）**：
+- r4 的 wrapper 在**独占态**（物理屏全禁、仅虚拟屏 active）调用 `p0vprobe lock`：返回 `{"ok":true,"called":"SACLockScreenImmediate"}`，但锁屏后 probe 仍 `screenIsLocked=false`，保存帧全是动画/桌面，**登录 UI 从未呈现**。
+- 对照实验（恢复物理单屏后）：同样的 `p0vprobe lock` 在 GUI Terminal（Aqua session）里调用，8 秒后 `screenIsLocked=true`；而 SSH 进程直接调用同 API 静默无效（不在 Aqua session）。⇒ **`SACLockScreenImmediate` 必须在 Aqua/GUI session 中调用，且在物理屏全禁的独占态下不生效**。
+- 镜像模式 §5.29 的 Path A 成功，正是因为物理屏仍在、lock 在 GUI Terminal 有效；独占态禁掉物理屏后这条锁屏触发路径失效。⇒ 独占态 Path A 要成立，需另找触发锁屏/登录窗的路径（例如登录窗迁移本身应由「零 active 物理屏」触发，见 §5 V-04d Tahoe 结论；13 上该迁移是否自动发生尚未验证）。
+- 锁屏后一度进入「`screenIsLocked=true` 但登录框未呈现」的过渡态（`kCGSessionSecureInputPID=none`、截图纯壁纸），SSH 侧 `type` 注入无效；已清理残留进程。**该状态下恢复登录需人工/屏幕共享**。
+
+**边界口径不变**：13 上只有 1280×720 单屏独占 C-09 有真机 PASS；1080p 独占为 OS 层边界；多屏独占与独占态 Path A（V-04d 等价）仍未覆盖。本轮未改产品代码（仅 stream_probe 两个默认关闭的诊断环境变量 + 既有 p2.sh `P2_SAVE_FRAMES`）。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
 |---|---|---|---|
 | A-01 Tahoe SPI 可用 | — | ✅ 关闭 | — |
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 | — |
-| A-07 13–26 双角色 | — | — | ⚠️ 部分收敛：client 全角色 PASS（§5.24）；host 的 SCK 被系统拒绝但 CG 回退可用，镜像 + 虚拟屏 keep-main 双机全链路 PASS（§5.27/§5.28），真实系统输入注入 PASS（光标位移 >1000px），SPI 建虚拟屏 PASS，帧率 ~14.8fps@720p；锁屏态改用 CGDisplayCreateImage 后端后可看见登录界面并接受键入，14.9fps@720p（§5.29）；**1280×720 完整独占禁屏/C-09 加 ScreensharingAgent 竞态规避后已 PASS（§5.30）**；1920×1080 独占触发 WindowServer layer-blit 崩溃为该机型 OS 层边界、不重试；多屏独占未覆盖（§5.31） |
+| A-07 13–26 双角色 | — | — | ⚠️ 部分收敛：client 全角色 PASS（§5.24）；host 的 SCK 被系统拒绝但 CG 回退可用，镜像 + 虚拟屏 keep-main 双机全链路 PASS（§5.27/§5.28），真实系统输入注入 PASS（光标位移 >1000px），SPI 建虚拟屏 PASS，帧率 ~14.8fps@720p；锁屏态改用 CGDisplayCreateImage 后端后可看见登录界面并接受键入，14.9fps@720p（§5.29）；**1280×720 完整独占禁屏/C-09 加 ScreensharingAgent 竞态规避后已 PASS（§5.30）**，健康态复测再次全链路 PASS（§5.32）；1920×1080 独占触发 WindowServer layer-blit 崩溃为该机型 OS 层边界、不重试；多屏独占未覆盖（§5.31） |
 | A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
-| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） | ✅ 镜像模式 Path A 端到端 PASS（V-04a/b/c 等价）：锁屏且防睡眠下 CGDisplayCreateImage 后端看到完整登录界面（14.9fps），定向键入使密码框出现圆点，真实口令注入后 `locked=0 / ok=1`、回到桌面（§5.29）。**独占禁屏下的登录窗迁移（V-04d 等价）仍未实测**：补测被建屏阶段的控制通道重传放弃与 WindowServer layer-blit 崩溃阻断（§5.31） |
+| A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） | ✅ 镜像模式 Path A 端到端 PASS（V-04a/b/c 等价）：锁屏且防睡眠下 CGDisplayCreateImage 后端看到完整登录界面（14.9fps），定向键入使密码框出现圆点，真实口令注入后 `locked=0 / ok=1`、回到桌面（§5.29）。**独占禁屏下的登录窗迁移（V-04d 等价）仍未实测**：补测被建屏阶段的控制通道重传放弃与 WindowServer layer-blit 崩溃阻断（§5.31）；健康态独占全链路虽 PASS，但独占态下 `SACLockScreenImmediate` 静默失效（须 Aqua session 且物理屏全禁时不生效），登录 UI 未呈现（§5.32） |
 | A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。2026-11-19 跨公网已取得首批双机数据（§5.13，Tahoe host × Sequoia client）：1080p20 客户端渲染 84.7ms/帧、解码/发出 54/375；720p10 渲染 41.6ms、上屏 0 积压；补测 C/D 拿到完整配对（3440×1440 → 7 解出；720p15 → 136/443，丢包 4–6% + 严格按序重组等关键帧是主因）。无 60fps / glass-to-glass 证据，A-02 保持开放，见 D-10 |
 
 ---
 
 ## 7. 变更记录
 
+- v0.57-draft 2026-11-22 14:0x：**健康态独占复测 PASS + Path A 根因定位（§5.32）**。iMac 充分恢复后 13 host × 26 client 1280×720 独占 C-09 全链路再次 PASS（C-09=verified、511 帧解出/0 丢弃、8 张 PNG、WS 未崩），修正 §5.31「连续建屏必崩」的悲观判断。定位独占态 Path A 失败根因：`SACLockScreenImmediate` 须在 Aqua session 调用且物理屏全禁的独占态下静默失效，登录 UI 未呈现——非 OS 崩溃。harness 增 `M1_CTRL_RETRY_MS`/`M1_CTRL_MAX_ATTEMPTS` 两个默认关闭的诊断开关缓解建屏阻塞 ACK；产品代码未动。1080p 独占 OS 边界、多屏与独占态 Path A 未覆盖的口径不变。
 - v0.56-draft 2026-11-22 13:4x：**C-09 剩余边界补测遇 OS 层崩溃，收敛为边界（§5.31）**。尝试 1080p 独占、独占态 Path A、多屏独占：1080p（1920×1080）虚拟屏 mode-commit 后 WindowServer 崩在 `layer_blit_byte_ARGB8_ARGB8_RGB8`（SIGBUS），与已修复的 ScreensharingAgent/`CopyFrame` 竞态是两条独立问题，`M1_C09_QUIESCE_SS` 无效；首次 720p 独占态 Path A 因建屏期间控制通道 `seq=2 重传 8 次` 踩线提前放弃（未进流）；带病态重跑 720p 又崩在 `layer_blit_byte_ANY`（SIGSEGV，WS 进程自 1080p 崩溃后带病运行）。⇒ 新增三条 Ventura 13/此机型边界（1080p 独占层 blit 崩溃、mode-commit 阻塞控制 ACK、连续 mode-commit 累积不稳定），停止连续真机重试；独占态 Path A（V-04d 等价）与多屏独占保持未覆盖。harness 仅加 `P2_SAVE_FRAMES` 可选参数，产品代码未动。
 - v0.55-draft 2026-11-21 22:3x：**13 完整独占禁屏 / C-09 PASS（§5.30）**。WindowServer 崩溃报告证明两次旧崩溃与一次新崩溃都由 ScreensharingAgent 的 `CGDisplayStream` 与虚拟屏 mode 提交 / 禁屏重配置竞态触发（栈顶 `DisplayStreamStateSW::CopyFrame` 或 `layer_blit_byte_ANY`），且发生在建屏阶段，故把 `SIGSTOP` 窗口从禁屏事务前移到建屏前（C-17.40），提交 + settle 后 `SIGCONT`，所有异常/兜底路径解冻；`M1_C09_QUIESCE_SS=0` 可关闭。13 host × 26 client LAN 1280×720@15：C-09 verified、active 仅虚拟屏、采集 172/编码 163/发出 163、client 解出 163/上屏 161、summary PASS，WindowServer 未重启、物理屏恢复、屏幕共享仍可达。§5.28「OS 层阻塞、不再重试」结论作废。
 - v0.54-draft 2026-11-21 21:2x：**13 Path A 真实口令解锁 PASS（§5.29 补测）**。用户给出真实口令；发现合成 Unicode 事件投递过密导致 10 字符只落 2 个圆点，修复 `p0vprobe.m`：逐字符 30ms 间隔 + 键入前 32 次 Delete 清场，并从输出里去掉明文口令。复测 `p0vprobe lock` → 前置 `locked=1` → 注入 → 后置 `locked=0 / ok=1`，截图为已解锁桌面，证据 `P2-Dual/out/a07-unlock-real-r2/`。A-09 在 13 更新为镜像模式端到端 PASS；完整独占禁屏下的登录窗迁移仍受 C-09 阻塞。

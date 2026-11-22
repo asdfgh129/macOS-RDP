@@ -231,6 +231,14 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 - (void)attachSessionTo:(M1QuicTransport *)conn {
     self.streamConn = conn;
     self.link = [[M1ControlLink alloc] initWithSink:[M1PriorityDatagramSink sinkForTransport:conn]];
+    {
+        // 诊断开关：慢速建屏（如 13 独占 mode-commit）期间控制 ACK 可能延迟，
+        // 放宽重传窗口避免误判丢包。默认行为不变（250ms × 8）。
+        const char *retryMs = getenv("M1_CTRL_RETRY_MS");
+        if (retryMs && atoi(retryMs) > 0) self.link.retryIntervalMs = (uint32_t)atoi(retryMs);
+        const char *maxTries = getenv("M1_CTRL_MAX_ATTEMPTS");
+        if (maxTries && atoi(maxTries) > 0) self.link.maxAttempts = (NSUInteger)atoi(maxTries);
+    }
     self.link.delegate = self;
     self.channel = [[M1ControlChannel alloc] initWithSink:self.link];
 
