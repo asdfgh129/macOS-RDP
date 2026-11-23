@@ -19,6 +19,10 @@
 
 - refactor: 产品层收口，五 target 静态库化与入口自检 (`c72f4b9`)
 
+### Fixed
+
+- fix: 产品 host 入口实现 `--guardian` 兜底握手（C-12.2），keep-main 双机 WAN 闭环入档 §5.36 (`17f9883`)
+
 ## [2026-11-22] — 帧头 v3 与 P2 基线收口
 
 ### Added

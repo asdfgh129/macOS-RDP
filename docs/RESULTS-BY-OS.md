@@ -1537,6 +1537,26 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 **口径**：① 单机环回中采集编码与解码渲染争同一条 GPU/WindowServer，且 Screen Sharing 仍在解码 Tahoe 3440×1440 画面，p50≈一个帧间隔（50ms）更像排队节拍，p95 尾部是竞争噪声，**仅作冒烟**；② 跨机数字是 **capture→render**，不含显示器扫描、摄像头采样，**不等于 glass-to-glass**；③ 跨机样本仅来自一轮会话的两种时长（30s/40s），尚未做多时段/多网络条件采样。
 
+### 5.36 产品入口补齐 `--guardian` 兜底握手；Tahoe keep-main 双机 WAN 闭环（2026-11-23 21:4x–22:2x）
+
+**背景**：产品入口 `veild-host-agent --serve` 跑 keep-main/独占档时被自身安全门禁拒绝：`M1RDPDriver.prepareSessionShield` 调 `P0VStartGuardian`，后者用同一二进制 re-exec `--guardian` 并等待 `<snapshot>.guardian-ready`；第 4 轮产品化后的 `Apps/HostAgent/Sources/main.m` 没有该分支，守护子进程打印用法后退出，握手超时即报「守护进程启动即退出（exit=0）…禁止在无兜底的情况下禁屏」。探针入口（`stream_probe` 等）一直有该分支，属 C-12.2 的收口遗漏。
+
+**修复（`17f9883`）**：`Apps/HostAgent/Sources/main.m` 在 `main` 最前拦截 `--guardian <snapshot> --parent-pid <pid>` 并转调 `P0VRunGuardian`（+13 行）。`HostDaemon` 目标不链接 RDPKit、也不执行显示配置，未改。五个 target 重建，`Scripts/test.sh` ALL PASS；两端 `--guardian` 缺参均退出码 3，确认分支生效。
+
+**本机 Sequoia 15.5（host/client 同机，`127.0.0.1`，产品入口）**：
+- 镜像档 r0（720p15，静态桌面，30s/18s）：握手 55.3ms，host captured 43 / encoded 42 / sent 28（drop 0），client 28/28 解出上屏，解码/发送 = 100%，控制最大间隔 1046ms，上屏 p50/p95 = 92.5/320.5ms，时钟 offset 10µs，`c09=not-started`。
+- 镜像档 r1（720p15，主屏 `anim_display 0` 彩条动画，26s/18s）：握手 65.3ms，host captured 265 / encoded 264 / sent 223，动画期间 `[capture] complete=12–15 idle=0–3`；client 220/220 解出上屏、0 丢帧，**解码/发送 = 220/223 = 98.7%**，控制最大间隔 1051ms，上屏 p50/p95 = 113.5/366.5ms。
+- keep-main 门禁（修复后）：守护进程启动并完成就绪握手（快照旁生成 `.guardian-ready`），但本机被已知陈旧虚拟槽位 `4128835` 阻断——建屏即处于镜像态，`unmirror 超时(8s) → WindowServer 疑似挂起`，keeper 中止全部建屏动作（非本次改动引入）。强制终止 host 后守护日志记录「父进程未正常收尾 → 兜底恢复成功」。副作用：主屏模式从 3008×1692（Looks like）落到 3840×2160，已用 `CGDisplaySetDisplayMode` 恢复并核对三块物理屏。**本机 keep-main/独占仍需登出清理槽位后再测**。
+
+**Tahoe 26.5.2 host × Sequoia 15.5 client（WAN `112.5.32.34:46600`，keep-main 720p15）**：
+- 启动：SSH 下 `launchctl asuser` + `open -a Terminal host-serve.command`，沿用 Terminal 的屏幕录制授权；两端指纹 `3305dec…` 一致。本机 `192.168.31.171 → 192.168.10.23` ICMP 100% 丢包，LAN 路径本轮不通，改走公网。
+- r1（虚拟屏静态，30s/18s）：握手 59.8ms，host captured 31 / encoded 30 / sent 16，client 15/15 解出上屏、0 丢帧，`c09=skipped-keep-main`，结束打印 `已恢复物理屏并销毁虚拟屏`。
+- r2（虚拟屏全屏彩条动画，40s/25s）：host captured 343 / encoded 342 / sent 325（drop 0），动画期间 `[capture] complete=15 idle=0` 稳定；client 解码 321 / 上屏 320、0 丢帧，**解码/发送 = 321/325 = 98.8%**，控制最大间隔 **1062ms**，上屏 p50/p95 = 188.5/405.5ms，时钟 offset -53ms（8 样本）；结束销毁 1 块虚拟屏、物理屏恢复为 2 块。
+
+**口径问题（待修）**：host JSON 的 `maxControlGapMs` 把 client 退出到 host 时长结束的空窗计入（r2 15.1s ≈ 40s−25s，r1 18.9s 同理），不能当门禁值；本轮门禁以 client 侧 1062ms 为准。
+
+**仍未覆盖**：本机 Sequoia 的 keep-main/独占（需先清陈旧槽位）；LAN 路径；`--inject real`；C-09 全独占档走产品入口（keep-main 只记 `skipped-keep-main`，不判 C-09）。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
@@ -1552,6 +1572,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
+- v0.64-draft 2026-11-23 22:2x：**产品入口补齐 `--guardian`，keep-main 双机 WAN 闭环（§5.36）**。产品 `veild-host-agent --serve` 的 keep-main/独占档此前被自身门禁拒绝：`M1RDPDriver` 的 `P0VStartGuardian` 用同一二进制 re-exec `--guardian`，产品入口缺该分支导致握手超时、禁止禁屏（探针入口一直有，属 C-12.2 收口遗漏）。`Apps/HostAgent/Sources/main.m` 补分支并转调 `P0VRunGuardian`（`17f9883`），`HostDaemon` 不链接 RDPKit、不碰显示配置，未改。本机 Sequoia 15.5 镜像环回两轮（静态 28 帧；动画 220/223=98.7%、p50 113.5ms）通过；keep-main 被陈旧虚拟槽位 4128835 阻断（unmirror 超时），守护兜底恢复成功，主屏模式已手工恢复 3008×1692。Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，keep-main 720p15）：静态轮 15/15、动画轮 321/325=98.8%、0 丢帧、控制间隔 1062ms、`c09=skipped-keep-main`、虚拟屏销毁且物理屏恢复。发现 host 侧 `maxControlGapMs` 把 client 退出后的空窗计入，门禁应以 client 值为准。
 - v0.63-draft 2026-11-22 23:0x：**A-02 打点落地 + 首轮跨机 capture→render（§5.35）**。帧头 v2→v3（26B，偏移 18 起 8B `capturedAtUs`），Host 采集打点经编码 PTS 回填、Client 用其作解码 PTS 并在贴层处算原始差；控制通道新增 `time-sync`/`time-sync-reply`（最小 RTT 估时钟差）。首次跨机暴露符号错误：原始差为负的帧被直方图丢弃、报告端又减了时钟差，导致 p50=0、样本仅 380/586；改为 -512ms 起的有符号直方图并改回 `raw+offset` 后，Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，1080p20 镜像）两轮：r2 583 帧 p50/p95 95.1/231.1ms、r3 767 帧 94.2/206.2ms，时钟差 ~88ms、RTT 7–9ms、解码 19.2–19.7fps、0 丢、summary PASS。单测双端 291/291。glass-to-glass 仍开放。
 - v0.62-draft 2026-11-22 22:1x：**P2.3 上屏积压收口（§5.33）**。上轮 66 帧丢弃来自 2 帧积压上限而非渲染成本（转换 p50 4.5ms）：槽位改为转换完成即释放，上限 8 时剩 2 帧、12 时归零。1080p20 镜像最终轮 host 589 采集/588 发出，client 587/587 解出并上屏、积压丢 0、`maxPendingRenders=8`、p50/p95 4.5/20.5ms、主线程等待 0.1ms、解码 19.8fps、summary PASS；新增 pending/直方图/入队与主线程等待指标及 client JSON 字段。单测 280/280、render_selftest ALL PASS。⇒ P2.3 完成判据达成，A-02 仍开放。
 - v0.61-draft 2026-11-22 21:5x：**P2.3 干净基线（§5.33）**。Qoder 最小化 + mds 暂停 + nice -20 后，离屏 8 轮：720p 3.2ms、1080p 5.3ms（p95 10.4ms）、ultrawide 13.2ms，0 失败；真实 client 1080p20 镜像 30s：host complete=20/idle=0、589→588 帧，client 19.2fps、上屏 504、`lastRenderMs=3.9`、`maxRenderMs=209.4`（启动尖峰）、summary PASS。⇒ 1080p20 渲染下限 ~4ms，积压丢弃不来自渲染；Qoder 常驻时的 500–875ms 尖峰是 WindowServer/GPU 竞争，nice 无法消除，需最小化或专用户隔离。该轮 66 帧积压已在 v0.62 收口。
