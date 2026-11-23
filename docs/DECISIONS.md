@@ -161,7 +161,7 @@ Host 不为每个会话预先创建虚拟屏。会话开始时的供给顺序是
 ### 理由
 
 - **为什么不是多会话**：Windows RDP 是"服务端为新客户端开一个新会话"，macOS 的会话创建被 Apple 私有 entitlement 独占。第三方做到的是"同一 console 会话内独占"，这恰好满足用户要的体验（我登入，别人不能用），而**不需要**多会话并发。
-- **为什么不是镜像**：镜像把被控端屏数、分辨率、隐私问题全部暴露给客户端，且体验差。Apple 自己也不这么做（HP 模式用虚拟屏 + 置黑）。
+- **为什么不是镜像**：镜像把被控端屏数、分辨率、隐私问题全部暴露给客户端，且体验差。Apple 自己也不这么做（HP 模式用虚拟屏 + 置黑）。**补充（2026-11-23）**：VNC/RFB 与 RDP 的延迟差别不在「采集 / 不采集」，而在采集层级、编码和缓存复用，详见 `DESIGN.md` §1.2.1。
 - **为什么 Intel 上要自研**：Apple 的 HP 模式只给 Apple Silicon。Intel 上没有系统级方案，所以只能自己拼：`CGVirtualDisplay` + `SLSConfigureDisplayEnabled` + `SACLockScreenImmediate`，这三块本机已验证存在。
 
 ### 影响与待办
@@ -869,6 +869,54 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
   预期位置）。**`physical` 驱动与主机真注入未验证**：两者都要求宿主进程
   `AXIsProcessTrusted=1`，属授权前置而非代码问题，列入双机验收。
   若单机无法稳定解锁，判据并入双机验收（届时窗口在另一台机器上）。
+
+---
+
+## D-18 项目命名：Veil Remote Desktop（简称 VeilRD）
+
+**日期**：2026-11-23　**状态**：已定（用户确认）
+
+### 决定
+
+- 正式名：**Veil Remote Desktop**
+- 简称：**VeilRD**
+- 中文名：**帷幕远程桌面**
+- 定位语：**远端熄屏，眼前如本地——为 Intel Mac 打造的独占式远程桌面**
+
+### 理由
+
+- **一眼懂用途**：名字里保留 Remote Desktop，不需要背景知识就知道是远程桌面工具；纯意象名（如只叫 Veil）牺牲了可发现性。
+- **一眼懂差异**：Veil 表示「把被控端物理屏遮住，只在客户端升起按客户端规格定制的虚拟桌面」，直接区别于 VNC 镜像（C-07）与 Windows RDP 多会话（C-08）。
+- **不用 `VeilRDP`**：RDP 会被读成微软协议或多会话实现，与本项目单会话模型冲突。
+
+### 影响与边界
+
+- 人类可读文档标题（`DESIGN.md` / `PROTOCOL.md` / `RESULTS-BY-OS.md`）与项目自称改为 VeilRD；`DESIGN.md` §1.1 / §1.3 / 变更记录同步。
+- **本次不改名**：仓库目录与路径占位（`<macOS-RDP>`、`~/macOS-RDP`）、代码标识符 / 类名 / 二进制名、既有钥匙串条目 `CN=macOS-RDP M1 dev`。改名会破坏构建脚本、实测资产与证书匹配，收益仅为文案；若后续要统一 CLI / 产品二进制名，另立决策并配套迁移。
+- 各子工程 README 保持组件名（P0-TahoeProbe、M1-Skeleton 等），不强行改成 VeilRD。
+
+---
+
+## D-19 源码分层归位与兼容软链
+
+**日期**：2026-11-23　**状态**：已执行（第 2 轮工程骨架）
+
+### 决定
+
+- 把 `M1-Skeleton/src/` 的 23 个模块物理迁到 `Packages/RDPKit/Sources/{Common,Capture,Codec,Frame,Transport,Control,Display,Input}/`，把 `P1-ClientProbe/src/` 的 4 个模块迁到 `Packages/ProtocolCodec/Sources/`；`.h`/`.m` 同目录放置，裸文件名 `#import` 不变。
+- Xcode 三个 target 的文件引用改指向 `Packages/` 真实路径，`HEADER_SEARCH_PATHS` 补齐各分层目录；PBXGroup 按 Apps / Packages / Probes 与 RDPKit 子层组织。
+- 旧 `src/` 路径保留为**相对软链**（不是副本），覆盖全部 53 个文件（45 个 RDPKit + 8 个 ProtocolCodec）；12 个既有构建脚本与双机 runbook 路径不改。
+
+### 理由
+
+- 分层按职责而非按历史探针目录：采集、编码、帧通道、传输、控制、显示、输入各自独立，便于后续拆库与替换后端（C-10 / D-10）。
+- 真机验收仍在进行，脚本与 runbook 里满是 `cd ~/macOS-RDP/<dir>` 与 `src/` 相对路径；此时硬切路径会让测试资产失效，收益不抵风险。软链让「物理归位」和「路径兼容」同时成立。
+
+### 影响与边界
+
+- 软链是**过渡兼容层**：P2 延迟验收结束后统一迁移脚本与 runbook 路径，再删除软链；在此之前禁止向旧 `src/` 目录新增文件，新增模块必须写进 `Packages/`。
+- 本轮不改任何算法、类名、构建参数与测试断言；未跑双机真机，符合开发与测试分离约定。
+- 验收线：三个 target `BUILD SUCCEEDED`，`M1-Skeleton/build_tests.sh` 与 `P1-ClientProbe/build_tests.sh` 断言数不回退，M1-Skeleton 推流探针仍能从旧路径构建。
 
 ---
 

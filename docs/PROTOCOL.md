@@ -1,4 +1,4 @@
-# macOS-RDP 控制协议 v1（草案）
+# VeilRD（Veil Remote Desktop）控制协议 v1（草案）
 
 | 项 | 值 |
 |---|---|

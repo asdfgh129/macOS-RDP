@@ -1,4 +1,4 @@
-# macOS-RDP 实测结论（按 OS 分离）
+# VeilRD（Veil Remote Desktop）实测结论（按 OS 分离）
 
 | 项 | 值 |
 |---|---|

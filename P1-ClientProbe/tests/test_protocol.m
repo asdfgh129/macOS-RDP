@@ -253,7 +253,7 @@ int main(void) {
             h0.capturedAtUs = 1763835600111000ULL;
             h1.capturedAtUs = 1763835600112000ULL;
             h2.capturedAtUs = 1763835600113000ULL;
-            NSArray *d0 = [ro acceptHeader:h0 payload:f0 nowMs:1000 error:NULL];
+            NSArray<P1ReassembledFrame *> *d0 = [ro acceptHeader:h0 payload:f0 nowMs:1000 error:NULL];
             NSArray *d2 = [ro acceptHeader:h2 payload:f2 nowMs:1010 error:NULL];
             Expect(d0.count == 1, "reorder-seq0-delivered");
             Expect(d0.count == 1 && d0[0].capturedAtUs == h0.capturedAtUs,
