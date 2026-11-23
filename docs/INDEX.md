@@ -16,10 +16,13 @@
 
 ## 2. 再看：事实与验收
 
-5. `RESULTS-BY-OS.md`：**按 OS 分离的实测结论**，禁止跨版本外推
-6. `P2-CHECKLIST.md`：双机验收清单
-7. `P2-NEXT-PLAN.md` / `P2-TONIGHT-RUNBOOK.md`：夜间执行计划与 runbook
-8. `SSH-SETUP.md`：测试机 SSH / 端口映射
+1. `RESULTS-BY-OS.md`：**按 OS 分离的实测结论**，禁止跨版本外推
+2. `PRODUCT-DUAL-RUNBOOK.md`：**产品入口 `--serve` ↔ `--connect` 双机实测操作单（当前主线）**
+   - 镜像 → keep-main → 全独占 C-09 三档递进；可选 WAN / 真注入 / Ventura host
+   - 含 TCC 重授权、无信号处理器导致的中断风险、显示恢复步骤
+3. `P2-CHECKLIST.md`：探针路径的双机验收清单
+4. `P2-NEXT-PLAN.md` / `P2-TONIGHT-RUNBOOK.md`：探针路径的夜间执行计划与 runbook
+5. `SSH-SETUP.md`：测试机 SSH / 端口映射
 
 ## 3. 工程骨架
 

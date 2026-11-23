@@ -66,7 +66,8 @@ VeilRD --connect <host-ip> --port 46600 --fingerprint <host-fp> --window 1280x72
 - `docs/DECISIONS.md`：决策记录（D-01 … D-21）
 - `docs/PROTOCOL.md`：控制协议与帧头
 - `docs/RESULTS-BY-OS.md`：按 OS 分离的实测结论
-- `docs/P2-CHECKLIST.md` / `P2-NEXT-PLAN.md` / `P2-TONIGHT-RUNBOOK.md`：双机验收与夜间执行
+- `docs/PRODUCT-DUAL-RUNBOOK.md`：**产品入口 `--serve` ↔ `--connect` 双机实测操作单**（当前主线）
+- `docs/P2-CHECKLIST.md` / `P2-NEXT-PLAN.md` / `P2-TONIGHT-RUNBOOK.md`：探针路径的双机验收与夜间执行
 
 ## 命名与路径边界
 
