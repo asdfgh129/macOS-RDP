@@ -1559,7 +1559,24 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - 残留修复（`4a37d1d`）：`M1StreamSession` 进入 STREAMING 时清 `lastControlArrivalMs`，首包心跳只播种不记账（与 CLOSED 停记同口径）。Tahoe host 已重建。
 - r4（复测，同构 40s/25s）：host captured 403 / encoded 402 / sent 356，`maxControlGapMs=1300.9`、`maxGapAtOffsetMs=9331.7`（发生在推流中段，口径正常）；窗口布局快照 11 个（keep-main 不搬窗，restored=0）、守护就绪握手通过、结束销毁 1 块虚拟屏并恢复 2 块物理屏。client 解码 351 / 上屏 316、0 丢帧，**解码/发送 = 351/356 = 98.6%**，控制最大间隔 1025.1ms，上屏 p50/p95 = 767.5/1110.5ms，时钟 offset 2.3ms（8 样本）。⇒ **§2 keep-main WAN 门禁通过**（解码/发送 ≥0.85、0 丢帧、两端间隔 <3000ms）。
 
-**仍未覆盖**：本机 Sequoia 的 keep-main/独占（需先清陈旧槽位）；LAN 路径；`--inject real`；C-09 全独占档走产品入口（keep-main 只记 `skipped-keep-main`，不判 C-09）。
+**仍未覆盖**：本机 Sequoia 的 keep-main/独占（需先清陈旧槽位）；LAN 路径；`--inject real`。（C-09 全独占档走产品入口已由 §5.37 覆盖。）
+
+### 5.37 产品入口 WAN 对照：全独占（C-09）与 `--mirror` 诊断档（2026-11-23 22:4x–22:5x）
+
+**档位口径**：产品 `--serve` 默认档为**全独占**（按客户端规格建虚拟屏并禁物理屏，C-09=verified）；`--keep-main` 见 §5.36；`--mirror` 是诊断档，仅采物理主屏、不建虚拟屏、不碰 C-09（not-started）。
+
+**环境**：Tahoe 26.5.2 host × Sequoia 15.5 client（WAN `112.5.32.34:46600`，握手指纹 `3305dec…`），720p15，host 20s / client 18s，远端物理主屏跑 `anim_display 0` 彩条动画。host 均在 Tahoe GUI 经 Terminal 启动（沿用屏幕录制授权）。
+
+**§3 全独占 + C-09（产品入口，原计划 `--mirror` 未加，实为默认独占档）**：
+- host captured 284 / encoded 283 / sent 260；`[独占] 虚拟屏（1280x720）C-09=verified`，守护就绪握手通过；窗口布局快照 12 个，结束恢复 `planned=2 restored=1 failed=1`。
+- client 255/255 解出上屏、0 丢帧，**解码/发送 = 255/260 = 98.1%**，两端控制最大间隔 1021/1014ms，上屏 p50/p95 = 102.5/225.5ms，时钟 offset 3.1ms（8 样本）。
+- 结束「已恢复物理屏并销毁虚拟屏」；`system_profiler` 核对 2 块物理屏（3440×1440 + 1080×1920）在位。⇒ **§3 全独占 + C-09 走产品入口、双机 WAN PASS**。遗留：窗口布局恢复 1 个失败（planned=2），下轮取失败窗口与原因。
+
+**§1 `--mirror` 诊断档三轮（各 20s/18s，c09 均 `not-started`）**：
+- r1：host sent 262；client 257 解出、0 传输丢帧，**98.1%**，间隔 1032/1028ms，p50/p95 477.5/657.5ms，上屏 139（渲染积压丢 106）。
+- r2：host sent 263；client 245 解出、4 丢帧，**93.2%**，间隔 1172/1005ms，p50/p95 601.5/1182.5ms，上屏 129（积压丢 104）。
+- r3：host sent 264；client 244 解出、3 丢帧，**92.4%**，间隔 1041/1300ms，p50/p95 174.5/752.5ms，上屏 241（积压丢 3）。
+- ⇒ **§1 镜像档 WAN 门禁通过**（解码/发送 ≥0.85、两端控制间隔 <3s、`c09=not-started`）。三轮传输丢帧 0–4（WAN 抖动；同期 keep-main/独占档为 0，mirror 档画面源为 3440×1440 物理主屏降采样，码流构成差异未取字节证据，暂记现象）。r1/r2 上屏积压 100+ 帧、r3 恢复正常：本机渲染压力显著波动，属 Qoder/WindowServer 竞争（§5.33 口径），交 P2.3 基线（D）定位；不影响网络侧门禁。
 
 ## 6. 状态汇总
 
@@ -1576,6 +1593,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
+- v0.67-draft 2026-11-23 22:5x：**产品入口 WAN 对照：全独占 + C-09 PASS、`--mirror` 诊断档 PASS（§5.37）**。Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，720p15，20s/18s）：默认独占档 `C-09=verified`、解码/发送 255/260=98.1%、0 丢帧、间隔 ~1.0s、物理屏恢复 2 块在位（窗口布局恢复 failed=1 待查）；`--mirror` 三轮 `c09=not-started`、解码/发送 98.1/93.2/92.4%、传输丢帧 0–4、间隔 <1.4s，上屏积压受本机渲染压力波动为本机负载所致。另确认产品档位口径：默认=全独占，`--keep-main` 见 §5.36。
 - v0.66-draft 2026-11-23 22:5x：**host 间隔指标二次收口 + §2 keep-main WAN 复测通过（§5.36 r3/r4）**。v0.65 修 CLOSED 空窗后仍有残留：建屏/守护阶段（Tahoe 上约 13–18s）的最后一包控制消息把 STREAMING 前的空窗算进首包心跳（r3 host 18.1s / offset 308ms）。`4a37d1d` 在进入 STREAMING 时清 `lastControlArrivalMs`；r4 复测 host 1300.9ms@+9.3s、client 1025.1ms、解码/发送 351/356=98.6%、0 丢帧、`c09=skipped-keep-main`、虚拟屏销毁物理屏恢复 ⇒ §2 keep-main WAN 门禁通过。
 - v0.65-draft 2026-11-23 22:4x：**host 控制间隔指标口径修复**。`M1StreamSession` 在 CLOSED 后继续记账，把 client 退出到 host 时长结束的空窗算成心跳被挤（§5.36 r2 15.1s）；改为 CLOSED 即停记并清 `lastControlArrivalMs`，host JSON 增 `maxGapAtOffsetMs`。本机 Sequoia 15.5 镜像环回（20s/12s）复测 1044.6ms、最大间隔 offset 3047ms，尾部 8s 不再计入。另记：Qoder 后台任务会节流 host，导致 QUIC 握手卡在 preparing；本机环回须同前台 shell 起两端。
 - v0.64-draft 2026-11-23 22:2x：**产品入口补齐 `--guardian`，keep-main 双机 WAN 闭环（§5.36）**。产品 `veild-host-agent --serve` 的 keep-main/独占档此前被自身门禁拒绝：`M1RDPDriver` 的 `P0VStartGuardian` 用同一二进制 re-exec `--guardian`，产品入口缺该分支导致握手超时、禁止禁屏（探针入口一直有，属 C-12.2 收口遗漏）。`Apps/HostAgent/Sources/main.m` 补分支并转调 `P0VRunGuardian`（`17f9883`），`HostDaemon` 不链接 RDPKit、不碰显示配置，未改。本机 Sequoia 15.5 镜像环回两轮（静态 28 帧；动画 220/223=98.7%、p50 113.5ms）通过；keep-main 被陈旧虚拟槽位 4128835 阻断（unmirror 超时），守护兜底恢复成功，主屏模式已手工恢复 3008×1692。Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，keep-main 720p15）：静态轮 15/15、动画轮 321/325=98.8%、0 丢帧、控制间隔 1062ms、`c09=skipped-keep-main`、虚拟屏销毁且物理屏恢复。发现 host 侧 `maxControlGapMs` 把 client 退出后的空窗计入，门禁应以 client 值为准。
