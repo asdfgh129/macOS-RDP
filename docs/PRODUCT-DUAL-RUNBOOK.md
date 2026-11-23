@@ -220,6 +220,10 @@ open -a Terminal "$REPO/P2-Dual/out/host-serve.command"   # 在屏幕前点「�
 - **建屏 ACK 踩线**（慢机：mode-commit 1.4–1.6s 阻塞控制 ACK）：加
   `M1_CTRL_RETRY_MS=500 M1_CTRL_MAX_ATTEMPTS=12`（默认 250ms×8 不变）。
 - **黑帧**：Tahoe 默认 SCK，失败自动回退 CG；需要时用 `M1_CAPTURE_BACKEND=cg|sck|cgimage` 强制。
+  **本机 Sequoia 镜像环回**：HiDPI 主屏（3008×1692，scale=2.0）下 SCK 只交付 3–5 帧/秒，
+  20fps 基线须用 `M1_CAPTURE_BACKEND=cg`（§5.38）；本地环回起动画时别用 `full` 盖住 client 窗口
+  （被完全遮挡的窗口不绘制，渲染计数为 0），且 host/client 用同一个前台 shell 先后启动
+  （挂后台任务会被节流，QUIC 握手卡在 `preparing`）。
 - **握手细节**：client 加 `M1_QUIC_DEBUG=1`。
 - **崩溃后**：WindowServer 带病进程会让后续建屏再崩，须充分恢复/重新登录后再测。
 
