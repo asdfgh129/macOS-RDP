@@ -8,6 +8,7 @@
 
 ### Added（最近更新）
 
+- docs: `RESULTS-BY-OS.md` §5.38 P2.3 渲染基线复测入档——离屏 8 轮无回退，CG 后端 20fps 真实流渲染 100%、0 积压
 - docs: `RESULTS-BY-OS.md` §5.37 产品入口 WAN 对照入档——全独占 + C-09 PASS、`--mirror` 诊断档三轮 PASS（`9113c32`）
 - docs: 新增 `docs/PRODUCT-DUAL-RUNBOOK.md` 产品入口 `--serve` ↔ `--connect` 双机实测操作单，根 README / `docs/INDEX.md` 导航同步（`613336f`）
 
