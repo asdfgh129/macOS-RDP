@@ -307,7 +307,13 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 - (void)controlSession:(M1ControlSession *)session didChangeState:(P1SessionState)state {
     printf("  [%s] %s\n", self.isHost ? "host" : "client", P1SessionStateName(state).UTF8String);
-    if (state == P1SessionStateClosed && self.onSessionClosed) self.onSessionClosed();
+    if (state == P1SessionStateClosed) {
+        // 对端挥手后控制通道不再有消息。继续记账会把「客户端断开 → 本端
+        // --duration 结束」的空窗算成心跳被挤（§5.36 r2 host 15.1 s 即此）。
+        self.streaming = NO;
+        self.lastControlArrivalMs = 0;
+        if (self.onSessionClosed) self.onSessionClosed();
+    }
 }
 
 - (void)controlSessionDidReachStreaming:(M1ControlSession *)session {

@@ -348,15 +348,17 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     printf("serve: frames captured=%llu encoded=%llu sent=%llu dropped=%llu fragments=%llu\n",
            ps.framesCaptured, ps.framesEncoded, ps.framesSent, ps.framesDroppedBeforeEncoder,
            ps.fragmentsSent);
-    printf("serve: input ok=%lu fail=%lu record=%lu | 控制到达最大间隔=%.1fms\n",
+    printf("serve: input ok=%lu fail=%lu record=%lu | 控制到达最大间隔=%.1fms (offset %.1fms)\n",
            (unsigned long)injectOK, (unsigned long)injectFail,
-           (unsigned long)recorder.postCount, host.maxControlGapMs);
+           (unsigned long)recorder.postCount, host.maxControlGapMs, host.maxGapAtOffsetMs);
     if (outPath.length > 0) {
         NSDictionary *json = @{
             @"framesCaptured": @(ps.framesCaptured), @"framesEncoded": @(ps.framesEncoded),
             @"framesSent": @(ps.framesSent), @"fragmentsSent": @(ps.fragmentsSent),
             @"inputOK": @(injectOK), @"inputFail": @(injectFail),
-            @"maxControlGapMs": @(host.maxControlGapMs), @"c09": c09,
+            @"maxControlGapMs": @(host.maxControlGapMs),
+            @"maxGapAtOffsetMs": @(host.maxGapAtOffsetMs),
+            @"c09": c09,
             @"stateLog": host.stateLog ?: @[],
         };
         NSData *data = [NSJSONSerialization dataWithJSONObject:json

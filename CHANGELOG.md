@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- fix: host 控制间隔指标在对端 CLOSED 后停止记账，host JSON 增 `maxGapAtOffsetMs`（§5.36 口径问题，v0.65）
 - fix: 产品 host 入口实现 `--guardian` 兜底握手（C-12.2），keep-main 双机 WAN 闭环入档 §5.36 (`17f9883`)
 
 ## [2026-11-22] — 帧头 v3 与 P2 基线收口
