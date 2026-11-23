@@ -60,6 +60,7 @@ VeilRD --connect <host-ip> --port 46600 --fingerprint <host-fp> --window 1280x72
 
 ## 文档索引
 
+- `CHANGELOG.md`：全部更新的倒序记录（按日期分节，Added / Changed / Fixed / Documentation + commit hash）
 - `docs/INDEX.md`：文档导航与阅读顺序
 - `docs/DESIGN.md`：软件设计方案、需求、约束、架构
 - `docs/DECISIONS.md`：决策记录（D-01 … D-21）
