@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- fix: 进入 STREAMING 时清零控制到达时钟，首包心跳不再把建屏空窗算成间隔；Tahoe keep-main WAN r4 门禁通过（§5.36 r3/r4，v0.66）
 - fix: host 控制间隔指标在对端 CLOSED 后停止记账，host JSON 增 `maxGapAtOffsetMs`（§5.36 口径问题，v0.65）
 - fix: 产品 host 入口实现 `--guardian` 兜底握手（C-12.2），keep-main 双机 WAN 闭环入档 §5.36 (`17f9883`)
 

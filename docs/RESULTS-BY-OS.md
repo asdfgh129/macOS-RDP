@@ -1555,6 +1555,10 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 **口径问题（已修）**：host JSON 的 `maxControlGapMs` 曾把 client 退出到 host 时长结束的空窗计入（r2 15.1s ≈ 40s−25s，r1 18.9s 同理），不能当门禁值。修复：`M1StreamSession` 在会话进入 CLOSED 时停止间隔记账并清 `lastControlArrivalMs`，host JSON 追加 `maxGapAtOffsetMs`（同时打印到 stdout）。本机 Sequoia 15.5 镜像环回复测（20s/12s，与 r2 同构）：host 控制最大间隔 **1044.6ms**、offset 3047ms（即最大间隔发生在 +3s 推流中段，+12s CLOSED 后 8s 尾部不再计入）；client 侧 201–1052ms。**操作坑**：把 host 挂到 Qoder 后台任务会被节流，QUIC 握手卡在 `preparing`（两端各只到 state 2）；host/client 放在同一个前台 shell 里先后启动即正常（握手 53.9ms），后续本机环回按此方式跑。
 
+- r3（虚拟屏彩条动画，40s/25s，修复后首轮）：host captured 392 / encoded 391 / sent 359，`c09=skipped-keep-main`，守护就绪握手通过；client 解码 354 / 上屏 326、0 丢帧，**解码/发送 = 354/359 = 98.6%**，控制最大间隔 1274.5ms，上屏 p50/p95 = 364.5/1294.5ms，时钟 offset 47.8ms。**指标仍有残留**：host `maxControlGapMs=18146.9` 而 `maxGapAtOffsetMs=308.2`——STREAMING 前最后一包握手消息（建屏/守护阶段到达）被首包心跳当成一次 18s 间隔。该轮前半还有一次握手瞬断（`连接失败：60`，重试即过）和一次停在 DISPLAYS_READY 的失败尝试（SIGTERM 后守护兜底恢复、物理屏复原）。
+- 残留修复（`4a37d1d`）：`M1StreamSession` 进入 STREAMING 时清 `lastControlArrivalMs`，首包心跳只播种不记账（与 CLOSED 停记同口径）。Tahoe host 已重建。
+- r4（复测，同构 40s/25s）：host captured 403 / encoded 402 / sent 356，`maxControlGapMs=1300.9`、`maxGapAtOffsetMs=9331.7`（发生在推流中段，口径正常）；窗口布局快照 11 个（keep-main 不搬窗，restored=0）、守护就绪握手通过、结束销毁 1 块虚拟屏并恢复 2 块物理屏。client 解码 351 / 上屏 316、0 丢帧，**解码/发送 = 351/356 = 98.6%**，控制最大间隔 1025.1ms，上屏 p50/p95 = 767.5/1110.5ms，时钟 offset 2.3ms（8 样本）。⇒ **§2 keep-main WAN 门禁通过**（解码/发送 ≥0.85、0 丢帧、两端间隔 <3000ms）。
+
 **仍未覆盖**：本机 Sequoia 的 keep-main/独占（需先清陈旧槽位）；LAN 路径；`--inject real`；C-09 全独占档走产品入口（keep-main 只记 `skipped-keep-main`，不判 C-09）。
 
 ## 6. 状态汇总
@@ -1572,6 +1576,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
+- v0.66-draft 2026-11-23 22:5x：**host 间隔指标二次收口 + §2 keep-main WAN 复测通过（§5.36 r3/r4）**。v0.65 修 CLOSED 空窗后仍有残留：建屏/守护阶段（Tahoe 上约 13–18s）的最后一包控制消息把 STREAMING 前的空窗算进首包心跳（r3 host 18.1s / offset 308ms）。`4a37d1d` 在进入 STREAMING 时清 `lastControlArrivalMs`；r4 复测 host 1300.9ms@+9.3s、client 1025.1ms、解码/发送 351/356=98.6%、0 丢帧、`c09=skipped-keep-main`、虚拟屏销毁物理屏恢复 ⇒ §2 keep-main WAN 门禁通过。
 - v0.65-draft 2026-11-23 22:4x：**host 控制间隔指标口径修复**。`M1StreamSession` 在 CLOSED 后继续记账，把 client 退出到 host 时长结束的空窗算成心跳被挤（§5.36 r2 15.1s）；改为 CLOSED 即停记并清 `lastControlArrivalMs`，host JSON 增 `maxGapAtOffsetMs`。本机 Sequoia 15.5 镜像环回（20s/12s）复测 1044.6ms、最大间隔 offset 3047ms，尾部 8s 不再计入。另记：Qoder 后台任务会节流 host，导致 QUIC 握手卡在 preparing；本机环回须同前台 shell 起两端。
 - v0.64-draft 2026-11-23 22:2x：**产品入口补齐 `--guardian`，keep-main 双机 WAN 闭环（§5.36）**。产品 `veild-host-agent --serve` 的 keep-main/独占档此前被自身门禁拒绝：`M1RDPDriver` 的 `P0VStartGuardian` 用同一二进制 re-exec `--guardian`，产品入口缺该分支导致握手超时、禁止禁屏（探针入口一直有，属 C-12.2 收口遗漏）。`Apps/HostAgent/Sources/main.m` 补分支并转调 `P0VRunGuardian`（`17f9883`），`HostDaemon` 不链接 RDPKit、不碰显示配置，未改。本机 Sequoia 15.5 镜像环回两轮（静态 28 帧；动画 220/223=98.7%、p50 113.5ms）通过；keep-main 被陈旧虚拟槽位 4128835 阻断（unmirror 超时），守护兜底恢复成功，主屏模式已手工恢复 3008×1692。Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，keep-main 720p15）：静态轮 15/15、动画轮 321/325=98.8%、0 丢帧、控制间隔 1062ms、`c09=skipped-keep-main`、虚拟屏销毁且物理屏恢复。发现 host 侧 `maxControlGapMs` 把 client 退出后的空窗计入，门禁应以 client 值为准。
 - v0.63-draft 2026-11-22 23:0x：**A-02 打点落地 + 首轮跨机 capture→render（§5.35）**。帧头 v2→v3（26B，偏移 18 起 8B `capturedAtUs`），Host 采集打点经编码 PTS 回填、Client 用其作解码 PTS 并在贴层处算原始差；控制通道新增 `time-sync`/`time-sync-reply`（最小 RTT 估时钟差）。首次跨机暴露符号错误：原始差为负的帧被直方图丢弃、报告端又减了时钟差，导致 p50=0、样本仅 380/586；改为 -512ms 起的有符号直方图并改回 `raw+offset` 后，Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，1080p20 镜像）两轮：r2 583 帧 p50/p95 95.1/231.1ms、r3 767 帧 94.2/206.2ms，时钟差 ~88ms、RTT 7–9ms、解码 19.2–19.7fps、0 丢、summary PASS。单测双端 291/291。glass-to-glass 仍开放。
