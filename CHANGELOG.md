@@ -6,6 +6,10 @@
 
 ## [2026-11-23] — 产品化骨架与四轮收口（VeilRD 定名 / workspace / 分层 / 静态库 / QUIC 端到端链路）
 
+### Added（最近更新）
+
+- docs: 新增 `docs/PRODUCT-DUAL-RUNBOOK.md` 产品入口 `--serve` ↔ `--connect` 双机实测操作单，根 README / `docs/INDEX.md` 导航同步（`613336f`）
+
 ### Added
 
 - feat: 打通产品端 QUIC 端到端链路并抽出共享会话层（第4轮） (`dc10fbc`)
