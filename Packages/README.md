@@ -1,6 +1,6 @@
 # Packages（可复用库层）
 
-与产品可执行层分离的逻辑库。**第 2 轮已完成物理归位**：真实源码在 `RDPKit/Sources/` 与 `ProtocolCodec/Sources/`，由三个产品 target 直接引用。
+与产品可执行层分离的逻辑库。**第 2 轮完成物理归位，第 3 轮落成独立静态库 target**：真实源码在 `RDPKit/Sources/` 与 `ProtocolCodec/Sources/`，由三个产品入口通过 target 依赖链接，不再各自直接编源文件。
 
 | 目录 | 内容 | 来源 |
 |---|---|---|

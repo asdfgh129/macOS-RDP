@@ -1,5 +1,8 @@
 # Client（控制端）
 
-target `VeilRD` 已建并编译通过；当前编译 `RDPApp/Sources/main.swift` + 桥接头 + 5 个 M1 ObjC 模块（`M1Pairing`、`M1Takeover`、`M1SessionCoordinator`、`M1DriverLogic`、`M1InputLogic`）。规划承载 Swift UI：收流、解码、零拷贝上屏、键鼠采集与独立光标通道。
+target `VeilRD` 已编译通过；第 3 轮把 Swift 入口与桥接头物理归位到 `Sources/main.swift` 与 `Sources/RDPApp-Bridging-Header.h`（旧 `RDPApp/Sources/` 为软链）。
 
-第 2 轮后这 5 个模块的真实源码在 `Packages/RDPKit/Sources/{Control,Display,Input}/`，Xcode 已直接引用；渲染/解码底座 `M1FrameReceiver`、`M1FrameView`、`M1InputLogic` 分别在 `Frame/`、`Display/`、`Input/`。过渡壳仍留 `RDPApp/Sources/`，未搬到本目录，以免改动 Swift 构建路径。约束见 `docs/DESIGN.md` §4.2 与 `docs/DECISIONS.md` D-17。
+- 默认输出 D-02 桥接演示：Swift 实现 `M1SessionDriver`、调用配对 / 接管 / 输入逻辑，并新增解码预热与 `M1FrameView` 构造演示。
+- `--selftest`：跑纯逻辑自检（配对、会话、输入映射、解码器预热、上屏视图构造），输出 `VeilRD client selftest PASS`，由 `Tests/integration_selftest.sh` 调用。
+
+真实 QUIC 收流 / 窗口上屏仍在 `M1-Skeleton/stream_probe.m`，本入口尚未并入；这属于后续产品化范围。约束见 `docs/DESIGN.md` §4.2 与 `docs/DECISIONS.md` D-17 / D-20。

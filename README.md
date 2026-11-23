@@ -12,18 +12,18 @@
 |---|---|
 | 平台 | Intel x86_64，macOS 13 Ventura – 26 Tahoe；双端均可当 host / client |
 | 设计基线 | `docs/DESIGN.md` v1.5（M1 基线，补注 §1.2.1 与 D-18 不改变基线） |
-| 决策 | `docs/DECISIONS.md`，编号至 D-19 |
+| 决策 | `docs/DECISIONS.md`，编号至 D-20 |
 | 协议 | `docs/PROTOCOL.md` v1，2026-11-18 冻结 |
 | 实测 | `docs/RESULTS-BY-OS.md`，**按 OS 分离，禁止跨版本外推** |
-| 工程形态 | `VeilRD.xcworkspace` + 三个 target（daemon / agent / client）编译通过；第 2 轮源码已分层归位到 `Packages/`，旧探针路径留兼容软链 |
+| 工程形态 | `VeilRD.xcworkspace` + 五个 target（`RDPKit` / `ProtocolCodec` 静态库 + daemon / agent / client）编译通过；产品入口已归位 `Apps/`，旧探针路径留兼容软链 |
 
 ## 快速入口
 
 ```bash
-# 构建三个产品 target（或只传一个 scheme：bash Scripts/build.sh VeilRD）
+# 构建五个 target（两个静态库 + 三个产品入口；也可只传一个 scheme）
 bash Scripts/build.sh
 
-# 纯开发单测：M1-Skeleton + P1-ClientProbe
+# 纯开发单测 + 跨模块集成自检（不碰真机）
 bash Scripts/test.sh
 
 # 仍可用的探针入口
@@ -36,13 +36,13 @@ cd M1-Skeleton && bash build_stream_probe.sh
 
 ```
 .
-├── VeilRD.xcworkspace/  # Xcode workspace（三个共享 scheme）
-├── VeilRD.xcodeproj/    # 三个 target，文件引用指向 Packages 真实路径
-├── Apps/          # 产品可执行层：HostDaemon / HostAgent / Client
-├── Packages/      # 可复用库层：RDPKit/Sources/{Common,Capture,Codec,Frame,Transport,Control,Display,Input}、ProtocolCodec/Sources
+├── VeilRD.xcworkspace/  # Xcode workspace（共享 scheme）
+├── VeilRD.xcodeproj/    # 五个 target：两个静态库 + 三个产品入口
+├── Apps/          # 产品可执行层：HostDaemon/Sources、HostAgent/Sources、Client/Sources
+├── Packages/      # RDPKit/Sources/{Common,Capture,Codec,Frame,Transport,Control,Display,Input}、ProtocolCodec/Sources
 ├── Probes/        # 验证资产索引（探针目录原位保留）
 ├── Scripts/       # 统一 build.sh / test.sh 入口
-├── Tests/         # 跨模块测试入口（占位）
+├── Tests/         # integration_selftest.sh（跨模块产品入口自检）
 ├── docs/          # 设计、决策、协议、实测、测试清单
 ├── M1-Skeleton/   # 探针与单测；src/ 为 Packages/RDPKit 的兼容软链
 ├── P1-ClientProbe/ # 协议单测；src/ 为 Packages/ProtocolCodec 的兼容软链
@@ -50,13 +50,13 @@ cd M1-Skeleton && bash build_stream_probe.sh
 └── P0-* / M1-Pre-CaptureCodec / RDPApp/   # 既有探针与过渡壳
 ```
 
-三个 target 的源文件已全部指向 `Packages/` 的真实路径。`M1-Skeleton/src/` 与 `P1-ClientProbe/src/` 现在是**相对软链兼容层**，不是源码副本：保留它是为了让 12 个既有构建脚本和双机 runbook 的 `cd ~/macOS-RDP/<dir>` 路径继续有效。`Tests/` 仍为跨模块测试占位；`RDPApp/Sources/` 作为 Swift 过渡壳未搬动。
+源码与入口都已归位到 `Apps/`、`Packages/` 的真实路径；`RDPKit` / `ProtocolCodec` 是独立静态库 target，三个产品入口通过 target 依赖链接它们。`M1-Skeleton/src/`、`P1-ClientProbe/src/`、`P0V-RootDaemon/src/p0vprobe.m`、`RDPApp/Sources/` 现在是**相对软链兼容层**，不是源码副本：保留它们是为了让既有构建脚本和双机 runbook 路径继续有效。
 
 ## 文档索引
 
 - `docs/INDEX.md`：文档导航与阅读顺序
 - `docs/DESIGN.md`：软件设计方案、需求、约束、架构
-- `docs/DECISIONS.md`：决策记录（D-01 … D-19）
+- `docs/DECISIONS.md`：决策记录（D-01 … D-20）
 - `docs/PROTOCOL.md`：控制协议与帧头
 - `docs/RESULTS-BY-OS.md`：按 OS 分离的实测结论
 - `docs/P2-CHECKLIST.md` / `P2-NEXT-PLAN.md` / `P2-TONIGHT-RUNBOOK.md`：双机验收与夜间执行

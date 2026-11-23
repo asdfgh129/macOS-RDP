@@ -920,6 +920,32 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 
 ---
 
+## D-20 产品入口归位与静态库分层
+
+**日期**：2026-11-23　**状态**：已执行（第 3 轮工程骨架）
+
+### 决定
+
+- `VeilRD.xcodeproj` 由三个「壳 + 探针入口」target 改为五个 target：`RDPKit`、`ProtocolCodec` 为静态库，daemon / agent / client 为可执行入口，通过 target 依赖与 Frameworks phase 链接两库。
+- 三个入口的物理源码归位：`P0V-RootDaemon/src/p0vprobe.m` → `Apps/HostDaemon/Sources/main.m`；`RDPApp/Sources/main.swift` 与桥接头 → `Apps/Client/Sources/`；`Apps/HostAgent/Sources/main.m` 从纯逻辑演示改成实际消费采集/编码/会话/输入模块。
+- 新增 `Tests/integration_selftest.sh`，由 `Scripts/test.sh` 聚合：构建全部 target 后运行三个入口的纯逻辑自检。
+- 旧 p0vprobe 与 Swift 壳路径保留相对软链；`RDPApp/build.sh` 扩充模块与框架以继续可用。
+
+### 理由
+
+- 第 2 轮只解决「源码放哪」，产物仍是探针入口；第 3 轮把产品目录与编译产物对齐，避免骨架长期停留在占位态。
+- 静态库把「可复用逻辑」与「可执行入口」在构建层分开，后续替换采集后端或客户端渲染时不必重编入口依赖图。
+- 默认自检不碰 WindowServer / 网络，保持开发与真机测试分离；真实采集只在显式 `--capture` 下启用。
+
+### 影响与边界
+
+- 本轮不改协议、不新增真机结论；QUIC 收流与真实窗口上屏仍在 `stream_probe`，未并入 `VeilRD` 客户端入口。
+- `RDPKit` 静态库包含全部 22 个 `.m`，`ProtocolCodec` 含 4 个；三个入口只编自己的 main 文件。
+- 验收：五个 target 构建成功；M1 291 断言、P1 全 PASS、跨模块自检 PASS；`build_stream_probe.sh`、`RDPApp/build.sh`、`P0V-RootDaemon/build.sh` 仍可从软链构建。
+- 打包 / 签名 / plist / TCC 说明仍未做，留待 P2 后的真机验收。
+
+---
+
 ## 附：协议实现进度（2026-11-17）
 
 | 模块 | 状态 | 测试 |

@@ -10,4 +10,7 @@ bash M1-Skeleton/build_tests.sh
 echo "=== P1-ClientProbe tests ==="
 bash P1-ClientProbe/build_tests.sh
 
+echo "=== cross-module integration selftest ==="
+bash Tests/integration_selftest.sh
+
 echo "ALL UNIT TESTS PASSED"

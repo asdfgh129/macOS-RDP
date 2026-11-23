@@ -7,220 +7,305 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		000000000000000000000200 /* p0vprobe.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000100 /* p0vprobe.m */; };
-		000000000000000000000226 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000130 /* main.m */; };
-		000000000000000000000201 /* M1Pairing.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000101 /* M1Pairing.m */; };
-		000000000000000000000202 /* M1Takeover.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000102 /* M1Takeover.m */; };
-		000000000000000000000203 /* M1SessionCoordinator.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000103 /* M1SessionCoordinator.m */; };
-		000000000000000000000204 /* M1DriverLogic.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000104 /* M1DriverLogic.m */; };
-		000000000000000000000205 /* M1WindowLayout.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000105 /* M1WindowLayout.m */; };
-		000000000000000000000206 /* M1InputLogic.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000106 /* M1InputLogic.m */; };
-		000000000000000000000207 /* M1InputInjector.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000107 /* M1InputInjector.m */; };
-		000000000000000000000208 /* M1PipelineTypes.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000108 /* M1PipelineTypes.m */; };
-		000000000000000000000209 /* M1DatagramSink.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000109 /* M1DatagramSink.m */; };
-		00000000000000000000020A /* M1FrameSender.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010A /* M1FrameSender.m */; };
-		00000000000000000000020B /* M1MessageSink.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010B /* M1MessageSink.m */; };
-		00000000000000000000020C /* M1ControlChannel.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010C /* M1ControlChannel.m */; };
-		00000000000000000000020D /* M1ControlSession.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010D /* M1ControlSession.m */; };
-		00000000000000000000020E /* ProtocolCodec.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010E /* ProtocolCodec.m */; };
-		00000000000000000000020F /* P1SessionState.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000010F /* P1SessionState.m */; };
-		000000000000000000000210 /* P1InputCodec.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000110 /* P1InputCodec.m */; };
-		000000000000000000000220 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000120 /* main.swift */; };
-		000000000000000000000221 /* M1Pairing.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000101 /* M1Pairing.m */; };
-		000000000000000000000222 /* M1Takeover.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000102 /* M1Takeover.m */; };
-		000000000000000000000223 /* M1SessionCoordinator.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000103 /* M1SessionCoordinator.m */; };
-		000000000000000000000224 /* M1DriverLogic.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000104 /* M1DriverLogic.m */; };
-		000000000000000000000225 /* M1InputLogic.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000106 /* M1InputLogic.m */; };
+		000000000000000000000200 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000401 /* main.m */; };
+		000000000000000000000201 /* agent-main.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000402 /* agent-main.m */; };
+		000000000000000000000202 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000403 /* main.swift */; };
+		000000000000000000000405 /* libRDPKit.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000024 /* libRDPKit.a in Frameworks */; };
+		000000000000000000000406 /* libProtocolCodec.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000025 /* libProtocolCodec.a in Frameworks */; };
+		000000000000000000000407 /* libRDPKit.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000024 /* libRDPKit.a in Frameworks */; };
+		000000000000000000000408 /* libProtocolCodec.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 000000000000000000000025 /* libProtocolCodec.a in Frameworks */; };
+		00000000000000000000040A /* M1PipelineTypes.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000409 /* M1PipelineTypes.m */; };
+		00000000000000000000040C /* M1CapturePipeline.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000040B /* M1CapturePipeline.m */; };
+		00000000000000000000040E /* M1VideoEncoder.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000040D /* M1VideoEncoder.m */; };
+		000000000000000000000410 /* M1FramePipeline.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000040F /* M1FramePipeline.m */; };
+		000000000000000000000412 /* M1FrameSender.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000411 /* M1FrameSender.m */; };
+		000000000000000000000414 /* M1FrameReceiver.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000413 /* M1FrameReceiver.m */; };
+		000000000000000000000416 /* M1QuicTransport.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000415 /* M1QuicTransport.m */; };
+		000000000000000000000418 /* M1DatagramSink.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000417 /* M1DatagramSink.m */; };
+		00000000000000000000041A /* M1MessageSink.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000419 /* M1MessageSink.m */; };
+		00000000000000000000041C /* M1ControlLink.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000041B /* M1ControlLink.m */; };
+		00000000000000000000041E /* M1ControlChannel.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000041D /* M1ControlChannel.m */; };
+		000000000000000000000420 /* M1ControlSession.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000041F /* M1ControlSession.m */; };
+		000000000000000000000422 /* M1Pairing.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000421 /* M1Pairing.m */; };
+		000000000000000000000424 /* M1Takeover.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000423 /* M1Takeover.m */; };
+		000000000000000000000426 /* M1SessionCoordinator.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000425 /* M1SessionCoordinator.m */; };
+		000000000000000000000428 /* M1RDPDriver.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000427 /* M1RDPDriver.m */; };
+		00000000000000000000042A /* M1DriverLogic.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000429 /* M1DriverLogic.m */; };
+		00000000000000000000042C /* M1ScreenLock.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000042B /* M1ScreenLock.m */; };
+		00000000000000000000042E /* M1WindowLayout.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000042D /* M1WindowLayout.m */; };
+		000000000000000000000430 /* M1FrameView.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000042F /* M1FrameView.m */; };
+		000000000000000000000432 /* M1InputLogic.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000431 /* M1InputLogic.m */; };
+		000000000000000000000434 /* M1InputInjector.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000433 /* M1InputInjector.m */; };
+		000000000000000000000436 /* ProtocolCodec.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000435 /* ProtocolCodec.m */; };
+		000000000000000000000438 /* P1SessionState.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000437 /* P1SessionState.m */; };
+		00000000000000000000043A /* P1InputCodec.m in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000439 /* P1InputCodec.m */; };
+		00000000000000000000043C /* P1Coordinate.m in Sources */ = {isa = PBXBuildFile; fileRef = 00000000000000000000043B /* P1Coordinate.m */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		00000000000000000000043D /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 000000000000000000000014;
+			remoteInfo = RDPKit;
+		};
+		00000000000000000000043E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 000000000000000000000015;
+			remoteInfo = ProtocolCodec;
+		};
+		00000000000000000000043F /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 000000000000000000000014;
+			remoteInfo = RDPKit;
+		};
+		000000000000000000000440 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 000000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 000000000000000000000015;
+			remoteInfo = ProtocolCodec;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
-		000000000000000000000100 /* p0vprobe.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "P0V-RootDaemon/src/p0vprobe.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000130 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Apps/HostAgent/Sources/main.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000101 /* M1Pairing.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Control/M1Pairing.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000102 /* M1Takeover.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Control/M1Takeover.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000103 /* M1SessionCoordinator.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Control/M1SessionCoordinator.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000104 /* M1DriverLogic.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Display/M1DriverLogic.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000105 /* M1WindowLayout.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Display/M1WindowLayout.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000106 /* M1InputLogic.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Input/M1InputLogic.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000107 /* M1InputInjector.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Input/M1InputInjector.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000108 /* M1PipelineTypes.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Common/M1PipelineTypes.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000109 /* M1DatagramSink.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Transport/M1DatagramSink.m"; sourceTree = SOURCE_ROOT; };
-		00000000000000000000010A /* M1FrameSender.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Frame/M1FrameSender.m"; sourceTree = SOURCE_ROOT; };
-		00000000000000000000010B /* M1MessageSink.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Transport/M1MessageSink.m"; sourceTree = SOURCE_ROOT; };
-		00000000000000000000010C /* M1ControlChannel.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Transport/M1ControlChannel.m"; sourceTree = SOURCE_ROOT; };
-		00000000000000000000010D /* M1ControlSession.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Transport/M1ControlSession.m"; sourceTree = SOURCE_ROOT; };
-		00000000000000000000010E /* ProtocolCodec.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/ProtocolCodec/Sources/ProtocolCodec.m"; sourceTree = SOURCE_ROOT; };
-		00000000000000000000010F /* P1SessionState.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/ProtocolCodec/Sources/P1SessionState.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000110 /* P1InputCodec.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/ProtocolCodec/Sources/P1InputCodec.m"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000120 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "RDPApp/Sources/main.swift"; sourceTree = SOURCE_ROOT; };
-		000000000000000000000126 /* RDPApp-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "RDPApp/Sources/RDPApp-Bridging-Header.h"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000401 /* Apps/HostDaemon/Sources/main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Apps/HostDaemon/Sources/main.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000402 /* Apps/HostAgent/Sources/main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Apps/HostAgent/Sources/main.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000403 /* Apps/Client/Sources/main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Apps/Client/Sources/main.swift"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000404 /* Apps/Client/Sources/RDPApp-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Apps/Client/Sources/RDPApp-Bridging-Header.h"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000409 /* Packages/RDPKit/Sources/Common/M1PipelineTypes.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Common/M1PipelineTypes.m"; sourceTree = SOURCE_ROOT; };
+		00000000000000000000040B /* Packages/RDPKit/Sources/Capture/M1CapturePipeline.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Capture/M1CapturePipeline.m"; sourceTree = SOURCE_ROOT; };
+		00000000000000000000040D /* Packages/RDPKit/Sources/Codec/M1VideoEncoder.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Codec/M1VideoEncoder.m"; sourceTree = SOURCE_ROOT; };
+		00000000000000000000040F /* Packages/RDPKit/Sources/Frame/M1FramePipeline.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Frame/M1FramePipeline.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000411 /* Packages/RDPKit/Sources/Frame/M1FrameSender.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Frame/M1FrameSender.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000413 /* Packages/RDPKit/Sources/Frame/M1FrameReceiver.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Frame/M1FrameReceiver.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000415 /* Packages/RDPKit/Sources/Transport/M1QuicTransport.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Transport/M1QuicTransport.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000417 /* Packages/RDPKit/Sources/Transport/M1DatagramSink.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Transport/M1DatagramSink.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000419 /* Packages/RDPKit/Sources/Transport/M1MessageSink.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Transport/M1MessageSink.m"; sourceTree = SOURCE_ROOT; };
+		00000000000000000000041B /* Packages/RDPKit/Sources/Transport/M1ControlLink.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Transport/M1ControlLink.m"; sourceTree = SOURCE_ROOT; };
+		00000000000000000000041D /* Packages/RDPKit/Sources/Transport/M1ControlChannel.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Transport/M1ControlChannel.m"; sourceTree = SOURCE_ROOT; };
+		00000000000000000000041F /* Packages/RDPKit/Sources/Transport/M1ControlSession.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Transport/M1ControlSession.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000421 /* Packages/RDPKit/Sources/Control/M1Pairing.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Control/M1Pairing.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000423 /* Packages/RDPKit/Sources/Control/M1Takeover.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Control/M1Takeover.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000425 /* Packages/RDPKit/Sources/Control/M1SessionCoordinator.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Control/M1SessionCoordinator.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000427 /* Packages/RDPKit/Sources/Display/M1RDPDriver.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Display/M1RDPDriver.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000429 /* Packages/RDPKit/Sources/Display/M1DriverLogic.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Display/M1DriverLogic.m"; sourceTree = SOURCE_ROOT; };
+		00000000000000000000042B /* Packages/RDPKit/Sources/Display/M1ScreenLock.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Display/M1ScreenLock.m"; sourceTree = SOURCE_ROOT; };
+		00000000000000000000042D /* Packages/RDPKit/Sources/Display/M1WindowLayout.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Display/M1WindowLayout.m"; sourceTree = SOURCE_ROOT; };
+		00000000000000000000042F /* Packages/RDPKit/Sources/Display/M1FrameView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Display/M1FrameView.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000431 /* Packages/RDPKit/Sources/Input/M1InputLogic.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Input/M1InputLogic.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000433 /* Packages/RDPKit/Sources/Input/M1InputInjector.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/RDPKit/Sources/Input/M1InputInjector.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000435 /* Packages/ProtocolCodec/Sources/ProtocolCodec.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/ProtocolCodec/Sources/ProtocolCodec.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000437 /* Packages/ProtocolCodec/Sources/P1SessionState.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/ProtocolCodec/Sources/P1SessionState.m"; sourceTree = SOURCE_ROOT; };
+		000000000000000000000439 /* Packages/ProtocolCodec/Sources/P1InputCodec.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/ProtocolCodec/Sources/P1InputCodec.m"; sourceTree = SOURCE_ROOT; };
+		00000000000000000000043B /* Packages/ProtocolCodec/Sources/P1Coordinate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "Packages/ProtocolCodec/Sources/P1Coordinate.m"; sourceTree = SOURCE_ROOT; };
 		000000000000000000000020 /* veild-host-daemon */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "veild-host-daemon"; sourceTree = BUILT_PRODUCTS_DIR; };
 		000000000000000000000021 /* veild-host-agent */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "veild-host-agent"; sourceTree = BUILT_PRODUCTS_DIR; };
-		000000000000000000000022 /* VeilRD */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = VeilRD; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000022 /* VeilRD */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "VeilRD"; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000024 /* RDPKit */ = {isa = PBXFileReference; explicitFileType = "archive.ar"; includeInIndex = 0; path = "libRDPKit.a"; sourceTree = BUILT_PRODUCTS_DIR; };
+		000000000000000000000025 /* ProtocolCodec */ = {isa = PBXFileReference; explicitFileType = "archive.ar"; includeInIndex = 0; path = "libProtocolCodec.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		000000000000000000000060 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000405 /* libRDPKit.a in Frameworks */,
+				000000000000000000000406 /* libProtocolCodec.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000061 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000407 /* libRDPKit.a in Frameworks */,
+				000000000000000000000408 /* libProtocolCodec.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		000000000000000000000002 = {
 			isa = PBXGroup;
 			children = (
-				0000000000000000000000A0 /* Apps */,
-				0000000000000000000000B0 /* Packages */,
-				0000000000000000000000D0 /* Probes */,
+				000000000000000000000441 /* Apps */,
+				000000000000000000000442 /* Packages */,
+				000000000000000000000443 /* Probes */,
 				000000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		0000000000000000000000A0 /* Apps */ = {
+		000000000000000000000444 /* HostDaemon */ = {
 			isa = PBXGroup;
 			children = (
-				0000000000000000000000A1 /* HostAgent */,
-				0000000000000000000000A2 /* HostDaemon */,
-				0000000000000000000000A3 /* Client */,
+				000000000000000000000401,
+			);
+			path = "Apps/HostDaemon";
+			sourceTree = "<group>";
+		};
+		000000000000000000000445 /* HostAgent */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000402,
+			);
+			path = "Apps/HostAgent";
+			sourceTree = "<group>";
+		};
+		000000000000000000000446 /* Client */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000403,
+				000000000000000000000404,
+			);
+			path = "Apps/Client";
+			sourceTree = "<group>";
+		};
+		000000000000000000000441 /* Apps */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000444,
+				000000000000000000000445,
+				000000000000000000000446,
 			);
 			name = Apps;
 			sourceTree = "<group>";
 		};
-		0000000000000000000000A1 /* HostAgent */ = {
+		000000000000000000000447 /* Common */ = {
 			isa = PBXGroup;
 			children = (
-				000000000000000000000130 /* main.m */,
+				000000000000000000000409,
 			);
-			path = HostAgent;
+			path = "Packages/RDPKit/Sources/Common";
 			sourceTree = "<group>";
 		};
-		0000000000000000000000A2 /* HostDaemon */ = {
+		000000000000000000000448 /* Capture */ = {
 			isa = PBXGroup;
 			children = (
+				00000000000000000000040B,
 			);
-			path = HostDaemon;
+			path = "Packages/RDPKit/Sources/Capture";
 			sourceTree = "<group>";
 		};
-		0000000000000000000000A3 /* Client */ = {
+		000000000000000000000449 /* Codec */ = {
 			isa = PBXGroup;
 			children = (
-				000000000000000000000120 /* main.swift */,
-				000000000000000000000126 /* RDPApp-Bridging-Header.h */,
+				00000000000000000000040D,
 			);
-			path = Client;
+			path = "Packages/RDPKit/Sources/Codec";
 			sourceTree = "<group>";
 		};
-		0000000000000000000000B0 /* Packages */ = {
+		00000000000000000000044A /* Frame */ = {
 			isa = PBXGroup;
 			children = (
-				0000000000000000000000B1 /* RDPKit */,
-				0000000000000000000000B2 /* ProtocolCodec */,
+				00000000000000000000040F,
+				000000000000000000000411,
+				000000000000000000000413,
+			);
+			path = "Packages/RDPKit/Sources/Frame";
+			sourceTree = "<group>";
+		};
+		00000000000000000000044B /* Transport */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000415,
+				000000000000000000000417,
+				000000000000000000000419,
+				00000000000000000000041B,
+				00000000000000000000041D,
+				00000000000000000000041F,
+			);
+			path = "Packages/RDPKit/Sources/Transport";
+			sourceTree = "<group>";
+		};
+		00000000000000000000044C /* Control */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000421,
+				000000000000000000000423,
+				000000000000000000000425,
+			);
+			path = "Packages/RDPKit/Sources/Control";
+			sourceTree = "<group>";
+		};
+		00000000000000000000044D /* Display */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000427,
+				000000000000000000000429,
+				00000000000000000000042B,
+				00000000000000000000042D,
+				00000000000000000000042F,
+			);
+			path = "Packages/RDPKit/Sources/Display";
+			sourceTree = "<group>";
+		};
+		00000000000000000000044E /* Input */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000431,
+				000000000000000000000433,
+			);
+			path = "Packages/RDPKit/Sources/Input";
+			sourceTree = "<group>";
+		};
+		00000000000000000000044F /* RDPKit */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000447,
+				000000000000000000000448,
+				000000000000000000000449,
+				00000000000000000000044A,
+				00000000000000000000044B,
+				00000000000000000000044C,
+				00000000000000000000044D,
+				00000000000000000000044E,
+			);
+			path = "Packages/RDPKit";
+			sourceTree = "<group>";
+		};
+		000000000000000000000450 /* ProtocolCodec */ = {
+			isa = PBXGroup;
+			children = (
+				000000000000000000000435,
+				000000000000000000000437,
+				000000000000000000000439,
+				00000000000000000000043B,
+			);
+			path = "Packages/ProtocolCodec";
+			sourceTree = "<group>";
+		};
+		000000000000000000000442 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				00000000000000000000044F,
+				000000000000000000000450,
 			);
 			name = Packages;
 			sourceTree = "<group>";
 		};
-		0000000000000000000000B1 /* RDPKit */ = {
-			isa = PBXGroup;
-			children = (
-				0000000000000000000000C1 /* Common */,
-				0000000000000000000000C2 /* Capture */,
-				0000000000000000000000C3 /* Codec */,
-				0000000000000000000000C4 /* Frame */,
-				0000000000000000000000C5 /* Transport */,
-				0000000000000000000000C6 /* Control */,
-				0000000000000000000000C7 /* Display */,
-				0000000000000000000000C8 /* Input */,
-			);
-			path = RDPKit;
-			sourceTree = "<group>";
-		};
-		0000000000000000000000B2 /* ProtocolCodec */ = {
-			isa = PBXGroup;
-			children = (
-				00000000000000000000010E /* ProtocolCodec.m */,
-				00000000000000000000010F /* P1SessionState.m */,
-				000000000000000000000110 /* P1InputCodec.m */,
-			);
-			path = ProtocolCodec;
-			sourceTree = "<group>";
-		};
-		0000000000000000000000C1 /* Common */ = {
-			isa = PBXGroup;
-			children = (
-				000000000000000000000108 /* M1PipelineTypes.m */,
-			);
-			path = Common;
-			sourceTree = "<group>";
-		};
-		0000000000000000000000C2 /* Capture */ = {
+		000000000000000000000443 /* Probes */ = {
 			isa = PBXGroup;
 			children = (
 			);
-			path = Capture;
+			path = "P0V-RootDaemon";
 			sourceTree = "<group>";
 		};
-		0000000000000000000000C3 /* Codec */ = {
+		000000000000000000000451 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-			);
-			path = Codec;
-			sourceTree = "<group>";
-		};
-		0000000000000000000000C4 /* Frame */ = {
-			isa = PBXGroup;
-			children = (
-				00000000000000000000010A /* M1FrameSender.m */,
-			);
-			path = Frame;
-			sourceTree = "<group>";
-		};
-		0000000000000000000000C5 /* Transport */ = {
-			isa = PBXGroup;
-			children = (
-				000000000000000000000109 /* M1DatagramSink.m */,
-				00000000000000000000010B /* M1MessageSink.m */,
-				00000000000000000000010C /* M1ControlChannel.m */,
-				00000000000000000000010D /* M1ControlSession.m */,
-			);
-			path = Transport;
-			sourceTree = "<group>";
-		};
-		0000000000000000000000C6 /* Control */ = {
-			isa = PBXGroup;
-			children = (
-				000000000000000000000101 /* M1Pairing.m */,
-				000000000000000000000102 /* M1Takeover.m */,
-				000000000000000000000103 /* M1SessionCoordinator.m */,
-			);
-			path = Control;
-			sourceTree = "<group>";
-		};
-		0000000000000000000000C7 /* Display */ = {
-			isa = PBXGroup;
-			children = (
-				000000000000000000000104 /* M1DriverLogic.m */,
-				000000000000000000000105 /* M1WindowLayout.m */,
-			);
-			path = Display;
-			sourceTree = "<group>";
-		};
-		0000000000000000000000C8 /* Input */ = {
-			isa = PBXGroup;
-			children = (
-				000000000000000000000106 /* M1InputLogic.m */,
-				000000000000000000000107 /* M1InputInjector.m */,
-			);
-			path = Input;
-			sourceTree = "<group>";
-		};
-		0000000000000000000000D0 /* Probes */ = {
-			isa = PBXGroup;
-			children = (
-				000000000000000000000100 /* p0vprobe.m */,
-			);
-			name = Probes;
-			sourceTree = "<group>";
-		};
-		000000000000000000000003 /* Products */ = {
-			isa = PBXGroup;
-			children = (
-				000000000000000000000020 /* veild-host-daemon */,
-				000000000000000000000021 /* veild-host-agent */,
-				000000000000000000000022 /* VeilRD */,
+				000000000000000000000020,
+				000000000000000000000021,
+				000000000000000000000022,
+				000000000000000000000024,
+				000000000000000000000025,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -232,14 +317,14 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 000000000000000000000041 /* Build configuration list for PBXNativeTarget "veild-host-daemon" */;
 			buildPhases = (
-				000000000000000000000030 /* Sources */,
+				000000000000000000000030,
 			);
 			buildRules = (
 			);
 			dependencies = (
 			);
-			name = "veild-host-daemon";
-			productName = "veild-host-daemon";
+			name = veild-host-daemon;
+			productName = veild-host-daemon;
 			productReference = 000000000000000000000020 /* veild-host-daemon */;
 			productType = "com.apple.product-type.tool";
 		};
@@ -247,14 +332,17 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 000000000000000000000042 /* Build configuration list for PBXNativeTarget "veild-host-agent" */;
 			buildPhases = (
-				000000000000000000000031 /* Sources */,
+				000000000000000000000031,
+				000000000000000000000060,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				000000000000000000000452,
+				000000000000000000000453,
 			);
-			name = "veild-host-agent";
-			productName = "veild-host-agent";
+			name = veild-host-agent;
+			productName = veild-host-agent;
 			productReference = 000000000000000000000021 /* veild-host-agent */;
 			productType = "com.apple.product-type.tool";
 		};
@@ -262,16 +350,49 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 000000000000000000000043 /* Build configuration list for PBXNativeTarget "VeilRD" */;
 			buildPhases = (
-				000000000000000000000032 /* Sources */,
+				000000000000000000000032,
+				000000000000000000000061,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				000000000000000000000454,
+				000000000000000000000455,
 			);
 			name = VeilRD;
 			productName = VeilRD;
 			productReference = 000000000000000000000022 /* VeilRD */;
 			productType = "com.apple.product-type.tool";
+		};
+		000000000000000000000014 /* RDPKit */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 000000000000000000000044 /* Build configuration list for PBXNativeTarget "RDPKit" */;
+			buildPhases = (
+				000000000000000000000034,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = RDPKit;
+			productName = RDPKit;
+			productReference = 000000000000000000000024 /* RDPKit */;
+			productType = "com.apple.product-type.library.static";
+		};
+		000000000000000000000015 /* ProtocolCodec */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 000000000000000000000045 /* Build configuration list for PBXNativeTarget "ProtocolCodec" */;
+			buildPhases = (
+				000000000000000000000035,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ProtocolCodec;
+			productName = ProtocolCodec;
+			productReference = 000000000000000000000025 /* ProtocolCodec */;
+			productType = "com.apple.product-type.library.static";
 		};
 /* End PBXNativeTarget section */
 
@@ -280,7 +401,6 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
-				LastSwiftUpdateCheck = 2650;
 				LastUpgradeCheck = 2650;
 				TargetAttributes = {
 					000000000000000000000010 = {
@@ -290,6 +410,12 @@
 						CreatedOnToolsVersion = 26.5;
 					};
 					000000000000000000000012 = {
+						CreatedOnToolsVersion = 26.5;
+					};
+					000000000000000000000014 = {
+						CreatedOnToolsVersion = 26.5;
+					};
+					000000000000000000000015 = {
 						CreatedOnToolsVersion = 26.5;
 					};
 				};
@@ -307,9 +433,11 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				000000000000000000000010 /* veild-host-daemon */,
-				000000000000000000000011 /* veild-host-agent */,
-				000000000000000000000012 /* VeilRD */,
+				000000000000000000000010,
+				000000000000000000000011,
+				000000000000000000000012,
+				000000000000000000000014,
+				000000000000000000000015,
 			);
 		};
 /* End PBXProject section */
@@ -319,7 +447,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				000000000000000000000200 /* p0vprobe.m in Sources */,
+				000000000000000000000200,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -327,23 +455,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				000000000000000000000201 /* M1Pairing.m in Sources */,
-				000000000000000000000202 /* M1Takeover.m in Sources */,
-				000000000000000000000203 /* M1SessionCoordinator.m in Sources */,
-				000000000000000000000204 /* M1DriverLogic.m in Sources */,
-				000000000000000000000205 /* M1WindowLayout.m in Sources */,
-				000000000000000000000206 /* M1InputLogic.m in Sources */,
-				000000000000000000000207 /* M1InputInjector.m in Sources */,
-				000000000000000000000208 /* M1PipelineTypes.m in Sources */,
-				000000000000000000000209 /* M1DatagramSink.m in Sources */,
-				00000000000000000000020A /* M1FrameSender.m in Sources */,
-				00000000000000000000020B /* M1MessageSink.m in Sources */,
-				00000000000000000000020C /* M1ControlChannel.m in Sources */,
-				00000000000000000000020D /* M1ControlSession.m in Sources */,
-				00000000000000000000020E /* ProtocolCodec.m in Sources */,
-				00000000000000000000020F /* P1SessionState.m in Sources */,
-				000000000000000000000210 /* P1InputCodec.m in Sources */,
-				000000000000000000000226 /* main.m in Sources */,
+				000000000000000000000201,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -351,16 +463,74 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				000000000000000000000220 /* main.swift in Sources */,
-				000000000000000000000221 /* M1Pairing.m in Sources */,
-				000000000000000000000222 /* M1Takeover.m in Sources */,
-				000000000000000000000223 /* M1SessionCoordinator.m in Sources */,
-				000000000000000000000224 /* M1DriverLogic.m in Sources */,
-				000000000000000000000225 /* M1InputLogic.m in Sources */,
+				000000000000000000000202,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000034 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				00000000000000000000040A,
+				00000000000000000000040C,
+				00000000000000000000040E,
+				000000000000000000000410,
+				000000000000000000000412,
+				000000000000000000000414,
+				000000000000000000000416,
+				000000000000000000000418,
+				00000000000000000000041A,
+				00000000000000000000041C,
+				00000000000000000000041E,
+				000000000000000000000420,
+				000000000000000000000422,
+				000000000000000000000424,
+				000000000000000000000426,
+				000000000000000000000428,
+				00000000000000000000042A,
+				00000000000000000000042C,
+				00000000000000000000042E,
+				000000000000000000000430,
+				000000000000000000000432,
+				000000000000000000000434,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000035 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				000000000000000000000436,
+				000000000000000000000438,
+				00000000000000000000043A,
+				00000000000000000000043C,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		000000000000000000000452 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 000000000000000000000014 /* RDPKit */;
+			targetProxy = 00000000000000000000043D /* PBXContainerItemProxy */;
+		};
+		000000000000000000000453 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 000000000000000000000015 /* ProtocolCodec */;
+			targetProxy = 00000000000000000000043E /* PBXContainerItemProxy */;
+		};
+		000000000000000000000454 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 000000000000000000000014 /* RDPKit */;
+			targetProxy = 00000000000000000000043F /* PBXContainerItemProxy */;
+		};
+		000000000000000000000455 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 000000000000000000000015 /* ProtocolCodec */;
+			targetProxy = 000000000000000000000440 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		000000000000000000000050 /* Debug */ = {
@@ -370,11 +540,11 @@
 				CLANG_ENABLE_MODULES = YES;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGNING_ALLOWED = NO;
-				ENABLE_TESTABILITY = YES;
 				GCC_WARN_UNUSED_PARAMETER = NO;
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
-				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = macosx;
+				ONLY_ACTIVE_ARCH = YES;
+				ENABLE_TESTABILITY = YES;
 			};
 			name = Debug;
 		};
@@ -408,20 +578,23 @@
 					"$(SRCROOT)/P1-ClientProbe/src",
 					"$(SRCROOT)/P0-TahoeProbe/src",
 					"$(SRCROOT)/P0V-DisplayIsolation/src",
+					"$(SRCROOT)/P0V-RootDaemon/src",
+					"$(SRCROOT)/RDPApp/Sources",
+					"$(SRCROOT)/Apps/Client/Sources",
 				);
 				OTHER_LDFLAGS = (
 					"-framework",
-					Foundation,
+					"Foundation",
 					"-framework",
-					ApplicationServices,
+					"ApplicationServices",
 					"-framework",
-					CoreGraphics,
+					"CoreGraphics",
 					"-framework",
-					CoreVideo,
+					"CoreVideo",
 					"-framework",
-					CoreMedia,
+					"ScreenCaptureKit",
 					"-framework",
-					ScreenCaptureKit,
+					"IOKit",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -445,20 +618,23 @@
 					"$(SRCROOT)/P1-ClientProbe/src",
 					"$(SRCROOT)/P0-TahoeProbe/src",
 					"$(SRCROOT)/P0V-DisplayIsolation/src",
+					"$(SRCROOT)/P0V-RootDaemon/src",
+					"$(SRCROOT)/RDPApp/Sources",
+					"$(SRCROOT)/Apps/Client/Sources",
 				);
 				OTHER_LDFLAGS = (
 					"-framework",
-					Foundation,
+					"Foundation",
 					"-framework",
-					ApplicationServices,
+					"ApplicationServices",
 					"-framework",
-					CoreGraphics,
+					"CoreGraphics",
 					"-framework",
-					CoreVideo,
+					"CoreVideo",
 					"-framework",
-					CoreMedia,
+					"ScreenCaptureKit",
 					"-framework",
-					ScreenCaptureKit,
+					"IOKit",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -482,38 +658,41 @@
 					"$(SRCROOT)/P1-ClientProbe/src",
 					"$(SRCROOT)/P0-TahoeProbe/src",
 					"$(SRCROOT)/P0V-DisplayIsolation/src",
+					"$(SRCROOT)/P0V-RootDaemon/src",
+					"$(SRCROOT)/RDPApp/Sources",
+					"$(SRCROOT)/Apps/Client/Sources",
 				);
 				OTHER_LDFLAGS = (
 					"-framework",
-					AppKit,
+					"Foundation",
 					"-framework",
-					Foundation,
+					"ApplicationServices",
 					"-framework",
-					ApplicationServices,
+					"CoreGraphics",
 					"-framework",
-					Network,
+					"CoreVideo",
 					"-framework",
-					Security,
+					"CoreMedia",
 					"-framework",
-					QuartzCore,
+					"ScreenCaptureKit",
 					"-framework",
-					CoreGraphics,
+					"VideoToolbox",
 					"-framework",
-					CoreMedia,
+					"Network",
 					"-framework",
-					CoreVideo,
+					"Security",
 					"-framework",
-					ScreenCaptureKit,
+					"QuartzCore",
 					"-framework",
-					VideoToolbox,
+					"CoreImage",
 					"-framework",
-					CoreImage,
+					"ImageIO",
 					"-framework",
-					ImageIO,
+					"IOKit",
 					"-framework",
-					IOKit,
+					"IOSurface",
 					"-framework",
-					IOSurface,
+					"AppKit",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -537,38 +716,41 @@
 					"$(SRCROOT)/P1-ClientProbe/src",
 					"$(SRCROOT)/P0-TahoeProbe/src",
 					"$(SRCROOT)/P0V-DisplayIsolation/src",
+					"$(SRCROOT)/P0V-RootDaemon/src",
+					"$(SRCROOT)/RDPApp/Sources",
+					"$(SRCROOT)/Apps/Client/Sources",
 				);
 				OTHER_LDFLAGS = (
 					"-framework",
-					AppKit,
+					"Foundation",
 					"-framework",
-					Foundation,
+					"ApplicationServices",
 					"-framework",
-					ApplicationServices,
+					"CoreGraphics",
 					"-framework",
-					Network,
+					"CoreVideo",
 					"-framework",
-					Security,
+					"CoreMedia",
 					"-framework",
-					QuartzCore,
+					"ScreenCaptureKit",
 					"-framework",
-					CoreGraphics,
+					"VideoToolbox",
 					"-framework",
-					CoreMedia,
+					"Network",
 					"-framework",
-					CoreVideo,
+					"Security",
 					"-framework",
-					ScreenCaptureKit,
+					"QuartzCore",
 					"-framework",
-					VideoToolbox,
+					"CoreImage",
 					"-framework",
-					CoreImage,
+					"ImageIO",
 					"-framework",
-					ImageIO,
+					"IOKit",
 					"-framework",
-					IOKit,
+					"IOSurface",
 					"-framework",
-					IOSurface,
+					"AppKit",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -587,20 +769,50 @@
 					"$(SRCROOT)/Packages/RDPKit/Sources/Control",
 					"$(SRCROOT)/Packages/RDPKit/Sources/Display",
 					"$(SRCROOT)/Packages/RDPKit/Sources/Input",
+					"$(SRCROOT)/Packages/ProtocolCodec/Sources",
 					"$(SRCROOT)/M1-Skeleton/src",
+					"$(SRCROOT)/P1-ClientProbe/src",
+					"$(SRCROOT)/P0-TahoeProbe/src",
+					"$(SRCROOT)/P0V-DisplayIsolation/src",
+					"$(SRCROOT)/P0V-RootDaemon/src",
 					"$(SRCROOT)/RDPApp/Sources",
+					"$(SRCROOT)/Apps/Client/Sources",
 				);
 				OTHER_LDFLAGS = (
 					"-framework",
-					Foundation,
+					"Foundation",
 					"-framework",
-					ApplicationServices,
+					"ApplicationServices",
 					"-framework",
-					Cocoa,
+					"Cocoa",
+					"-framework",
+					"CoreGraphics",
+					"-framework",
+					"CoreVideo",
+					"-framework",
+					"CoreMedia",
+					"-framework",
+					"ScreenCaptureKit",
+					"-framework",
+					"VideoToolbox",
+					"-framework",
+					"Network",
+					"-framework",
+					"Security",
+					"-framework",
+					"QuartzCore",
+					"-framework",
+					"CoreImage",
+					"-framework",
+					"ImageIO",
+					"-framework",
+					"IOKit",
+					"-framework",
+					"IOSurface",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
-				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/RDPApp/Sources/RDPApp-Bridging-Header.h";
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Apps/Client/Sources/RDPApp-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 			};
 			name = Debug;
@@ -617,21 +829,171 @@
 					"$(SRCROOT)/Packages/RDPKit/Sources/Control",
 					"$(SRCROOT)/Packages/RDPKit/Sources/Display",
 					"$(SRCROOT)/Packages/RDPKit/Sources/Input",
+					"$(SRCROOT)/Packages/ProtocolCodec/Sources",
 					"$(SRCROOT)/M1-Skeleton/src",
+					"$(SRCROOT)/P1-ClientProbe/src",
+					"$(SRCROOT)/P0-TahoeProbe/src",
+					"$(SRCROOT)/P0V-DisplayIsolation/src",
+					"$(SRCROOT)/P0V-RootDaemon/src",
 					"$(SRCROOT)/RDPApp/Sources",
+					"$(SRCROOT)/Apps/Client/Sources",
 				);
 				OTHER_LDFLAGS = (
 					"-framework",
-					Foundation,
+					"Foundation",
 					"-framework",
-					ApplicationServices,
+					"ApplicationServices",
 					"-framework",
-					Cocoa,
+					"Cocoa",
+					"-framework",
+					"CoreGraphics",
+					"-framework",
+					"CoreVideo",
+					"-framework",
+					"CoreMedia",
+					"-framework",
+					"ScreenCaptureKit",
+					"-framework",
+					"VideoToolbox",
+					"-framework",
+					"Network",
+					"-framework",
+					"Security",
+					"-framework",
+					"QuartzCore",
+					"-framework",
+					"CoreImage",
+					"-framework",
+					"ImageIO",
+					"-framework",
+					"IOKit",
+					"-framework",
+					"IOSurface",
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
-				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/RDPApp/Sources/RDPApp-Bridging-Header.h";
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/Apps/Client/Sources/RDPApp-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		000000000000000000000058 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Packages/RDPKit/Sources/Common",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Capture",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Codec",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Frame",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Transport",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Control",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Display",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Input",
+					"$(SRCROOT)/Packages/ProtocolCodec/Sources",
+					"$(SRCROOT)/M1-Skeleton/src",
+					"$(SRCROOT)/P1-ClientProbe/src",
+					"$(SRCROOT)/P0-TahoeProbe/src",
+					"$(SRCROOT)/P0V-DisplayIsolation/src",
+					"$(SRCROOT)/P0V-RootDaemon/src",
+					"$(SRCROOT)/RDPApp/Sources",
+					"$(SRCROOT)/Apps/Client/Sources",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		000000000000000000000059 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Packages/RDPKit/Sources/Common",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Capture",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Codec",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Frame",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Transport",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Control",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Display",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Input",
+					"$(SRCROOT)/Packages/ProtocolCodec/Sources",
+					"$(SRCROOT)/M1-Skeleton/src",
+					"$(SRCROOT)/P1-ClientProbe/src",
+					"$(SRCROOT)/P0-TahoeProbe/src",
+					"$(SRCROOT)/P0V-DisplayIsolation/src",
+					"$(SRCROOT)/P0V-RootDaemon/src",
+					"$(SRCROOT)/RDPApp/Sources",
+					"$(SRCROOT)/Apps/Client/Sources",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		00000000000000000000005A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Packages/RDPKit/Sources/Common",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Capture",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Codec",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Frame",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Transport",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Control",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Display",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Input",
+					"$(SRCROOT)/Packages/ProtocolCodec/Sources",
+					"$(SRCROOT)/M1-Skeleton/src",
+					"$(SRCROOT)/P1-ClientProbe/src",
+					"$(SRCROOT)/P0-TahoeProbe/src",
+					"$(SRCROOT)/P0V-DisplayIsolation/src",
+					"$(SRCROOT)/P0V-RootDaemon/src",
+					"$(SRCROOT)/RDPApp/Sources",
+					"$(SRCROOT)/Apps/Client/Sources",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		00000000000000000000005B /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/Packages/RDPKit/Sources/Common",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Capture",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Codec",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Frame",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Transport",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Control",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Display",
+					"$(SRCROOT)/Packages/RDPKit/Sources/Input",
+					"$(SRCROOT)/Packages/ProtocolCodec/Sources",
+					"$(SRCROOT)/M1-Skeleton/src",
+					"$(SRCROOT)/P1-ClientProbe/src",
+					"$(SRCROOT)/P0-TahoeProbe/src",
+					"$(SRCROOT)/P0V-DisplayIsolation/src",
+					"$(SRCROOT)/P0V-RootDaemon/src",
+					"$(SRCROOT)/RDPApp/Sources",
+					"$(SRCROOT)/Apps/Client/Sources",
+				);
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				SDKROOT = macosx;
 			};
 			name = Release;
 		};
@@ -641,8 +1003,8 @@
 		000000000000000000000040 /* Build configuration list for PBXProject "VeilRD" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				000000000000000000000050 /* Debug */,
-				000000000000000000000051 /* Release */,
+				000000000000000000000050,
+				000000000000000000000051,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
@@ -650,8 +1012,8 @@
 		000000000000000000000041 /* Build configuration list for PBXNativeTarget "veild-host-daemon" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				000000000000000000000052 /* Debug */,
-				000000000000000000000053 /* Release */,
+				000000000000000000000052,
+				000000000000000000000053,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
@@ -659,8 +1021,8 @@
 		000000000000000000000042 /* Build configuration list for PBXNativeTarget "veild-host-agent" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				000000000000000000000054 /* Debug */,
-				000000000000000000000055 /* Release */,
+				000000000000000000000054,
+				000000000000000000000055,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
@@ -668,8 +1030,26 @@
 		000000000000000000000043 /* Build configuration list for PBXNativeTarget "VeilRD" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				000000000000000000000056 /* Debug */,
-				000000000000000000000057 /* Release */,
+				000000000000000000000056,
+				000000000000000000000057,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		000000000000000000000044 /* Build configuration list for PBXNativeTarget "RDPKit" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				000000000000000000000058,
+				000000000000000000000059,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		000000000000000000000045 /* Build configuration list for PBXNativeTarget "ProtocolCodec" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				00000000000000000000005A,
+				00000000000000000000005B,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

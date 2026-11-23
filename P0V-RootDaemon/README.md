@@ -4,6 +4,8 @@
 
 这是"远程登录"能不能做的唯一判据。此前 D-07 的"永不锁屏"是**在未验证的前提下**做出的妥协，本探针就是来把它证伪或证实的。
 
+> **第 3 轮工程收口**：`src/p0vprobe.m` 已物理归位到 `Apps/HostDaemon/Sources/main.m`，本目录旧路径为兼容软链，`./build.sh` 等 runbook 用法不变。产品身份见 `Apps/HostDaemon/README.md` 与 D-20。
+
 ## 判据（对应 DESIGN A-09 / V-04）
 
 | 编号 | 内容 | 通过判据 |
