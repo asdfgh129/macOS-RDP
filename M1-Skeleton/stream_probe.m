@@ -55,574 +55,12 @@
 #import "M1SessionCoordinator.h"
 #import "M1RDPDriver.h"
 #import "P0VDisplayControl.h"
+#import "M1StreamSession.h"
 
 static NSString *gIdentity = @".state/rdp-identity.p12";
 static NSString *gPass = @"rdpdev";
-static const char *kALPN = "rdp1";
-
-static const uint8_t kMagicControl = 0x43;   // 'C'  M1ControlLink
-static const uint8_t kMagicFrame   = 0x4D;   // 'M'  P1FrameMagic 首字节
-
-static double NowMs(void) {
-    return [[NSDate date] timeIntervalSince1970] * 1000.0;
-}
-
-static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
-    if (!pb || path.length == 0) return NO;
-    CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
-    if (!ci) return NO;
-    static CIContext *ctx = nil;
-    if (!ctx) ctx = [CIContext contextWithOptions:nil];
-    CGImageRef cg = [ctx createCGImage:ci fromRect:ci.extent];
-    if (!cg) return NO;
-    NSURL *url = [NSURL fileURLWithPath:path];
-    CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
-        (__bridge CFURLRef)url, (__bridge CFStringRef)@"public.png", 1, NULL);
-    if (!dst) { CGImageRelease(cg); return NO; }
-    CGImageDestinationAddImage(dst, cg, NULL);
-    BOOL ok = CGImageDestinationFinalize(dst);
-    CFRelease(dst);
-    CGImageRelease(cg);
-    return ok;
-}
-
-#pragma mark - 单端节点
-
-// 控制链路专用 sink：控制包插到传输队列最前，不与整帧分片一起排队。
-// 补片请求晚到几百毫秒就等于没发——接收端早已按期限判丢。
-@interface M1PriorityDatagramSink : NSObject <M1DatagramSink>
-@property (nonatomic, strong) M1QuicTransport *transport;
-+ (instancetype)sinkForTransport:(M1QuicTransport *)transport;
-@end
-
-@implementation M1PriorityDatagramSink
-+ (instancetype)sinkForTransport:(M1QuicTransport *)transport {
-    M1PriorityDatagramSink *s = [M1PriorityDatagramSink new];
-    s.transport = transport;
-    return s;
-}
-- (BOOL)sendDatagram:(NSData *)datagram error:(NSError **)error {
-    return [self.transport sendPriorityDatagram:datagram error:error];
-}
-@end
-
-@interface StreamNode : NSObject <M1QuicTransportDelegate, M1ControlLinkDelegate,
-                                 M1ControlSessionDelegate, M1DatagramSink>
-
-@property (nonatomic, assign) BOOL isHost;
-@property (nonatomic, assign) uint16_t port;
-@property (nonatomic, copy, nullable) NSString *expectedFingerprint;
-@property (nonatomic, copy, nullable) NSString *localFingerprint;
-@property (nonatomic, assign) int fps;
-@property (nonatomic, assign) int bitrateKbps;
-
-@property (nonatomic, strong, nullable) M1QuicTransport *listener;
-@property (nonatomic, strong, nullable) M1QuicTransport *streamConn;   // 实际承载流量的连接
-@property (nonatomic, strong, nullable) M1ControlLink *link;
-@property (nonatomic, strong, nullable) M1ControlChannel *channel;
-@property (nonatomic, strong, nullable) M1ControlSession *session;
-@property (nonatomic, strong) dispatch_semaphore_t readySem;
-@property (nonatomic, strong) dispatch_semaphore_t streamingSem;
-@property (nonatomic, strong, nullable) NSError *error;
-@property (nonatomic, assign) BOOL streaming;
-@property (nonatomic, assign) double handshakeMs;
-@property (nonatomic, assign) double streamStartMs;   // 进入 STREAMING 的时刻
-@property (nonatomic, copy, nullable) void (^onSessionClosed)(void);
-// Host 侧：收到客户端输入事件（已在 M1ControlSession 过校验与限速）。
-@property (nonatomic, copy, nullable) void (^onInputEvent)(NSDictionary *event);
-// Host 侧：为 session-start 准备真实显示；返回 nil = 失败（会回 session-error），
-// 返回空数组 = 沿用合成占位。
-@property (nonatomic, copy, nullable) NSArray<NSDictionary *> *(^displayProvider)(NSDictionary *message,
-                                                                              NSError **error);
-// Host 侧：收到 keyframe-request（控制收包队列上调用）。
-@property (nonatomic, copy, nullable) void (^onKeyframeRequest)(void);
-// Host 侧：收到 frame-nack（控制收包队列上调用），应只重发缺失分片。
-@property (nonatomic, copy, nullable) void (^onFrameNack)(uint32_t frameSeq, uint16_t fragCount,
-                                                          NSIndexSet *indices);
-// 单次接入失败（握手/会话错误）时回调：独占模式必须在这里恢复显示，
-// 否则 --wait-ms 0 会清掉错误继续等下一次，把机器留在禁屏态。
-@property (nonatomic, copy, nullable) void (^onAttemptFailed)(void);
-// Client 侧：session-start 请求的规格；nil = 1920x1080。
-@property (nonatomic, copy, nullable) NSArray<NSDictionary *> *requestedSpecs;
-
-// 发送端故障注入（只影响帧分片，不影响控制包）。
-@property (nonatomic, assign) double simLossPct;
-@property (nonatomic, assign) double simReorderPct;
-@property (nonatomic, assign) uint64_t simFragmentsDropped;
-@property (nonatomic, assign) uint64_t simReordered;
-@property (nonatomic, assign) uint64_t simState;
-@property (nonatomic, strong, nullable) NSData *simHeld;
-
-// 分流统计
-@property (nonatomic, assign) uint64_t controlDatagrams;
-@property (nonatomic, assign) uint64_t frameDatagrams;
-@property (nonatomic, assign) uint64_t unroutedDatagrams;
-
-// 控制通道到达间隔（判「推流是否挤掉心跳」）
-@property (nonatomic, assign) double lastControlArrivalMs;
-@property (nonatomic, assign) double maxControlGapMs;
-@property (nonatomic, assign) double maxGapAtOffsetMs;    // 最大间隔出现在推流的第几毫秒
-@property (nonatomic, strong) NSMutableArray<NSNumber *> *controlArrivals;  // 相对偏移
-
-@end
-
-@implementation StreamNode
-
-- (instancetype)init {
-    if ((self = [super init])) {
-        _readySem = dispatch_semaphore_create(0);
-        _streamingSem = dispatch_semaphore_create(0);
-        _fps = 20;
-        _bitrateKbps = 12000;
-        _controlArrivals = [NSMutableArray array];
-        _simState = 0x9E3779B97F4A7C15ull ^ (uint64_t)getpid();
-    }
-    return self;
-}
-
-#pragma mark 启动
-
-- (BOOL)startAsHostOnPort:(uint16_t)port error:(NSError **)error {
-    self.isHost = YES;
-    M1QuicTransport *t = [[M1QuicTransport alloc] initAsListenerOnPort:port
-                                                                  alpn:@(kALPN)
-                                                          identityPath:gIdentity
-                                                          identityPass:gPass
-                                                            verifyPeer:NO];
-    t.delegate = self;
-    self.listener = t;
-    [t start];
-    if (dispatch_semaphore_wait(self.readySem,
-            dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC)) != 0) {
-        if (error) *error = [NSError errorWithDomain:@"streamprobe" code:1
-            userInfo:@{NSLocalizedDescriptionKey: @"listener 未在 8s 内 ready"}];
-        return NO;
-    }
-    if (self.error) { if (error) *error = self.error; return NO; }
-    self.port = t.listenPort;
-    return YES;
-}
-
-- (BOOL)startAsClientTo:(NSString *)host port:(uint16_t)port
-                timeout:(uint32_t)timeoutMs error:(NSError **)error {
-    self.isHost = NO;
-    M1QuicTransport *t = [[M1QuicTransport alloc] initAsClientToHost:host
-                                                                port:port
-                                                                alpn:@(kALPN)
-                                                        identityPath:nil
-                                                        identityPass:nil
-                                                          verifyPeer:YES];
-    t.expectedPeerFingerprint = self.expectedFingerprint;
-    t.delegate = self;
-    self.streamConn = t;
-    double t0 = NowMs();
-    [t start];
-    if (![t waitUntilReadyTimeoutMs:timeoutMs]) {
-        if (error) *error = [NSError errorWithDomain:@"streamprobe" code:2
-            userInfo:@{NSLocalizedDescriptionKey:
-                [NSString stringWithFormat:@"握手未在 %ums 内完成", timeoutMs]}];
-        return NO;
-    }
-    self.handshakeMs = NowMs() - t0;
-    if (self.error) { if (error) *error = self.error; return NO; }
-    return YES;
-}
-
-- (void)attachSessionTo:(M1QuicTransport *)conn {
-    self.streamConn = conn;
-    self.link = [[M1ControlLink alloc] initWithSink:[M1PriorityDatagramSink sinkForTransport:conn]];
-    {
-        // 诊断开关：慢速建屏（如 13 独占 mode-commit）期间控制 ACK 可能延迟，
-        // 放宽重传窗口避免误判丢包。默认行为不变（250ms × 8）。
-        const char *retryMs = getenv("M1_CTRL_RETRY_MS");
-        if (retryMs && atoi(retryMs) > 0) self.link.retryIntervalMs = (uint32_t)atoi(retryMs);
-        const char *maxTries = getenv("M1_CTRL_MAX_ATTEMPTS");
-        if (maxTries && atoi(maxTries) > 0) self.link.maxAttempts = (NSUInteger)atoi(maxTries);
-    }
-    self.link.delegate = self;
-    self.channel = [[M1ControlChannel alloc] initWithSink:self.link];
-
-    M1ControlSessionConfig *cfg = [M1ControlSessionConfig new];
-    cfg.role = self.isHost ? M1ControlRoleHost : M1ControlRoleClient;
-    cfg.hostName = self.isHost ? @"stream-host" : @"stream-client";
-    cfg.localFingerprint = self.localFingerprint;
-    cfg.expectedPeerFingerprint = self.expectedFingerprint;
-    cfg.fps = self.fps;
-    cfg.bitrateKbps = self.bitrateKbps;
-    cfg.specs = self.requestedSpecs ?: @[ @{ @"w": @1920, @"h": @1080,
-                                             @"hidpi": @NO, @"refresh": @60 } ];
-    cfg.heartbeatIntervalMs = 1000;
-    self.session = [[M1ControlSession alloc] initWithChannel:self.channel config:cfg];
-    self.session.delegate = self;
-    printf("  [%s] 控制通道就绪，发 hello\n", self.isHost ? "host" : "client");
-    [self.session begin];
-}
-
-- (BOOL)waitForStreamingTimeoutMs:(uint32_t)timeoutMs {
-    // timeoutMs == 0 → 无限等待，直到对端接入（自动化联调时 host 常无人值守）。
-    // 用 10s 切片等待而不是 DISPATCH_TIME_FOREVER，只为能定期打印「还活着」，
-    // 否则长时间没日志会被误判成进程卡死。
-    if (timeoutMs == 0) {
-        uint64_t waitedS = 0;
-        for (;;) {
-            if (dispatch_semaphore_wait(self.streamingSem,
-                    dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) == 0) {
-                if (self.streaming && self.error == nil) return YES;
-                // 单次尝试失败不该让无人值守的 host 直接退出：打印原因、清掉错误、
-                // 回到监听状态继续等下一次接入（附带的连接是新的 generation）。
-                if (self.error) {
-                    printf("  [%s] 本次尝试失败：%s（继续等待重试）\n",
-                           self.isHost ? "host" : "client",
-                           self.error.localizedDescription.UTF8String ?: "unknown");
-                    if (self.onAttemptFailed) self.onAttemptFailed();
-                    fflush(stdout);
-                    self.error = nil;
-                }
-                continue;
-            }
-            waitedS += 10;
-            printf("  [%s] 仍在等待对端…已等 %llus（--wait-ms 0 = 无限等待，Ctrl-C 结束）\n",
-                   self.isHost ? "host" : "client", waitedS);
-            fflush(stdout);
-        }
-    }
-    if (dispatch_semaphore_wait(self.streamingSem,
-            dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMs * NSEC_PER_MSEC)) != 0) {
-        return NO;
-    }
-    return self.streaming && self.error == nil;
-}
-
-#pragma mark M1DatagramSink（帧管线出口）
-
-- (double)simRandom {   // xorshift64*，确定性、不依赖 rand()
-    uint64_t x = self.simState;
-    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
-    self.simState = x;
-    return (double)((x * 0x2545F4914F6CDD1Dull) >> 11) / 9007199254740992.0;
-}
-
-- (BOOL)sendDatagram:(NSData *)datagram error:(NSError **)error {
-    M1QuicTransport *conn = self.streamConn;
-    if (!conn) {
-        if (error) *error = [NSError errorWithDomain:@"streamprobe" code:3
-            userInfo:@{NSLocalizedDescriptionKey: @"连接未就绪"}];
-        return NO;
-    }
-    // 发送端故障注入：丢片 + 相邻交换（模拟公网乱序）。只在 host 的帧路径上启用。
-    if (self.isHost && (self.simLossPct > 0 || self.simReorderPct > 0)) {
-        if (self.simLossPct > 0 && [self simRandom] * 100.0 < self.simLossPct) {
-            self.simFragmentsDropped += 1;
-            return YES;
-        }
-        if (self.simReorderPct > 0) {
-            if (self.simHeld) {
-                NSData *held = self.simHeld;
-                self.simHeld = nil;
-                self.simReordered += 1;
-                if (![conn sendDatagram:datagram error:error]) return NO;
-                return [conn sendDatagram:held error:error];
-            }
-            if ([self simRandom] * 100.0 < self.simReorderPct) {
-                self.simHeld = datagram;
-                return YES;
-            }
-        }
-    }
-    return [conn sendDatagram:datagram error:error];
-}
-
-// 收尾时把被「交换」扣住的最后一个分片放出去，别让它凭空丢一帧。
-- (void)flushSimulatedHeld {
-    if (!self.simHeld) return;
-    NSData *held = self.simHeld;
-    self.simHeld = nil;
-    if (self.streamConn) [self.streamConn sendDatagram:held error:NULL];
-}
-
-#pragma mark 传输回调
-
-- (void)quicTransportDidBecomeReady:(M1QuicTransport *)transport {
-    if (transport == self.listener) {
-        dispatch_semaphore_signal(self.readySem);
-        return;
-    }
-    if (transport != self.streamConn) {
-        // 服务端接受的入站连接
-        dispatch_semaphore_signal(self.readySem);
-    }
-    [self attachSessionTo:transport];
-}
-
-- (void)quicTransport:(M1QuicTransport *)transport
-   didAcceptConnection:(M1QuicTransport *)connection {
-    // 打上对端地址：跨网段时这行能直接看出包是从公网 client 来的，还是内网误连。
-    const char *peer = connection.peerDescription.UTF8String;
-    printf("  [host] 已接受连接%s%s\n", peer ? " from " : "", peer ?: "");
-    fflush(stdout);
-}
-
-- (void)quicTransport:(M1QuicTransport *)transport didFailWithError:(NSError *)error {
-    if (!self.error) self.error = error;
-    dispatch_semaphore_signal(self.readySem);
-    dispatch_semaphore_signal(self.streamingSem);
-}
-
-- (void)quicTransport:(M1QuicTransport *)transport didReceiveDatagram:(NSData *)datagram {
-    if (datagram.length == 0) return;
-    uint8_t magic = ((const uint8_t *)datagram.bytes)[0];
-    if (magic == kMagicControl) {
-        self.controlDatagrams += 1;
-        [self.link feedDatagram:datagram];
-        return;
-    }
-    if (magic == kMagicFrame) {
-        self.frameDatagrams += 1;
-        [self onFrameDatagram:datagram];
-        return;
-    }
-    self.unroutedDatagrams += 1;
-}
-
-// 子类/使用方覆写：host 侧不需要重组，client 侧交给 M1FrameReceiver
-- (void)onFrameDatagram:(NSData *)datagram {}
-
-- (void)controlLink:(M1ControlLink *)link didDeliverMessage:(NSData *)message {
-    double now = NowMs();
-    // 建虚拟屏（P2.2）在 session-start 内同步耗时可达 10s，此时尚未 STREAMING；
-    // 门禁只约束推流期控制通道，建链期不计入。
-    if (self.streaming && self.lastControlArrivalMs > 0) {
-        double gap = now - self.lastControlArrivalMs;
-        if (gap > self.maxControlGapMs) {
-            self.maxControlGapMs = gap;
-            self.maxGapAtOffsetMs = self.streamStartMs > 0 ? now - self.streamStartMs : 0;
-        }
-    }
-    self.lastControlArrivalMs = now;
-    // 收包在传输队列、打印在主线程：不加锁会撞上「枚举中修改」直接崩进程
-    // （双机跑得快，收尾打印时正好还有心跳/bye 在进来，已实测崩过一次）。
-    @synchronized (self.controlArrivals) {
-        if (self.streamStartMs > 0 && self.controlArrivals.count < 256) {
-            [self.controlArrivals addObject:@(round(now - self.streamStartMs))];
-        }
-    }
-    [self.channel feedBytes:message];
-}
-
-- (void)controlLink:(M1ControlLink *)link didFailWithError:(NSError *)error {
-    if (!self.error) self.error = error;
-    dispatch_semaphore_signal(self.streamingSem);
-}
-
-#pragma mark 会话回调
-
-- (void)controlSession:(M1ControlSession *)session didChangeState:(P1SessionState)state {
-    printf("  [%s] %s\n", self.isHost ? "host" : "client", P1SessionStateName(state).UTF8String);
-    if (state == P1SessionStateClosed && self.onSessionClosed) self.onSessionClosed();
-}
-
-- (void)controlSessionDidReachStreaming:(M1ControlSession *)session {
-    self.streaming = YES;
-    if (self.streamStartMs == 0) self.streamStartMs = NowMs();
-    dispatch_semaphore_signal(self.streamingSem);
-
-    // A-02：进入 STREAMING 后打 8 个时钟同步探针（200ms 起步、150ms 间隔）。
-    // 取 RTT 最小的样本，避免控制队列排队时间被误算成时钟差。
-    if (!self.isHost) {
-        for (int i = 0; i < 8; i++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t)(200 + i * 150) * NSEC_PER_MSEC),
-                           dispatch_get_main_queue(), ^{
-                if (session.stateMachine.state == P1SessionStateStreaming) {
-                    [session requestTimeSyncWithError:NULL];
-                }
-            });
-        }
-    }
-}
-
-- (void)controlSession:(M1ControlSession *)session didFailWithError:(NSError *)error {
-    if (!self.error) self.error = error;
-    dispatch_semaphore_signal(self.streamingSem);
-}
-
-- (void)controlSession:(M1ControlSession *)session didReceiveInputEvent:(NSDictionary *)event {
-    if (self.onInputEvent) self.onInputEvent(event);
-}
-
-- (void)controlSessionDidRequestKeyframe:(M1ControlSession *)session {
-    if (self.onKeyframeRequest) self.onKeyframeRequest();
-}
-
-- (void)controlSession:(M1ControlSession *)session
- didRequestFragmentsForFrame:(uint32_t)frameSeq
-             fragCount:(uint16_t)fragCount
-               indices:(NSIndexSet *)indices {
-    if (self.onFrameNack) self.onFrameNack(frameSeq, fragCount, indices);
-}
-
-- (NSArray<NSDictionary *> *)controlSession:(M1ControlSession *)session
-                 prepareDisplaysForSessionStart:(NSDictionary *)message
-                                       error:(NSError **)error {
-    if (!self.displayProvider) return @[];
-    return self.displayProvider(message, error);
-}
-
-- (NSArray<NSString *> *)stateLog { return self.session ? self.session.stateLog : @[]; }
-
-- (void)shutdown {
-    [self.session closeWithReason:@"probe-done"];
-    [NSThread sleepForTimeInterval:0.25];   // 让 bye 真的出去
-    [self.streamConn cancel];
-    [self.listener cancel];
-}
-
-@end
-
-#pragma mark - 客户端节点（带重组/解码）
-
-@interface StreamClientNode : StreamNode
-
-@property (nonatomic, strong) M1FrameReceiver *receiver;
-@property (nonatomic, copy) NSString *outdir;
-@property (nonatomic, assign) NSUInteger saveFrames;      // 保存前 N 帧
-@property (nonatomic, assign) NSUInteger savedFrames;
-@property (nonatomic, assign) NSUInteger reservedSaves;    // 已占用但尚未落盘的槽位
-@property (nonatomic, strong) dispatch_queue_t saveQueue;  // PNG 编码专用串行队列
-@property (nonatomic, strong) dispatch_queue_t frameQueue; // 重组+解码专用串行队列
-@property (nonatomic, assign) uint64_t keyframeRequests;        // 缺口 episode 数（接收端回调）
-@property (nonatomic, assign) uint64_t keyframeRequestsSent;    // 实际过线的请求数
-@property (nonatomic, assign) uint64_t keyframeRequestFailures; // 非限流原因的发送失败
-@property (nonatomic, assign) uint64_t repairRequests;          // 接收端发起的补片请求（含限流失败）
-@property (nonatomic, assign) uint64_t repairRequestsSent;      // 实际过线的补片请求
-@property (nonatomic, assign) uint64_t repairWholeFrameRequests; // 其中整帧零分片的整帧重发请求
-@property (nonatomic, assign) double firstFrameMs;
-@property (nonatomic, assign) double lastFrameMs;
-@property (nonatomic, assign) uint32_t lastSavedSeq;
-@property (nonatomic, assign) BOOL hasSavedSeq;
-@property (nonatomic, assign) double maxAcceptBlockMs;     // 单次重组+解码入口的最长阻塞
-@property (nonatomic, assign) double maxAcceptBlockAtMs;   // 出现在推流第几毫秒
-@property (nonatomic, assign) int32_t decodedWidth;
-@property (nonatomic, assign) int32_t decodedHeight;
-@property (nonatomic, copy) NSMutableArray<NSString *> *savedPaths;
-// 每一帧解码结果的直通出口（窗口上屏用）。在帧队列上回调，实现方需自行切线程。
-@property (nonatomic, copy, nullable) void (^onPixelBuffer)(CVPixelBufferRef pb, uint32_t frameSeq,
-                                                            uint64_t capturedAtUs);
-@end
-
-@implementation StreamClientNode
-
-- (instancetype)init {
-    if ((self = [super init])) {
-        _savedPaths = [NSMutableArray array];
-        _saveFrames = 5;
-        _saveQueue = dispatch_queue_create("m1.stream.png", DISPATCH_QUEUE_SERIAL);
-        _frameQueue = dispatch_queue_create("m1.stream.frames", DISPATCH_QUEUE_SERIAL);
-    }
-    return self;
-}
-
-- (void)prepareReceiver {
-    __weak typeof(self) weakSelf = self;
-    self.receiver = [[M1FrameReceiver alloc]
-        initWithOnFrame:^(CVPixelBufferRef pb, uint32_t frameSeq, uint64_t capturedAtUs) {
-            __strong typeof(weakSelf) self = weakSelf;
-            if (!self) return;
-            double now = NowMs();
-            if (self.firstFrameMs == 0) self.firstFrameMs = now;
-            self.lastFrameMs = now;
-            self.decodedWidth = (int32_t)CVPixelBufferGetWidth(pb);
-            self.decodedHeight = (int32_t)CVPixelBufferGetHeight(pb);
-            // 上屏：M1FrameView 内部自己 Retain + 转线程，这里直接递过去
-            if (self.onPixelBuffer) self.onPixelBuffer(pb, frameSeq, capturedAtUs);
-
-            // PNG 编码必须离开接收/解码线程。
-            //
-            // VT 的输出回调可能就在调用线程上执行（不保证异步），而 CIContext + PNG
-            // 编码一帧 1080p 要几十到几百毫秒。放在这里会直接堵住 nw_connection 的
-            // 收包队列——实测 6 张 PNG 就让控制心跳断了 4.5s（见 RESULTS-BY-OS §5.7）。
-            // 因此这里只做「占槽 + retain」，编码丢到独立串行队列。
-            if (self.outdir.length > 0 && self.reservedSaves < self.saveFrames &&
-                !(self.hasSavedSeq && frameSeq == self.lastSavedSeq)) {
-                self.reservedSaves += 1;
-                self.lastSavedSeq = frameSeq;
-                self.hasSavedSeq = YES;
-                CVPixelBufferRef held = CVPixelBufferRetain(pb);
-                NSString *name = [NSString stringWithFormat:@"frame-%03u.png", frameSeq];
-                NSString *path = [self.outdir stringByAppendingPathComponent:name];
-                dispatch_async(self.saveQueue, ^{
-                    if (M1SavePixelBufferPNG(held, path)) {
-                        self.savedFrames += 1;
-                        [self.savedPaths addObject:path];
-                    }
-                    CVPixelBufferRelease(held);
-                });
-            }
-        }
-        onNeedKeyframe:^{
-            __strong typeof(weakSelf) self = weakSelf;
-            if (!self) return;
-            self.keyframeRequests += 1;
-            // 这次要在线上真的发出去；限流不算失败（Host 产 IDR 本身也要时间）。
-            NSError *kfErr = nil;
-            if ([self.session requestKeyframeWithError:&kfErr]) {
-                self.keyframeRequestsSent += 1;
-                [self.receiver noteKeyframeRequestSent];   // 只有真正过线才开始计 RTT
-            } else if (kfErr.code != M1ControlSessionErrorRateLimited) {
-                self.keyframeRequestFailures += 1;
-            }
-        }];
-    // 缺 1~3 片时先走定向补片：只让 Host 重发这几片，通常一个 RTT 内收尾，
-    // 比等下一个 IDR（WAN 实测 kfRtt 800ms+）快一个量级。
-    // 整帧零分片（missingIndices 为空）时没有缺片下标，改请求整帧重发。
-    self.receiver.onNeedRepair = ^(uint32_t frameSeq, uint16_t fragCount,
-                                   NSIndexSet *missingIndices, BOOL keyframe) {
-        __strong typeof(weakSelf) self = weakSelf;
-        if (!self) return;
-        (void)keyframe;
-        self.repairRequests += 1;
-        NSError *nackErr = nil;
-        BOOL sent;
-        if (missingIndices.count == 0) {
-            self.repairWholeFrameRequests += 1;
-            sent = [self.session requestWholeFrame:frameSeq error:&nackErr];
-        } else {
-            sent = [self.session requestFragmentsForFrameSeq:frameSeq fragCount:fragCount
-                                                     indices:missingIndices error:&nackErr];
-        }
-        if (sent) self.repairRequestsSent += 1;
-    };
-}
-
-// 等帧队列排空（否则统计偏小）
-- (void)flushFrames {
-    dispatch_sync(self.frameQueue, ^{});
-}
-
-// 等所有排队中的 PNG 编码完成（结果打印前必须调用，否则统计偏小）
-- (void)flushSaves {
-    dispatch_sync(self.saveQueue, ^{});
-}
-
-- (void)onFrameDatagram:(NSData *)datagram {
-    // 绝不在这里做重组/解码。
-    //
-    // 这个回调跑在 nw_connection 的收包队列上，而首个关键帧要现场建 VT 解码会话
-    // （实测单次 1092ms）。同步做的话控制包会全部排在后面——实测心跳断 1.5s，
-    // 且首帧延迟被推到 3.5s。帧处理整体丢到独立串行队列，收包队列立刻返回。
-    dispatch_async(self.frameQueue, ^{
-        double t0 = NowMs();
-        [self.receiver acceptDatagram:datagram error:NULL];
-        double dt = NowMs() - t0;
-        if (dt > self.maxAcceptBlockMs) {
-            self.maxAcceptBlockMs = dt;
-            self.maxAcceptBlockAtMs = self.streamStartMs > 0 ? t0 - self.streamStartMs : 0;
-        }
-    });
-}
 
 
-@end
 
 #pragma mark - 主流程
 
@@ -641,7 +79,7 @@ static void AddTransportStats(NSMutableDictionary *json, M1QuicTransportStats *t
     json[@"transportSendCompletionMaxMs"] = @(round(ts.sendCompletionMaxMs * 10) / 10.0);
 }
 
-static void PrintFlowStats(StreamNode *n, const char *tag) {
+static void PrintFlowStats(M1StreamNode *n, const char *tag) {
     M1QuicTransportStats *ts = n.streamConn.stats;
     printf("  %s 传输: sent=%llu recv=%llu sendErr=%llu queued=%llu qdrop=%llu "
            "inFlightMax=%llu txDone=%.1f/%.1fms | 链路: sent=%lu delivered=%lu "
@@ -967,7 +405,9 @@ int main(int argc, char **argv) {
                 return 3;
             }
 
-            StreamNode *host = [StreamNode new];
+            M1StreamNode *host = [M1StreamNode new];
+            host.identityPath = gIdentity;
+            host.identityPass = gPass;
             host.localFingerprint = localFp;
             host.fps = fps;
             host.simLossPct = simLossPct;
@@ -1065,9 +505,9 @@ int main(int argc, char **argv) {
 
             // onAttemptFailed 由 host 持有，里面又会调 endExclusive：
             // 两个 block 都通过 weakHost 上锁，避免 host → block → host 环。
-            __weak StreamNode *weakHost = host;
+            __weak M1StreamNode *weakHost = host;
             void (^endExclusive)(void) = ^{
-                StreamNode *syncHost = weakHost;
+                M1StreamNode *syncHost = weakHost;
                 if (!syncHost) return;
                 @synchronized (syncHost) {
                     if (exclusiveEnded || !exclusiveCoordinator) return;
@@ -1090,7 +530,7 @@ int main(int argc, char **argv) {
             // 无限等待模式：单次接入失败后清掉独占显示状态，下一次 session-start
             // 会重建虚拟屏；不要把上一次失败的 displayID 带进下一次采集。
             host.onAttemptFailed = ^{
-                StreamNode *host = weakHost;
+                M1StreamNode *host = weakHost;
                 if (!host) return;
                 @synchronized (host) {
                     endExclusive();
@@ -1287,11 +727,11 @@ int main(int argc, char **argv) {
             };
 
             NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:durationMs / 1000.0];
-            double pipelineStartMs = NowMs();
+            double pipelineStartMs = M1StreamNowMs();
             double firstSentMs = 0;
             while (!stopped && [deadline timeIntervalSinceNow] > 0) {
                 if (firstSentMs == 0 && pipe.nextFrameSeq > 0) {
-                    firstSentMs = NowMs();
+                    firstSentMs = M1StreamNowMs();
                     printf("  首帧发出：管线启动后 %.0f ms（采集首帧 %.0f ms）\n",
                            firstSentMs - pipelineStartMs, pipe.stats.firstFrameLatencyMs);
                 }
@@ -1487,7 +927,7 @@ int main(int argc, char **argv) {
             printf("窗口已打开 %dx%d（Esc 或关窗退出）\n", (int)windowW, (int)windowH);
         }
 
-        StreamClientNode *client = [StreamClientNode new];
+        M1StreamClientNode *client = [M1StreamClientNode new];
         client.expectedFingerprint = fingerprint;
         client.fps = fps;
         if (specW > 0 && specH > 0) {
@@ -1500,7 +940,7 @@ int main(int argc, char **argv) {
         [client prepareReceiver];
         if (frameView) {
             __weak M1FrameView *weakView = frameView;
-            __weak StreamClientNode *weakClient = client;
+            __weak M1StreamClientNode *weakClient = client;
             __block BOOL printedAnchors = NO;
             client.onPixelBuffer = ^(CVPixelBufferRef pb, uint32_t seq, uint64_t capturedAtUs) {
                 [weakView presentPixelBuffer:pb capturedAtUs:capturedAtUs];

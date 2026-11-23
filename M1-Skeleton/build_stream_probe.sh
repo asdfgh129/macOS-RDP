@@ -15,6 +15,7 @@ CLANG="$(xcrun --sdk macosx --find clang)"
 P1SRC="../P1-ClientProbe/src"
 P0SRC="../P0-TahoeProbe/src"
 V01SRC="../P0V-DisplayIsolation/src"
+SESSION="../Packages/RDPKit/Sources/Session"
 SRC="src"
 
 bash ./gen_quic_identity.sh .state rdp-identity rdpdev >/dev/null
@@ -35,6 +36,8 @@ SOURCES=(
   "$SRC/M1FrameView.m"
   "$SRC/M1InputLogic.m"
   "$SRC/M1InputInjector.m"
+  # 第 4 轮：流会话节点（QUIC/控制/会话/重组解码）已从探针抽成共享模块
+  "$SESSION/M1StreamSession.m"
   # 独占会话（P2.2）：建虚拟屏 / 禁物理屏 / 守护恢复
   "$SRC/M1DriverLogic.m"
   "$SRC/M1Takeover.m"
@@ -56,7 +59,7 @@ for f in "${SOURCES[@]}"; do
 done
 
 "$CLANG" -fobjc-arc -fmodules -O2 -g -mmacosx-version-min=13.0 \
-  -isysroot "$SDKROOT" -I "$SRC" -I "$P1SRC" -I "$P0SRC" -I "$V01SRC" \
+  -isysroot "$SDKROOT" -I "$SRC" -I "$P1SRC" -I "$P0SRC" -I "$V01SRC" -I "$SESSION" \
   -Wall -Wno-unused-parameter -Wno-deprecated-declarations \
   "${SOURCES[@]}" \
   -framework AppKit \

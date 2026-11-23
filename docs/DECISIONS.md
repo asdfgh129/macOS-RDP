@@ -946,6 +946,33 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 
 ---
 
+## D-21 共享流会话节点层与产品端直接对连
+
+**日期**：2026-11-23　**状态**：已执行（第 4 轮工程骨架）
+
+### 决定
+
+- 把 `M1-Skeleton/stream_probe.m` 内的 QUIC / 控制链路 / 会话状态机 / 重组解码节点抽成共享模块 `Packages/RDPKit/Sources/Session/M1StreamSession.{h,m}`，新增 `RDPKit/Sources/Session` 分层与 `M1StreamNode`、`M1StreamClientNode` 两个类；探针改为消费该模块（探针只保留 CLI、独占显示、窗口与输入装配）。
+- `veild-host-agent --serve` 实现真实 QUIC 监听 + 会话协商 + 独占建屏 + 采集推流 + 输入回传（keyframe / frame-nack 一并接线），可与客户端直接对连。`VeilRD --connect` 实现 QUIC 收流 → `M1FrameReceiver` 重组解码 → `M1FrameView` 上屏 → 归一化输入回传；`--selftest` 保留为无网络自检。
+- 节点层把身份路径 / 口令 / ALPN 从探针全局变量改成实例属性（默认与探针一致），A-02 时钟同步探针仍在客户端进入 STREAMING 后发出，采集点未变。
+- 新增 `Tests/stream_session_selftest.m`：环回建链 + 控制会话 + 时钟探针自检，不需要屏幕录制 / 辅助功能授权；由 `Tests/integration_selftest.sh` 编译并运行。
+- 把 `VeilRD.xcodeproj` 的生成脚本收进仓库 `Scripts/generate_xcodeproj.py`；新增模块必须改生成器再重跑，不手改 pbxproj。RDPKit 静态库增加 Session 层与三个平台源文件（`P0VDisplayControl` / `VDManager` / `ProbeUtil`），供 `M1RDPDriver` 解析符号。
+
+### 理由
+
+- D-20 后两个产品入口仍只跑自检，真实端到端链路只在探针里；若直接把 1900 行探针复制进产品会形成两份协议实现，后续修 bug 必然漂移。
+- 抽层后「会话如何建链、控制帧如何优先、丢片如何补」只有一份实现；探针作为诊断入口保留原有 CLI 与真机判据，产品入口可复用而不复制。
+- 环回自检能在纯开发轮次证明协议层没有回退，不必等到夜间真机；它刻意不采集、不注入，不与「开发测试分离」冲突。
+
+### 影响与边界
+
+- **未跑双机真机**：`--serve` / `--connect` 的对连尚未在两台物理机上做采集→上屏→注入验收；本轮只验证环回建链与既有单测，真机按约定放夜间，结论按 OS 分离写入 `RESULTS-BY-OS.md`。
+- 探针 CLI 与真机判据不变；`M1-Skeleton/build_stream_probe.sh` 增加 Session 源与头文件路径，旧双机 runbook 命令不动。
+- 验收：5 个 target 构建成功；M1 291 断言 / P1 全 PASS / 跨模块自检 PASS；环回自检双端 STREAMING、控制包 5/5、时钟样本 ≥1；三套旧构建脚本仍成功；56 条兼容软链无悬空。
+- 打包 / 签名 / plist / TCC 说明、钥匙串 CN 统一仍未做，留待 P2 后的真机验收。
+
+---
+
 ## 附：协议实现进度（2026-11-17）
 
 | 模块 | 状态 | 测试 |
