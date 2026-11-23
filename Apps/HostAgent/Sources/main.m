@@ -24,6 +24,7 @@
 #import "M1RDPDriver.h"
 #import "M1QuicTransport.h"
 #import "M1StreamSession.h"
+#import "P0VDisplayControl.h"
 
 #pragma mark - 测试替身（不碰 WindowServer）
 
@@ -367,6 +368,18 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        // ★ 守护模式必须最先处理：P0VStartGuardian 用同一个二进制 re-exec。
+        //   缺这一段时父进程会等不到 <snapshot>.guardian-ready，禁屏被拒绝。
+        if (argc > 1 && strcmp(argv[1], "--guardian") == 0) {
+            NSString *snap = argc > 2 ? [NSString stringWithUTF8String:argv[2]] : nil;
+            pid_t parent = 0;
+            for (int i = 3; i + 1 < argc; i++) {
+                if (strcmp(argv[i], "--parent-pid") == 0) parent = atoi(argv[i + 1]);
+            }
+            if (!snap || parent <= 0) return 3;
+            return P0VRunGuardian(snap, parent);
+        }
+
         if (argc >= 2 && strcmp(argv[1], "--serve") == 0) {
             return AgentRunServe(argc, argv) ? 0 : 1;
         }
