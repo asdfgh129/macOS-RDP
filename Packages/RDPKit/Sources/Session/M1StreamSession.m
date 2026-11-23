@@ -318,6 +318,10 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 - (void)controlSessionDidReachStreaming:(M1ControlSession *)session {
     self.streaming = YES;
+    // 建屏/守护进程握手期间最后一包控制消息可能在 STREAMING 前十几秒就到，
+    // 首包心跳会把它算成一次巨大间隔（§5.36 r3 host 18.1 s 即此）。进入
+    // STREAMING 时清零，首个心跳只播种、不记账。
+    self.lastControlArrivalMs = 0;
     if (self.streamStartMs == 0) self.streamStartMs = M1StreamNowMs();
     dispatch_semaphore_signal(self.streamingSem);
 
