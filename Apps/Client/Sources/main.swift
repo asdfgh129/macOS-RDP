@@ -239,6 +239,11 @@ func runConnect() -> Int32 {
     let updateSpecs: [(Int, Int)] = argValues("--update-spec")
         .flatMap { $0.split(separator: ",").map(String.init) }
         .compactMap { parseSize($0) }
+    // FR-06 诊断：--send-text 毫秒:文本（可重复），按 IME 提交后的同一事件上行。
+    let sendTexts: [(Int, String)] = argValues("--send-text").compactMap { pair in
+        guard let i = pair.firstIndex(of: ":"), let ms = Int(pair[..<i]) else { return nil }
+        return (ms, String(pair[pair.index(after: i)...]))
+    }
 
     M1FrameReceiver.prewarmDecoder()
     let app = NSApplication.shared
@@ -398,6 +403,25 @@ func runConnect() -> Int32 {
                       + updateSpecs.map { "\($0.0)x\($0.1)" }.joined(separator: ", "))
             } else {
                 print("✗ 换屏请求失败: \(updateErr?.localizedDescription ?? "unknown")")
+            }
+        }
+    }
+
+    for (at, text) in sendTexts {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(at)) {
+            let displayID = slots.first?.displayID ?? 0
+            let event: [AnyHashable: Any] = [
+                "kind": "text",
+                "displayID": displayID,
+                "flags": ["cmd": false, "shift": false, "opt": false,
+                          "ctrl": false, "caps": false],
+                "text": text,
+            ]
+            do {
+                try client.session?.sendInputEvent(event)
+                print("文本上行 \(text.count) 字 → displayID=\(displayID)")
+            } catch {
+                print("✗ 文本上行失败: \(error.localizedDescription)")
             }
         }
     }
