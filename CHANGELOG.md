@@ -8,6 +8,7 @@
 
 ### Added（最近更新）
 
+- docs: `RESULTS-BY-OS.md` §5.40 双屏真注入 + P2.3 基线复核入档——host 15/15 注入、光标位移确认；8 轮离屏 ALL PASS 与 §5.38 一致
 - docs: `RESULTS-BY-OS.md` §5.39 M2 多屏双机 WAN 实测入档——keep-main 与全独占双屏均 PASS（138/138、981/981 解码上屏，0 丢帧，C-09 verified）
 - docs: `RESULTS-BY-OS.md` §5.38 P2.3 渲染基线复测入档——离屏 8 轮无回退，CG 后端 20fps 真实流渲染 100%、0 积压
 - docs: `RESULTS-BY-OS.md` §5.37 产品入口 WAN 对照入档——全独占 + C-09 PASS、`--mirror` 诊断档三轮 PASS（`9113c32`）
