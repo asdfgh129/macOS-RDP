@@ -1591,6 +1591,28 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - **CG 后端干净轮（`M1_CAPTURE_BACKEND=cg`）**：采集稳定 20fps（`delivered=20/s`、lastInterval 51ms），host captured 628 / encoded 627 / sent 584；client **解码 579 / 上屏 579、0 丢帧、0 渲染积压丢**，上屏 p50/p95 = 81.5/144.5ms，控制最大间隔 1052/1027ms，时钟 offset 50µs，`c09=not-started`。
 - ⇒ **P2.3 渲染下限复验一致**：1080p 离屏 ~5.5ms，真实 20fps 持续流下渲染 100% 无积压丢失。上一轮 WAN mirror 出现的 100+ 帧积压确认为本机负载波动（Qoder/WindowServer 竞争），Qoder 隐藏 + mds 暂停后不再出现。后续本机 20fps 采集基线优先用 `M1_CAPTURE_BACKEND=cg`，SCK 仅用于功能验证。
 
+### 5.39 M2 多屏双机实测：keep-main 与全独占（C-09）双档（2026-11-24 20:5x–21:0x）
+
+**环境**：Tahoe 26.5.2（25F84）host（112.5.32.34，WAN UDP 46600）× Sequoia 15.5（24F74）client；基线 `3e18538`（M2 多屏），两端同提交；host 由 Terminal 在 Aqua 会话启动，`caffeinate -d -u` 全程挂起。规格 1280×720 ×2 屏、15fps、`--inject record`，client 30–35s，host 45–55s，两块虚拟屏均由 `anim_display.sh` 喂动画。
+
+**A. `--keep-main` 双屏（不黑物理屏）**
+- host 建 2 块虚拟屏（4128835 / 4128834），2 条管线并行；`c09=skipped-keep-main`。
+- 采集/编码/发出：4128835 346/345/119、4128834 32/31/23；`framesDroppedBeforeEncoder=0`。
+- client：4128835 收齐 115 / 解 115 / 上屏 115，4128834 收齐 23 / 解 23 / 上屏 23；合计 **138/138，0 丢帧、0 渲染丢帧**；p50 50.5ms / p95 1031.5ms（4128834 首帧启动尖峰）；控制最大间隔 1045.9ms。
+- 结束：`销毁 2 块虚拟屏`、物理屏恢复（active=2）、`[窗口布局] captured=5 planned=0 restored=0`（WindowServer 自动还原）。
+- 注：第二个动画命令 cwd 写错未起窗，4128834 只推了静止屏的 idle 帧（~1/s）；不影响双屏路由判定。
+
+**B. 全独占双屏（C-09）**
+- host 建 2 块虚拟屏、禁物理屏，`c09=verified`；结束恢复物理屏（active=2），`[窗口布局] captured=7 planned=7 restored=7 failed=0`。
+- 采集/编码/发出：4128835 686/685/497、4128834 676/675/492；`framesDroppedBeforeEncoder=0`（host 比 client 多跑 20s，故 encoded≫sent）。
+- client：4128835 收齐 493 / 解 493 / 上屏 493，4128834 488/488/488；合计 **981/981，0 丢帧、0 渲染丢帧、0 遮挡跳过**；p50 129.5ms / p95 308.5ms；控制最大间隔 1159.6ms；时钟 offset −49.7ms（样本 8）。
+- PNG 按屏命名 `frame-d<displayID>-NNN.png`，两屏各取 1 张确认是 Tahoe 桌面实时内容（非黑帧）。
+- 输入：本轮 record 且未在窗口内操作，`inputSent=0`；按屏注入路由由 `inject-multi-*` 单测覆盖，真机输入待补。
+
+**结论**：双机双屏在 keep-main 与全独占两档均 PASS（结构性指标）。仍按约定不与其它 OS 混记；`maxGapAtOffsetMs` 的 18–33s offset 是建屏前空窗，门禁以 client 侧间隔为准。**Tahoe 的多屏独占已覆盖（A-07 表中 Ventura 的「多屏独占未覆盖」仍保持）。**
+
+**操作备注**：host 空闲后物理屏会 DPMS 睡眠，`CGDisplayIsActive=0` 导致 `prepareSessionShield` 报「当前没有任何 active display」；先 `caffeinate -d -u` 唤醒再跑。host 日志经文件重定向时是全缓冲，需用 `script -q /dev/null` 包一层才能实时看到 displayID。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
@@ -1606,6 +1628,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
+- v0.69-draft 2026-11-24 21:0x：**M2 多屏双机实测（§5.39）**。Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，1280×720×2@15，`3e18538`）：keep-main 档 client 138/138 解码上屏、0 丢帧、`c09=skipped-keep-main`、物理屏恢复；全独占档 `c09=verified`、client 981/981 解码上屏、0 丢帧、p50/p95 129.5/308.5ms、控制间隔 1.16s、窗口布局 7/7 恢复、物理屏 2 块在位。PNG 按 `frame-d<displayID>-` 命名且两屏内容非黑。备注：host 屏睡会令 CG active=0 阻断建屏（caffeinate 唤醒）；重定向日志需 `script -q /dev/null` 才实时。
 - v0.68-draft 2026-11-23 23:1x：**P2.3 渲染基线复测（§5.38）**。Qoder/Screen Sharing 隐藏 + mds 暂停后：离屏 8 轮 min/p50/p95 为 vga 2.2/2.3/2.4、720p 3.2/3.3/5.0、1080p 5.4/5.5/6.1、ultrawide 13.5/13.9/21.1ms（ALL PASS，与 v0.61 一致）；真实 client 1080p20 本机镜像环回用 `M1_CAPTURE_BACKEND=cg`（本机 SCK HiDPI 仅 3–5fps）后采集稳定 20fps，client 579/579 解出并上屏、0 丢帧 0 积压、p50/p95 81.5/144.5ms ⇒ 渲染下限无回退；WAN mirror 积压确认为本机负载。另确认隐藏/被遮挡的 client 窗口不绘制（r1 `渲染=0` 属 AppKit 遮挡态）。
 - v0.67-draft 2026-11-23 22:5x：**产品入口 WAN 对照：全独占 + C-09 PASS、`--mirror` 诊断档 PASS（§5.37）**。Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，720p15，20s/18s）：默认独占档 `C-09=verified`、解码/发送 255/260=98.1%、0 丢帧、间隔 ~1.0s、物理屏恢复 2 块在位（窗口布局恢复 failed=1 待查）；`--mirror` 三轮 `c09=not-started`、解码/发送 98.1/93.2/92.4%、传输丢帧 0–4、间隔 <1.4s，上屏积压受本机渲染压力波动为本机负载所致。另确认产品档位口径：默认=全独占，`--keep-main` 见 §5.36。
 - v0.66-draft 2026-11-23 22:5x：**host 间隔指标二次收口 + §2 keep-main WAN 复测通过（§5.36 r3/r4）**。v0.65 修 CLOSED 空窗后仍有残留：建屏/守护阶段（Tahoe 上约 13–18s）的最后一包控制消息把 STREAMING 前的空窗算进首包心跳（r3 host 18.1s / offset 308ms）。`4a37d1d` 在进入 STREAMING 时清 `lastControlArrivalMs`；r4 复测 host 1300.9ms@+9.3s、client 1025.1ms、解码/发送 351/356=98.6%、0 丢帧、`c09=skipped-keep-main`、虚拟屏销毁物理屏恢复 ⇒ §2 keep-main WAN 门禁通过。
