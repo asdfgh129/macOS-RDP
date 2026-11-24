@@ -55,6 +55,9 @@ static NSString *M1ArchName(void) {
     _Atomic int64_t _clockOffsetUs;
     _Atomic double _timeSyncRttMs;
     atomic_uint_fast64_t _timeSyncSamples;
+    atomic_uint_fast64_t _sessionUpdatesSent;
+    atomic_uint_fast64_t _sessionUpdatesApplied;
+    _Atomic int64_t _nextUpdateID;
 }
 @property (nonatomic, strong) M1ControlChannel *channel;
 @property (nonatomic, strong) M1ControlSessionConfig *config;
@@ -107,6 +110,9 @@ static NSString *M1ArchName(void) {
         atomic_init(&_clockOffsetUs, 0);
         atomic_store(&_timeSyncRttMs, 0.0);
         atomic_init(&_timeSyncSamples, 0);
+        atomic_init(&_sessionUpdatesSent, 0);
+        atomic_init(&_sessionUpdatesApplied, 0);
+        atomic_init(&_nextUpdateID, 0);
         _inputLimiter = [[P1InputRateLimiter alloc] initWithEventsPerSecond:P1InputMaxEventsPerSecond];
         channel.delegate = self;
     }
@@ -215,6 +221,8 @@ static NSString *M1ArchName(void) {
     else if ([type isEqualToString:@"keyframe-sent"])    { /* Host 的确认，统计不依赖它 */ }
     else if ([type isEqualToString:@"time-sync"])        [self handleTimeSync:message];
     else if ([type isEqualToString:@"time-sync-reply"])  [self handleTimeSyncReply:message];
+    else if ([type isEqualToString:@"session-update"])        [self handleSessionUpdate:message];
+    else if ([type isEqualToString:@"session-update-result"]) [self handleSessionUpdateResult:message];
     else if ([type isEqualToString:@"bye"] || [type isEqualToString:@"session-error"]) {
         self.closed = YES;
         [self stopHeartbeat];
@@ -760,6 +768,146 @@ static NSString *M1ArchName(void) {
 - (int64_t)clockOffsetUs { return atomic_load(&_clockOffsetUs); }
 - (double)timeSyncRttMs { return atomic_load(&_timeSyncRttMs); }
 - (NSUInteger)timeSyncSamples { return (NSUInteger)atomic_load(&_timeSyncSamples); }
+
+#pragma mark - 动态协商（FR-07）
+
+// session-start 与 session-update 共用同一套规格校验；上限与 capabilities 保持一致。
+static BOOL M1ValidateSpecs(NSArray *specs, NSString **reason) {
+    if (![specs isKindOfClass:[NSArray class]] || specs.count == 0) {
+        if (reason) *reason = @"specs 为空";
+        return NO;
+    }
+    if (specs.count > 8) {
+        if (reason) *reason = [NSString stringWithFormat:@"屏数 %lu 超过上限 8",
+                               (unsigned long)specs.count];
+        return NO;
+    }
+    for (id s in specs) {
+        if (![s isKindOfClass:[NSDictionary class]]) {
+            if (reason) *reason = @"spec 不是对象";
+            return NO;
+        }
+        NSNumber *w = s[@"w"], *h = s[@"h"];
+        if (![w isKindOfClass:[NSNumber class]] || ![h isKindOfClass:[NSNumber class]]) {
+            if (reason) *reason = @"spec 缺 w/h";
+            return NO;
+        }
+        if (w.unsignedIntegerValue < 2 || w.unsignedIntegerValue > 8192 ||
+            h.unsignedIntegerValue < 2 || h.unsignedIntegerValue > 8192) {
+            if (reason) *reason = [NSString stringWithFormat:@"分辨率越界 %@x%@", w, h];
+            return NO;
+        }
+    }
+    return YES;
+}
+
+- (NSUInteger)sessionUpdatesSent { return (NSUInteger)atomic_load(&_sessionUpdatesSent); }
+- (NSUInteger)sessionUpdatesApplied { return (NSUInteger)atomic_load(&_sessionUpdatesApplied); }
+
+- (int64_t)requestSessionUpdateWithSpecs:(NSArray<NSDictionary *> *)specs
+                                   error:(NSError **)error {
+    if (error) *error = nil;
+    if (self.role != M1ControlRoleClient) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorProtocol,
+            @"只有 Client 发起 session-update");
+        return 0;
+    }
+    if (self.closed || self.stateMachine.state != P1SessionStateStreaming) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorInvalidState,
+            @"会话未处于 STREAMING，session-update 未发送");
+        return 0;
+    }
+    NSString *why = nil;
+    if (!M1ValidateSpecs(specs, &why)) {
+        if (error) *error = M1SessErr(M1ControlSessionErrorProtocol, why);
+        return 0;
+    }
+    int64_t updateID = atomic_fetch_add(&_nextUpdateID, 1) + 1;
+    if (![self sendPayload:@{ @"type": @"session-update",
+                              @"updateID": @(updateID),
+                              @"specs": specs }]) return 0;
+    atomic_fetch_add(&_sessionUpdatesSent, 1);
+    return updateID;
+}
+
+- (void)handleSessionUpdate:(NSDictionary *)msg {
+    if (self.role != M1ControlRoleHost) {
+        [self failWith:M1SessErr(M1ControlSessionErrorProtocol,
+            @"Host 才接收 session-update")];
+        return;
+    }
+    // 非 STREAMING 无屏可换；不回结果会让客户端一直等，但此时状态本身已异常。
+    if (self.closed || self.stateMachine.state != P1SessionStateStreaming) return;
+
+    NSNumber *idNum = msg[@"updateID"];
+    int64_t updateID = [idNum isKindOfClass:[NSNumber class]] ? idNum.longLongValue : 0;
+
+    void (^replyFail)(NSString *, NSString *) = ^(NSString *code, NSString *detail) {
+        [self sendPayload:@{ @"type": @"session-update-result",
+                             @"updateID": @(updateID),
+                             @"ok": @NO,
+                             @"error": @{ @"code": code, @"detail": detail ?: @"" } }];
+    };
+    NSString *why = nil;
+    if (!M1ValidateSpecs(msg[@"specs"], &why)) {
+        replyFail(@"SPEC_UNSUPPORTED", why);
+        return;
+    }
+    if (![self.delegate respondsToSelector:
+            @selector(controlSession:applySessionUpdateSpecs:error:)]) {
+        replyFail(@"UPDATE_UNSUPPORTED", @"Host 不支持动态换屏");
+        return;
+    }
+    NSError *applyErr = nil;
+    NSArray<NSDictionary *> *displays =
+        [self.delegate controlSession:self applySessionUpdateSpecs:msg[@"specs"]
+                                error:&applyErr];
+    if (!displays) {
+        NSString *code = applyErr.userInfo[@"code"];
+        if (![code isKindOfClass:[NSString class]] || code.length == 0) {
+            code = @"UPDATE_FAILED";
+        }
+        replyFail(code, applyErr.localizedDescription ?: @"换屏失败");
+        return;
+    }
+    self.remoteDisplays = displays;
+    atomic_fetch_add(&_sessionUpdatesApplied, 1);
+    [self sendPayload:@{ @"type": @"session-update-result",
+                         @"updateID": @(updateID),
+                         @"ok": @YES,
+                         @"displays": displays }];
+}
+
+- (void)handleSessionUpdateResult:(NSDictionary *)msg {
+    if (self.role != M1ControlRoleClient) return;
+    NSNumber *idNum = msg[@"updateID"];
+    int64_t updateID = [idNum isKindOfClass:[NSNumber class]] ? idNum.longLongValue : 0;
+    NSNumber *okNum = msg[@"ok"];
+    BOOL ok = [okNum isKindOfClass:[NSNumber class]] && okNum.boolValue;
+    NSArray<NSDictionary *> *displays = msg[@"displays"];
+    if (![displays isKindOfClass:[NSArray class]]) displays = @[];
+    NSString *detail = nil;
+    if (!ok) {
+        NSDictionary *err = msg[@"error"];
+        if ([err isKindOfClass:[NSDictionary class]]) {
+            NSString *code = err[@"code"];
+            NSString *d = err[@"detail"];
+            NSString *c = [code isKindOfClass:[NSString class]] ? code : @"UPDATE_FAILED";
+            detail = [d isKindOfClass:[NSString class]] && d.length > 0
+                   ? [NSString stringWithFormat:@"%@: %@", c, d] : c;
+        } else {
+            detail = @"UPDATE_FAILED";
+        }
+    } else {
+        self.remoteDisplays = displays;
+        atomic_fetch_add(&_sessionUpdatesApplied, 1);
+    }
+    if ([self.delegate respondsToSelector:
+            @selector(controlSession:didCompleteSessionUpdate:ok:displays:errorDetail:)]) {
+        [self.delegate controlSession:self didCompleteSessionUpdate:updateID
+                                   ok:ok displays:displays errorDetail:detail];
+    }
+}
 
 #pragma mark - 心跳
 

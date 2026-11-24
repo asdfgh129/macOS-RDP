@@ -22,7 +22,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface M1FrameView : NSView
+@interface M1FrameView : NSView <NSTextInputClient>
 
 // 输入事件里携带的目标屏 ID（Host 据此选目标 rect）。
 @property (nonatomic, assign) uint32_t displayID;
@@ -33,6 +33,9 @@ NS_ASSUME_NONNULL_BEGIN
 // Esc 请求结束会话；宿主决定收尾方式（默认开启）。
 @property (nonatomic, copy, nullable) void (^onCloseRequest)(void);
 @property (nonatomic, assign) BOOL closesOnEscape;
+
+// FR-06：Cmd+Opt+F 切换沉浸模式；宿主负责改窗口样式（默认不响应）。
+@property (nonatomic, copy, nullable) void (^onToggleImmersive)(void);
 
 // 把一帧贴到屏幕上。capturedAtUs 为帧头 v3 携带的主机采集 epoch 微秒；
 // 传 0 表示不统计端到端延迟。

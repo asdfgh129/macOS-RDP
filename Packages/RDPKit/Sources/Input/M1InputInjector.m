@@ -4,6 +4,7 @@
 //
 
 #import "M1InputInjector.h"
+#import "M1InputLogic.h"
 #import <ApplicationServices/ApplicationServices.h>
 
 #pragma mark - 真实 CGEvent 下沉
@@ -21,9 +22,52 @@ static void M1Post(CGEventRef e, pid_t pid) {
     CFRelease(e);
 }
 
+// 用纯函数算出的增量逐键发 flagsChanged：只改掩码不带键码的事件在部分 App
+// 里会被忽略（实测文本编辑器不更新 Shift 状态），必须带 HID 键码。
+static void M1PostModifierTransitions(uint64_t oldFlags, uint64_t newFlags, pid_t pid) {
+    NSArray<NSDictionary<NSString *, id> *> *steps = M1ModifierFlagTransitions(oldFlags, newFlags);
+    if (steps.count == 0) {
+        if (oldFlags == newFlags) return;
+        CGEventRef e = CGEventCreate(NULL);   // 未知位（如 fn）只能全量发一条
+        if (e) {
+            CGEventSetType(e, kCGEventFlagsChanged);
+            CGEventSetFlags(e, (CGEventFlags)newFlags);
+            M1Post(e, pid);
+        }
+        return;
+    }
+    for (NSDictionary *step in steps) {
+        CGEventRef e = CGEventCreate(NULL);
+        if (!e) continue;
+        CGEventSetType(e, kCGEventFlagsChanged);
+        CGEventSetIntegerValueField(e, kCGKeyboardEventKeycode,
+                                    (int64_t)[step[@"keyCode"] unsignedShortValue]);
+        CGEventSetFlags(e, (CGEventFlags)[step[@"flags"] unsignedLongLongValue]);
+        M1Post(e, pid);
+    }
+}
+
+// 成串文本一次写入（逐字符写只会保留最后一个）。
+static void M1SetUnicode(CGEventRef e, NSString *text) {
+    if (!e || text.length == 0) return;
+    NSUInteger len = text.length;
+    UniChar *buf = calloc(len, sizeof(UniChar));
+    if (!buf) return;
+    [text getCharacters:buf range:NSMakeRange(0, len)];
+    CGEventKeyboardSetUnicodeString(e, (UniCharCount)len, buf);
+    free(buf);
+}
+
 - (BOOL)postPlan:(NSDictionary<NSString *, id> *)plan error:(NSError **)error {
     NSString *kind = plan[@"kind"];
     CGEventFlags flags = (CGEventFlags)[plan[@"flags"] unsignedLongLongValue];
+
+    // 修饰键状态先对齐：flags 事件到达前若有其它事件抢先（乱序/丢一条），
+    // 这里补上增量，下游看到的键位状态才和客户端一致。
+    if (![kind isEqualToString:@"flags"] && (uint64_t)flags != _lastFlags) {
+        M1PostModifierTransitions(_lastFlags, (uint64_t)flags, self.targetPID);
+        _lastFlags = (uint64_t)flags;
+    }
 
     if ([kind isEqualToString:@"mouse"]) {
         CGPoint p = CGPointMake([plan[@"x"] doubleValue], [plan[@"y"] doubleValue]);
@@ -57,12 +101,24 @@ static void M1Post(CGEventRef e, pid_t pid) {
         CGEventRef down = CGEventCreateKeyboardEvent(NULL, code, true);
         CGEventRef up = CGEventCreateKeyboardEvent(NULL, code, false);
         if (unicode.length) {
-            for (NSUInteger i = 0; i < unicode.length; i++) {
-                UniChar u = [unicode characterAtIndex:i];
-                if (down) CGEventKeyboardSetUnicodeString(down, 1, &u);
-                if (up) CGEventKeyboardSetUnicodeString(up, 1, &u);
-            }
+            M1SetUnicode(down, unicode);
+            M1SetUnicode(up, unicode);
         }
+        if (down) CGEventSetFlags(down, flags);
+        if (up) CGEventSetFlags(up, flags);
+        M1Post(down, self.targetPID);
+        M1Post(up, self.targetPID);
+        _lastFlags = flags;
+        return YES;
+    }
+    if ([kind isEqualToString:@"text"]) {
+        NSString *text = plan[@"text"];
+        if (text.length == 0) return YES;
+        // 键码 0 + 完整 unicode 串：目标应用按文本插入，不经 Host 输入法。
+        CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0, true);
+        CGEventRef up = CGEventCreateKeyboardEvent(NULL, 0, false);
+        M1SetUnicode(down, text);
+        M1SetUnicode(up, text);
         if (down) CGEventSetFlags(down, flags);
         if (up) CGEventSetFlags(up, flags);
         M1Post(down, self.targetPID);
@@ -79,13 +135,8 @@ static void M1Post(CGEventRef e, pid_t pid) {
         return YES;
     }
     if ([kind isEqualToString:@"flags"]) {
-        // 修饰键全量同步：发一个 flagsChanged 事件携带完整掩码。
-        CGEventRef e = CGEventCreate(NULL);
-        if (e) {
-            CGEventSetType(e, kCGEventFlagsChanged);
-            CGEventSetFlags(e, flags);
-            M1Post(e, self.targetPID);
-        }
+        // 逐键发增量 flagsChanged：只改掩码不带键码的部分 App 不认（见 M1PostModifierTransitions）。
+        M1PostModifierTransitions(_lastFlags, flags, self.targetPID);
         _lastFlags = flags;
         return YES;
     }

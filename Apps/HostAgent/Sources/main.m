@@ -44,6 +44,13 @@
     return YES;
 }
 - (NSArray<NSNumber *> *)createdDisplayIDs { return self.created ?: @[]; }
+- (BOOL)replaceVirtualDisplays:(NSArray<NSDictionary *> *)specs
+                         error:(NSError * _Nullable * _Nullable)error {
+    NSMutableArray *ids = [NSMutableArray array];
+    for (NSUInteger i = 0; i < specs.count; i++) { [ids addObject:@(2000 + (uint32_t)i)]; }
+    self.created = ids;
+    return YES;
+}
 - (BOOL)snapshotAndDisablePhysicalExcept:(NSArray<NSNumber *> *)keepIDs
                                    error:(NSError * _Nullable * _Nullable)error { return YES; }
 - (BOOL)verifyIsolationError:(NSError * _Nullable * _Nullable)error { return YES; }
@@ -198,6 +205,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     __block BOOL exclusiveEnded = NO;
     __block CGDirectDisplayID virtualID = 0;
     __block NSArray<NSDictionary *> *virtualDisplays = @[];
+    __block NSArray<NSDictionary *> *virtualConv = @[];
     __block NSUInteger virtualW = 0, virtualH = 0;
     __block NSString *c09 = @"not-started";
     void (^endExclusive)(void) = ^{
@@ -262,6 +270,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
                                       @"h": i < conv.count ? conv[i][@"height"] : @0,
                                       @"synthetic": @NO}];
             virtualDisplays = displays;
+            virtualConv = conv;
             printf("  [独占] 虚拟屏 %s（首屏 %lux%lu）C-09=%s\n",
                    ids.description.UTF8String, (unsigned long)virtualW, (unsigned long)virtualH, c09.UTF8String);
             return displays;
@@ -301,33 +310,66 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     __block int errCount = 0;
     NSMutableArray<M1FramePipeline *> *pipes = [NSMutableArray array];
     NSMutableDictionary<NSNumber *, M1FramePipeline *> *pipeByDisplay = [NSMutableDictionary dictionary];
-    for (NSDictionary *disp in streamDisplays) {
-        NSNumber *didNum = disp[@"displayID"];
-        if (![didNum isKindOfClass:[NSNumber class]]) continue;
-        uint32_t did = didNum.unsignedIntValue;
-        if (did == 0 || pipeByDisplay[didNum]) continue;
-        M1FramePipelineConfig *cfg = [M1FramePipelineConfig new];
-        cfg.targetFps = fps;
-        cfg.outputWidth = outW;
-        cfg.outputHeight = outH;
-        M1FramePipeline *pipe = [[M1FramePipeline alloc] initWithDisplayID:(CGDirectDisplayID)did
-                                                                    config:cfg sink:host
-                                                                   onError:^(NSError *e) {
-            errCount += 1;
-            if (errCount <= 3) fprintf(stderr, "  [管线错误] %s\n", e.localizedDescription.UTF8String);
-        }];
-        if (![pipe start:&err]) {
-            printf("✗ 管线启动失败 displayID=%u: %s\n", did, err.localizedDescription.UTF8String);
-            for (M1FramePipeline *p in pipes) [p stop];
-            endExclusive(); [host shutdown];
-            return NO;
+    // 换屏时旧管线已产出的统计：最终汇总要把它们算进去，否则数据看起来像丢了。
+    NSMutableArray<NSDictionary *> *retiredPipes = [NSMutableArray array];
+
+    // 停掉并记账当前全部管线（换屏前调用；旧屏随即会被销毁）。
+    void (^retirePipelines)(void) = ^{
+        @synchronized (pipes) {
+            for (M1FramePipeline *p in pipes) {
+                M1FramePipelineStats *s = p.stats;
+                [retiredPipes addObject:@{
+                    @"displayID": @(p.displayID), @"w": @(p.pixelWidth), @"h": @(p.pixelHeight),
+                    @"framesCaptured": @(s.framesCaptured), @"framesEncoded": @(s.framesEncoded),
+                    @"framesSent": @(s.framesSent), @"fragmentsSent": @(s.fragmentsSent),
+                    @"keyframes": @(s.keyframes), @"retired": @YES,
+                }];
+                [p stop];
+            }
+            [pipes removeAllObjects];
+            [pipeByDisplay removeAllObjects];
         }
-        [pipes addObject:pipe];
-        pipeByDisplay[didNum] = pipe;
-        printf("推流开始：displayID=%u  %dx%d  %dms @ %dfps\n",
-               did, pipe.pixelWidth, pipe.pixelHeight, durationMs, fps);
-    }
-    if (pipes.count == 0) {
+    };
+
+    // 启动一组管线；任一失败就停掉本批并返回 NO（调用方负责回滚显示）。
+    BOOL (^startPipelines)(NSArray<NSDictionary *> *) = ^BOOL(NSArray<NSDictionary *> *displays) {
+        NSMutableArray *fresh = [NSMutableArray array];
+        NSMutableDictionary *freshMap = [NSMutableDictionary dictionary];
+        for (NSDictionary *disp in displays) {
+            NSNumber *didNum = disp[@"displayID"];
+            if (![didNum isKindOfClass:[NSNumber class]]) continue;
+            uint32_t did = didNum.unsignedIntValue;
+            if (did == 0 || freshMap[didNum]) continue;
+            M1FramePipelineConfig *cfg = [M1FramePipelineConfig new];
+            cfg.targetFps = fps;
+            cfg.outputWidth = outW;
+            cfg.outputHeight = outH;
+            M1FramePipeline *pipe = [[M1FramePipeline alloc] initWithDisplayID:(CGDirectDisplayID)did
+                                                                        config:cfg sink:host
+                                                                       onError:^(NSError *e) {
+                errCount += 1;
+                if (errCount <= 3) fprintf(stderr, "  [管线错误] %s\n", e.localizedDescription.UTF8String);
+            }];
+            NSError *startErr = nil;
+            if (![pipe start:&startErr]) {
+                printf("✗ 管线启动失败 displayID=%u: %s\n",
+                       did, startErr.localizedDescription.UTF8String);
+                for (M1FramePipeline *p in fresh) [p stop];
+                return NO;
+            }
+            [fresh addObject:pipe];
+            freshMap[didNum] = pipe;
+            printf("推流开始：displayID=%u  %dx%d  %dms @ %dfps\n",
+                   did, pipe.pixelWidth, pipe.pixelHeight, durationMs, fps);
+        }
+        @synchronized (pipes) {
+            [pipes addObjectsFromArray:fresh];
+            [pipeByDisplay addEntriesFromDictionary:freshMap];
+        }
+        return fresh.count > 0;
+    };
+
+    if (!startPipelines(streamDisplays)) {
         printf("✗ 没有可推流的显示\n");
         endExclusive(); [host shutdown];
         return NO;
@@ -337,11 +379,15 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     // 900ms 合并窗口也按屏独立：一块屏的在途 IDR 不应吞掉另一块屏的请求。
     NSMutableDictionary<NSNumber *, NSNumber *> *lastKeyframeByDisplay = [NSMutableDictionary dictionary];
     host.onKeyframeRequest = ^(uint32_t displayID) {
-        NSArray<M1FramePipeline *> *targets = pipes;
+        NSArray<M1FramePipeline *> *targets = nil;
+        M1FramePipeline *one = nil;
+        @synchronized (pipes) {
+            targets = [pipes copy];
+            one = pipeByDisplay[@(displayID)];
+        }
         if (displayID != 0) {
-            M1FramePipeline *target = pipeByDisplay[@(displayID)];
-            if (!target) return;
-            targets = @[ target ];
+            if (!one) return;
+            targets = @[ one ];
         }
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
         NSNumber *key = @(displayID);
@@ -355,11 +401,15 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     host.onFrameNack = ^(uint32_t displayID, uint32_t frameSeq,
                          uint16_t fragCount, NSIndexSet *indices) {
         (void)fragCount;
-        NSArray<M1FramePipeline *> *targets = pipes;
+        NSArray<M1FramePipeline *> *targets = nil;
+        M1FramePipeline *one = nil;
+        @synchronized (pipes) {
+            targets = [pipes copy];
+            one = pipeByDisplay[@(displayID)];
+        }
         if (displayID != 0) {
-            M1FramePipeline *target = pipeByDisplay[@(displayID)];
-            if (!target) return;
-            targets = @[ target ];
+            if (!one) return;
+            targets = @[ one ];
         }
         for (M1FramePipeline *p in targets) {
             NSError *re = nil;
@@ -378,28 +428,99 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     if ([inject isEqualToString:@"real"]) sink = [M1CGEventSink new];
     else { recorder = [M1RecordingEventSink new]; sink = recorder; }
     M1InputInjector *injector = [[M1InputInjector alloc] initWithSink:sink];
-    NSMutableDictionary<NSNumber *, NSValue *> *rects = [NSMutableDictionary dictionary];
-    for (NSDictionary *disp in streamDisplays) {
-        NSNumber *didNum = disp[@"displayID"];
-        if (![didNum isKindOfClass:[NSNumber class]]) continue;
-        CGRect r = CGDisplayBounds((CGDirectDisplayID)didNum.unsignedIntValue);
-        if (!CGRectIsEmpty(r)) rects[didNum] = [NSValue valueWithRect:(NSRect)r];
-    }
-    if (rects.count == 0) {
-        CGRect fallback = CGRectMake(0, 0, virtualW ?: (specW ?: 1920), virtualH ?: (specH ?: 1080));
-        injector.targetDisplayRect = fallback;
-    } else {
-        injector.targetDisplayRect = [rects.allValues.firstObject rectValue];
-    }
-    injector.displayRects = rects;
-    printf("输入目标屏 %lu 块%s\n", (unsigned long)rects.count,
-           rects.count ? "" : "（无 Quartz bounds，回退到原点 rect）");
+    // 换屏后屏 bounds 变化，注入坐标基准必须跟着换。
+    void (^refreshRects)(NSArray<NSDictionary *> *) = ^(NSArray<NSDictionary *> *displays) {
+        NSMutableDictionary<NSNumber *, NSValue *> *fresh = [NSMutableDictionary dictionary];
+        for (NSDictionary *disp in displays) {
+            NSNumber *didNum = disp[@"displayID"];
+            if (![didNum isKindOfClass:[NSNumber class]]) continue;
+            CGRect r = CGDisplayBounds((CGDirectDisplayID)didNum.unsignedIntValue);
+            if (!CGRectIsEmpty(r)) fresh[didNum] = [NSValue valueWithRect:(NSRect)r];
+        }
+        if (fresh.count == 0) {
+            CGRect fallback = CGRectMake(0, 0, virtualW ?: (specW ?: 1920), virtualH ?: (specH ?: 1080));
+            injector.targetDisplayRect = fallback;
+        } else {
+            injector.targetDisplayRect = [fresh.allValues.firstObject rectValue];
+        }
+        injector.displayRects = fresh;
+        printf("输入目标屏 %lu 块%s\n", (unsigned long)fresh.count,
+               fresh.count ? "" : "（无 Quartz bounds，回退到原点 rect）");
+    };
+    refreshRects(streamDisplays);
     __block NSUInteger injectOK = 0, injectFail = 0;
     host.onInputEvent = ^(NSDictionary *event) {
         NSError *ie = nil;
         if ([injector injectEvent:event error:&ie]) injectOK += 1;
         else injectFail += 1;
     };
+
+    // FR-07：会话内换屏（控制收包队列上同步执行）。
+    // 事务顺序：停旧管线 → 建新屏（驱动内保证旧屏在失败时不动）→ 起新管线。
+    // 任一步失败都回到旧屏旧管线，回 session-update-result{ok:false}，会话不中断。
+    if (exclusive) {
+        host.onSessionUpdateSpecs = ^NSArray<NSDictionary *> *(NSArray<NSDictionary *> *specs,
+                                                                 NSError **perr) {
+            M1SessionCoordinator *c = coord;
+            if (!c) {
+                if (perr) *perr = [NSError errorWithDomain:@"veild.agent" code:7
+                    userInfo:@{NSLocalizedDescriptionKey: @"独占会话未就绪"}];
+                return nil;
+            }
+            NSMutableArray *conv = [NSMutableArray array];
+            for (NSDictionary *sp in specs) {
+                NSNumber *w = sp[@"w"], *h = sp[@"h"];
+                if ([w isKindOfClass:[NSNumber class]] && [h isKindOfClass:[NSNumber class]])
+                    [conv addObject:@{@"width": w, @"height": h}];
+            }
+            if (conv.count != specs.count || conv.count == 0) {
+                if (perr) *perr = [NSError errorWithDomain:@"veild.agent" code:7
+                    userInfo:@{NSLocalizedDescriptionKey: @"session-update 缺可用宽高"}];
+                return nil;
+            }
+            NSArray<NSDictionary *> *oldDisplays = virtualDisplays;
+            NSArray<NSDictionary *> *oldConv = virtualConv;
+            retirePipelines();
+
+            NSError *se = nil;
+            if (![c applySpecs:conv error:&se]) {
+                if (!startPipelines(oldDisplays)) {
+                    fprintf(stderr, "  [换屏] 回滚后旧管线重启失败\n");
+                }
+                if (perr) *perr = se ?: [NSError errorWithDomain:@"veild.agent" code:7
+                    userInfo:@{NSLocalizedDescriptionKey: @"换屏失败"}];
+                return nil;
+            }
+            NSArray<NSNumber *> *ids = c.createdDisplayIDs;
+            NSMutableArray *displays = [NSMutableArray array];
+            for (NSUInteger i = 0; i < ids.count; i++)
+                [displays addObject:@{@"displayID": ids[i],
+                                      @"w": i < conv.count ? conv[i][@"width"] : @0,
+                                      @"h": i < conv.count ? conv[i][@"height"] : @0,
+                                      @"synthetic": @NO}];
+            if (ids.count == 0 || !startPipelines(displays)) {
+                // 新屏生效但管线起不来：换回旧规格，恢复旧管线。
+                NSError *rbErr = nil;
+                BOOL back = oldConv.count > 0 && [c applySpecs:oldConv error:&rbErr];
+                if (back && startPipelines(oldDisplays)) refreshRects(oldDisplays);
+                if (perr) *perr = [NSError errorWithDomain:@"veild.agent" code:7
+                    userInfo:@{NSLocalizedDescriptionKey: back
+                        ? @"新屏管线启动失败，已回滚旧屏" : @"新屏管线启动失败且回滚失败"}];
+                return nil;
+            }
+            virtualDisplays = displays;
+            virtualConv = conv;
+            virtualID = ids.firstObject.unsignedIntValue;
+            virtualW = [conv.firstObject[@"width"] unsignedIntegerValue];
+            virtualH = [conv.firstObject[@"height"] unsignedIntegerValue];
+            refreshRects(displays);
+            @synchronized (lastKeyframeByDisplay) { [lastKeyframeByDisplay removeAllObjects]; }
+            printf("  [换屏] %lu 屏 → %lux%lu（首屏 displayID=%u）\n",
+                   (unsigned long)ids.count, (unsigned long)virtualW, (unsigned long)virtualH,
+                   virtualID);
+            return displays;
+        };
+    }
 
     [NSThread sleepForTimeInterval:durationMs / 1000.0];
     [host flushSimulatedHeld];
@@ -409,6 +530,14 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
 
     uint64_t cap = 0, enc = 0, sent = 0, dropped = 0, fragments = 0;
     NSMutableArray<NSDictionary *> *displayJSON = [NSMutableArray array];
+    // 换屏时退休的管线：统计照算，displayJSON 里带 retired:true 便于区分。
+    for (NSDictionary *r in retiredPipes) {
+        cap += [r[@"framesCaptured"] unsignedLongLongValue];
+        enc += [r[@"framesEncoded"] unsignedLongLongValue];
+        sent += [r[@"framesSent"] unsignedLongLongValue];
+        fragments += [r[@"fragmentsSent"] unsignedLongLongValue];
+        [displayJSON addObject:r];
+    }
     for (M1FramePipeline *p in pipes) {
         M1FramePipelineStats *s = p.stats;
         cap += s.framesCaptured;
@@ -426,8 +555,9 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
                p.displayID, s.framesCaptured, s.framesEncoded, s.framesSent,
                s.framesDroppedBeforeEncoder, s.keyframes);
     }
-    printf("serve: 合计 frames captured=%llu encoded=%llu sent=%llu dropped=%llu fragments=%llu（%lu 屏）\n",
-           cap, enc, sent, dropped, fragments, (unsigned long)pipes.count);
+    printf("serve: 合计 frames captured=%llu encoded=%llu sent=%llu dropped=%llu fragments=%llu（%lu 屏，含退休 %lu）\n",
+           cap, enc, sent, dropped, fragments, (unsigned long)(pipes.count + retiredPipes.count),
+           (unsigned long)retiredPipes.count);
     printf("serve: input ok=%lu fail=%lu record=%lu | 控制到达最大间隔=%.1fms (offset %.1fms)\n",
            (unsigned long)injectOK, (unsigned long)injectFail,
            (unsigned long)recorder.postCount, host.maxControlGapMs, host.maxGapAtOffsetMs);

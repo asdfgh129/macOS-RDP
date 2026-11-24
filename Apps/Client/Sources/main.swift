@@ -22,6 +22,9 @@ import AppKit
     func createVirtualDisplays(_ specs: [[AnyHashable: Any]], error: AutoreleasingUnsafeMutablePointer<NSError?>?) -> Bool {
         calls.append("create"); return true
     }
+    func replaceVirtualDisplays(_ specs: [[AnyHashable: Any]], error: AutoreleasingUnsafeMutablePointer<NSError?>?) -> Bool {
+        calls.append("replace"); return true
+    }
     func createdDisplayIDs() -> [NSNumber] { return [101, 102] }
     func snapshotAndDisablePhysicalExcept(_ keepIDs: [NSNumber], error: AutoreleasingUnsafeMutablePointer<NSError?>?) -> Bool {
         calls.append("disable"); return true
@@ -154,6 +157,7 @@ final class DisplaySlot {
     var displayID: UInt32 = 0
     var inputSent = 0
     var inputFailed = 0
+    var savedFrame: NSRect?
 
     init(window: NSWindow, view: M1FrameView) {
         self.window = window
@@ -178,6 +182,13 @@ final class DisplayRouter {
         defer { lock.unlock() }
         if let v = views[displayID] { return v }
         return views.count == 1 ? views.values.first : nil
+    }
+
+    /// 换屏后旧 displayID 的绑定必须清掉，否则旧屏迟到帧会往已关闭的窗口上贴。
+    func reset() {
+        lock.lock()
+        views.removeAll()
+        lock.unlock()
     }
 }
 
@@ -221,6 +232,14 @@ func runConnect() -> Int32 {
         windowSizes.isEmpty ? defaultWindow : windowSizes[min(index, windowSizes.count - 1)]
     }
 
+    // FR-07：会话中换屏。--update-at 毫秒（可重复/逗号分隔），--update-spec 为新的整套规格。
+    let updateAtMs: [Int] = argValues("--update-at")
+        .flatMap { $0.split(separator: ",").map(String.init) }
+        .compactMap { Int($0) }
+    let updateSpecs: [(Int, Int)] = argValues("--update-spec")
+        .flatMap { $0.split(separator: ",").map(String.init) }
+        .compactMap { parseSize($0) }
+
     M1FrameReceiver.prewarmDecoder()
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
@@ -252,8 +271,55 @@ func runConnect() -> Int32 {
 
     var slots: [DisplaySlot] = (0..<displayCount).map { makeSlot($0, windowSize($0)) }
     let router = DisplayRouter()
-
     let client = M1StreamClientNode()
+
+    // FR-06 沉浸模式：窗口铺满各自屏幕、自动隐藏 Dock/菜单栏；Cmd+Opt+F 切换。
+    var immersive = false
+    func applyImmersive(_ on: Bool) {
+        guard on != immersive else { return }
+        immersive = on
+        NSApp.presentationOptions = on ? [.autoHideDock, .autoHideMenuBar] : []
+        let screens = NSScreen.screens
+        for (i, slot) in slots.enumerated() {
+            if on {
+                slot.savedFrame = slot.window.frame
+                slot.window.styleMask = [.borderless]
+                if !screens.isEmpty {
+                    slot.window.setFrame(screens[min(i, screens.count - 1)].frame, display: true)
+                }
+                slot.window.makeKeyAndOrderFront(nil)
+            } else {
+                slot.window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+                if let f = slot.savedFrame { slot.window.setFrame(f, display: true) }
+            }
+        }
+        print("沉浸模式 \(on ? "开" : "关")（Cmd+Opt+F 切换）")
+    }
+
+    // 把窗口/路由/输入重绑到给定屏表；allowShrink 时关闭多出来的窗口（换屏缩屏用）。
+    func bindSlots(_ displays: [[AnyHashable: Any]], allowShrink: Bool) {
+        let n = displays.count
+        while slots.count < n {
+            slots.append(makeSlot(slots.count, windowSize(slots.count)))
+        }
+        for (i, display) in displays.enumerated() {
+            guard i < slots.count, let id = display["displayID"] as? NSNumber else { continue }
+            let displayID = id.uint32Value
+            slots[i].displayID = displayID
+            slots[i].view.displayID = displayID
+            router.bind(slots[i].view, displayID: displayID)
+            let w = (display["w"] as? NSNumber)?.intValue ?? Int(slots[i].window.frame.width)
+            let h = (display["h"] as? NSNumber)?.intValue ?? Int(slots[i].window.frame.height)
+            slots[i].window.title = "VeilRD \(i + 1)/\(n) \(w)×\(h)（Esc 退出）"
+            print("窗口 \(i + 1) → displayID=\(displayID)（\(w)×\(h)）")
+        }
+        if allowShrink && slots.count > n {
+            for slot in slots[n...] { slot.window.orderOut(nil) }
+            slots.removeSubrange(n...)
+        }
+        for slot in slots { wireSlot(slot) }
+    }
+
     client.expectedFingerprint = fingerprint
     client.outdir = outdir
     client.saveFrames = UInt(saveFrames)
@@ -266,6 +332,19 @@ func runConnect() -> Int32 {
     // 解码回调在每屏的帧队列上；present 本身线程安全，这里只做 displayID → 视图查表。
     client.onPixelBuffer = { displayID, pb, _, capturedAtUs in
         router.view(for: displayID)?.present(pb, capturedAtUs: capturedAtUs)
+    }
+    func wireSlot(_ slot: DisplaySlot) {
+        slot.view.onInputEvent = { event in
+            do {
+                try client.session?.sendInputEvent(event)
+                slot.inputSent += 1
+            } catch { slot.inputFailed += 1 }
+        }
+        slot.view.onCloseRequest = {
+            closedByUser = true
+            NSApp.stop(nil)
+        }
+        slot.view.onToggleImmersive = { applyImmersive(!immersive) }
     }
 
     print("连接 \(connectHost):\(port)")
@@ -283,32 +362,43 @@ func runConnect() -> Int32 {
     print("已 STREAMING，接收 \(durationMs) ms")
 
     let remote = client.session?.remoteDisplays ?? []
-    while slots.count < remote.count {
-        slots.append(makeSlot(slots.count, windowSize(slots.count)))
-    }
-    for (i, display) in remote.enumerated() {
-        guard i < slots.count, let id = display["displayID"] as? NSNumber else { continue }
-        let displayID = id.uint32Value
-        slots[i].displayID = displayID
-        slots[i].view.displayID = displayID
-        router.bind(slots[i].view, displayID: displayID)
-        let w = (display["w"] as? NSNumber)?.intValue ?? 0
-        let h = (display["h"] as? NSNumber)?.intValue ?? 0
-        print("窗口 \(i + 1) → displayID=\(displayID)（\(w)×\(h)）")
-    }
+    bindSlots(remote, allowShrink: false)
     if remote.count < slots.count {
         print("⚠ host 只提供 \(remote.count) 块屏，其余 \(slots.count - remote.count) 个窗口不接收画面")
     }
-    for slot in slots {
-        slot.view.onInputEvent = { event in
-            do {
-                try client.session?.sendInputEvent(event)
-                slot.inputSent += 1
-            } catch { slot.inputFailed += 1 }
+
+    // FR-07：换屏结果回到主线程重绑窗口；失败保持原窗口（Host 会保持旧屏）。
+    var updateResults: [[String: Any]] = []
+    client.onSessionUpdateResult = { updateID, ok, displays, detail in
+        DispatchQueue.main.async {
+            if ok {
+                router.reset()
+                bindSlots(displays, allowShrink: true)
+                print("换屏 #\(updateID) 成功：\(displays.count) 屏")
+            } else {
+                print("⚠ 换屏 #\(updateID) 被拒：\(detail ?? "unknown")（保持原屏）")
+            }
+            updateResults.append(["updateID": updateID, "ok": ok,
+                                  "displays": displays.count, "detail": detail ?? ""])
         }
-        slot.view.onCloseRequest = {
-            closedByUser = true
-            NSApp.stop(nil)
+    }
+    for at in updateAtMs {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(at)) {
+            guard !updateSpecs.isEmpty else {
+                print("⚠ --update-at 未给 --update-spec，跳过")
+                return
+            }
+            let dicts = updateSpecs.map {
+                ["w": $0.0, "h": $0.1, "hidpi": false, "refresh": 60] as [AnyHashable: Any]
+            }
+            var updateErr: NSError?
+            let updateID = client.requestSessionUpdate(withSpecs: dicts, error: &updateErr)
+            if updateID > 0 {
+                print("换屏请求 #\(updateID) → "
+                      + updateSpecs.map { "\($0.0)x\($0.1)" }.joined(separator: ", "))
+            } else {
+                print("✗ 换屏请求失败: \(updateErr?.localizedDescription ?? "unknown")")
+            }
         }
     }
 
@@ -325,6 +415,7 @@ func runConnect() -> Int32 {
     DispatchQueue.main.async {
         NSApp.activate(ignoringOtherApps: true)
         slots.first?.window.makeKeyAndOrderFront(nil)
+        if CommandLine.arguments.contains("--immersive") { applyImmersive(true) }
     }
     app.run()
 
@@ -374,6 +465,10 @@ func runConnect() -> Int32 {
           + "时钟 offset=\(client.session?.clockOffsetUs ?? 0) us（样本 \(client.session?.timeSyncSamples ?? 0)）")
     print("client: 输入上行 \(inputSent)/失败 \(inputFailed) | 控制最大间隔=\(client.maxControlGapMs) ms "
           + "PNG=\(client.savedFrames)")
+    if !updateResults.isEmpty {
+        let okCount = updateResults.filter { ($0["ok"] as? Bool) == true }.count
+        print("client: 换屏请求 \(updateResults.count) 次，成功 \(okCount) 次")
+    }
     if let outPath = outPath, let data = try? JSONSerialization.data(withJSONObject: [
         "framesCompleted": totalCompleted,
         "framesDecoded": totalDecoded,
@@ -390,6 +485,7 @@ func runConnect() -> Int32 {
         "inputSent": inputSent, "inputFailed": inputFailed,
         "maxControlGapMs": client.maxControlGapMs,
         "savedPNG": client.savedFrames,
+        "sessionUpdates": updateResults,
         "displays": perDisplay,
     ], options: .prettyPrinted) {
         try? data.write(to: URL(fileURLWithPath: outPath))

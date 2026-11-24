@@ -66,6 +66,34 @@ static NSError *M1InputErr(NSInteger code, NSString *desc) {
         userInfo:@{ NSLocalizedDescriptionKey: desc }];
 }
 
+// HID 修饰键码（IOHIDUsageTables）：caps 57、shift 56、ctrl 59、opt 58、cmd 55。
+NSArray<NSDictionary<NSString *, id> *> *M1ModifierFlagTransitions(uint64_t oldFlags,
+                                                                   uint64_t newFlags) {
+    static const struct { uint64_t bit; uint16_t keyCode; } kMods[] = {
+        { 1ULL << 16, 57 },   // caps
+        { 1ULL << 17, 56 },   // shift
+        { 1ULL << 18, 59 },   // ctrl
+        { 1ULL << 19, 58 },   // opt
+        { 1ULL << 20, 55 },   // cmd
+    };
+    NSMutableArray *out = [NSMutableArray array];
+    uint64_t running = oldFlags;
+    // 先抬起：同时换多个键时，抬起顺序不影响结果；按下放到后面更像真实手速。
+    for (BOOL down = NO; ; down = YES) {
+        for (size_t i = 0; i < sizeof(kMods) / sizeof(kMods[0]); i++) {
+            BOOL was = (oldFlags & kMods[i].bit) != 0;
+            BOOL now = (newFlags & kMods[i].bit) != 0;
+            if (was == now || now != down) continue;
+            running = down ? (running | kMods[i].bit) : (running & ~kMods[i].bit);
+            [out addObject:@{ @"keyCode": @(kMods[i].keyCode),
+                              @"down": @(down),
+                              @"flags": @(running) }];
+        }
+        if (down) break;
+    }
+    return out;
+}
+
 NSDictionary<NSString *, id> *M1InjectionPlan(NSDictionary *event,
                                                CGRect targetDisplayRect,
                                                NSError **error) {
@@ -101,6 +129,17 @@ NSDictionary<NSString *, id> *M1InjectionPlan(NSDictionary *event,
             @"kind": @"scroll", @"displayID": @(displayID),
             @"dx": event[@"dx"] ?: @(0), @"dy": event[@"dy"] ?: @(0),
             @"flags": @(flags),
+        };
+    }
+    if ([kind isEqualToString:@"text"]) {
+        NSString *text = event[@"text"];
+        if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+            if (error) *error = M1InputErr(3, @"text 缺内容");
+            return nil;
+        }
+        return @{
+            @"kind": @"text", @"displayID": @(displayID),
+            @"text": text, @"flags": @(flags),
         };
     }
     if ([kind isEqualToString:@"flags"]) {

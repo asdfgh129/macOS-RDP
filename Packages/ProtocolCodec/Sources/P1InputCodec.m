@@ -99,6 +99,12 @@ NSDictionary *P1MakeFlagsEvent(NSDictionary *flags) {
     return e;
 }
 
+NSDictionary *P1MakeTextEvent(uint32_t displayID, NSString *text, NSDictionary *flags) {
+    NSMutableDictionary *e = [P1BaseEvent(@"text", displayID, flags) mutableCopy];
+    if (text.length) e[@"text"] = text;
+    return e;
+}
+
 NSDictionary *P1MakeInputMessage(int64_t seq, NSDictionary *event) {
     return P1MakeControlMessage(@"input", seq, @{@"event": event});
 }
@@ -118,7 +124,7 @@ NSDictionary *P1NormalizeInputEvent(NSDictionary *event, NSError **error) {
         if (error) *error = P1InputErr(P1InputErrorBadKind, @"missing kind");
         return nil;
     }
-    NSArray *validKinds = @[@"mouse", @"key", @"scroll", @"flags"];
+    NSArray *validKinds = @[@"mouse", @"key", @"scroll", @"flags", @"text"];
     if (![validKinds containsObject:kind]) {
         if (error) *error = P1InputErr(P1InputErrorBadKind, @"unknown kind");
         return nil;
@@ -206,6 +212,17 @@ NSDictionary *P1NormalizeInputEvent(NSDictionary *event, NSError **error) {
         }
         out[@"dx"] = @([dx doubleValue]);
         out[@"dy"] = @([dy doubleValue]);
+    } else if ([kind isEqualToString:@"text"]) {
+        NSString *text = event[@"text"];
+        if (![text isKindOfClass:[NSString class]] || text.length == 0) {
+            if (error) *error = P1InputErr(P1InputErrorBadKey, @"text requires non-empty string");
+            return nil;
+        }
+        if (text.length > 256) {
+            if (error) *error = P1InputErr(P1InputErrorBadKey, @"text too long");
+            return nil;
+        }
+        out[@"text"] = text;
     }
 
     return out;

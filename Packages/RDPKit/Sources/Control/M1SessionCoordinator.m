@@ -37,6 +37,7 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
 @property (nonatomic, assign) BOOL sleepHeld;
 @property (nonatomic, assign) BOOL physicalDisabled;
 @property (nonatomic, assign) BOOL virtualCreated;
+@property (nonatomic, copy) NSArray<NSDictionary *> *currentSpecs;
 @property (nonatomic, copy, readwrite) NSArray<NSNumber *> *createdDisplayIDs;
 @end
 
@@ -62,17 +63,10 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
             M1HostSessionPhaseName(_phase), @"远程登录需要凭据");
         return NO;
     }
-    NSMutableArray *summary = [NSMutableArray array];
-    for (NSDictionary *spec in specs) {
-        NSNumber *w = spec[@"width"], *h = spec[@"height"];
-        if (!w || !h || w.unsignedIntegerValue < 2 || h.unsignedIntegerValue < 2) {
-            if (error) *error = M1SessErr(M1SessionErrorBadSpecs,
-                M1HostSessionPhaseName(_phase), @"非法 display 规格");
-            return NO;
-        }
-        [summary addObject:@(w.unsignedIntegerValue * 10000 + h.unsignedIntegerValue)];
-    }
+    NSArray<NSNumber *> *summary = [self summaryForSpecs:specs error:error];
+    if (!summary) return NO;
     self.specsSummary = summary;
+    self.currentSpecs = specs;
 
     // step 0 防睡眠断言（D-08 前置）
     _phase = M1HostSessionPreventingSleep;
@@ -189,6 +183,84 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
         self.sleepHeld = NO;
     }
     return ok;
+}
+
+#pragma mark - FR-07 会话内换屏
+
+// start 与 applySpecs 共用：返回 w*10000+h 的摘要表；非法返回 nil 并填 error。
+- (NSArray<NSNumber *> *)summaryForSpecs:(NSArray<NSDictionary *> *)specs
+                                   error:(NSError **)error {
+    if (specs.count == 0) {
+        if (error) *error = M1SessErr(M1SessionErrorBadSpecs,
+            M1HostSessionPhaseName(_phase), @"display 规格为空");
+        return nil;
+    }
+    NSMutableArray *summary = [NSMutableArray array];
+    for (NSDictionary *spec in specs) {
+        NSNumber *w = spec[@"width"], *h = spec[@"height"];
+        if (!w || !h || w.unsignedIntegerValue < 2 || h.unsignedIntegerValue < 2) {
+            if (error) *error = M1SessErr(M1SessionErrorBadSpecs,
+                M1HostSessionPhaseName(_phase), @"非法 display 规格");
+            return nil;
+        }
+        [summary addObject:@(w.unsignedIntegerValue * 10000 + h.unsignedIntegerValue)];
+    }
+    return summary;
+}
+
+- (BOOL)applySpecs:(NSArray<NSDictionary *> *)specs
+             error:(NSError * _Nullable * _Nullable)error {
+    if (error) *error = nil;
+    if (_phase != M1HostSessionStreaming) {
+        if (error) *error = M1SessErr(M1SessionErrorStepFailed,
+            M1HostSessionPhaseName(_phase), @"只有 STREAMING 态可以换屏");
+        return NO;
+    }
+    NSError *specErr = nil;
+    NSArray<NSNumber *> *summary = [self summaryForSpecs:specs error:&specErr];
+    if (!summary) {
+        if (error) *error = specErr;
+        return NO;
+    }
+
+    NSArray<NSDictionary *> *oldSpecs = self.currentSpecs ?: @[];
+    NSArray<NSNumber *> *oldSummary = self.specsSummary ?: @[];
+    NSError *stepErr = nil;
+    if (![_driver replaceVirtualDisplays:specs error:&stepErr]) {
+        // 驱动契约：失败时旧屏未动；这里只换错误语义，不碰 phase。
+        if (error) *error = [NSError errorWithDomain:M1SessionErrorDomain
+            code:M1SessionErrorStepFailed
+            userInfo:@{ NSLocalizedDescriptionKey: stepErr.localizedDescription ?: @"换屏失败",
+                        @"phase": M1HostSessionPhaseName(_phase),
+                        @"code": @"CREATE_FAILED" }];
+        return NO;
+    }
+    self.createdDisplayIDs = [_driver createdDisplayIDs];
+    self.specsSummary = summary;
+    self.currentSpecs = specs;
+
+    // 新屏已顶上但隔离不成立（外部屏冒出来）：换回旧规格，保持会话可用。
+    if (self.extraKeepDisplayIDs.count == 0 && ![_driver verifyIsolationError:&stepErr]) {
+        NSError *rollbackErr = nil;
+        if (oldSpecs.count > 0 && [_driver replaceVirtualDisplays:oldSpecs error:&rollbackErr]) {
+            self.createdDisplayIDs = [_driver createdDisplayIDs];
+            self.specsSummary = oldSummary;
+            self.currentSpecs = oldSpecs;
+            if (error) *error = [NSError errorWithDomain:M1SessionErrorDomain
+                code:M1SessionErrorStepFailed
+                userInfo:@{ NSLocalizedDescriptionKey: @"换屏后隔离校验失败，已回滚旧屏",
+                            @"phase": M1HostSessionPhaseName(_phase),
+                            @"code": @"VISIBILITY_FAILED" }];
+        } else if (error) {
+            *error = [NSError errorWithDomain:M1SessionErrorDomain
+                code:M1SessionErrorStepFailed
+                userInfo:@{ NSLocalizedDescriptionKey: @"换屏后隔离校验失败且回滚失败",
+                            @"phase": M1HostSessionPhaseName(_phase),
+                            @"code": @"VISIBILITY_FAILED" }];
+        }
+        return NO;
+    }
+    return YES;
 }
 
 @end

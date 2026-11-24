@@ -43,12 +43,20 @@ CGPoint M1NormalizedPointFromViewPoint(CGPoint viewPoint, CGRect videoRect)
 // 计划形状：@{@"kind":..., @"displayID":..., ...}
 //   mouse: @{@"x":全局px, @"y":全局py, @"button":..., @"action":..., @"flags":掩码}
 //   key:   @{@"keyCode":..., @"unicode":..., @"flags":掩码}
+//   text:  @{@"text":成串文本, @"flags":掩码}（IME 提交串，按 unicode 注入）
 //   scroll:@{@"dx":..., @"dy":..., @"flags":掩码}
 //   flags: @{@"flags":掩码}
 NSDictionary<NSString *, id> * _Nullable M1InjectionPlan(NSDictionary *event,
                                                           CGRect targetDisplayRect,
                                                           NSError * _Nullable * _Nullable error)
     NS_SWIFT_NAME(injectionPlan(event:targetRect:));
+
+// 旧掩码 → 新掩码的修饰键增量：按「先抬起后按下」逐键产出
+// @{@"keyCode":@(HID 键码), @"down":@(BOOL), @"flags":@(该步之后的掩码)}。
+// Host 只收到全量状态时用它合成 flagsChanged：只改掩码而不带键码的
+// flagsChanged 在部分 App 里会被忽略。
+NSArray<NSDictionary<NSString *, id> *> *M1ModifierFlagTransitions(uint64_t oldFlags,
+                                                                   uint64_t newFlags);
 
 extern NSString * const M1InputLogicErrorDomain;
 

@@ -369,6 +369,33 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     return self.displayProvider(message, error);
 }
 
+- (NSArray<NSDictionary *> *)controlSession:(M1ControlSession *)session
+                    applySessionUpdateSpecs:(NSArray<NSDictionary *> *)specs
+                                     error:(NSError **)error {
+    if (!self.onSessionUpdateSpecs) return nil;
+    return self.onSessionUpdateSpecs(specs, error);
+}
+
+- (void)controlSession:(M1ControlSession *)session
+ didCompleteSessionUpdate:(int64_t)updateID
+                     ok:(BOOL)ok
+               displays:(NSArray<NSDictionary *> *)displays
+            errorDetail:(NSString *)detail {
+    if (self.onSessionUpdateResult) {
+        self.onSessionUpdateResult(updateID, ok, displays, detail);
+    }
+}
+
+- (int64_t)requestSessionUpdateWithSpecs:(NSArray<NSDictionary *> *)specs
+                                   error:(NSError **)error {
+    if (!self.session) {
+        if (error) *error = [NSError errorWithDomain:@"M1StreamSession" code:1
+            userInfo:@{ NSLocalizedDescriptionKey: @"会话未建立" }];
+        return 0;
+    }
+    return [self.session requestSessionUpdateWithSpecs:specs error:error];
+}
+
 - (NSArray<NSString *> *)stateLog { return self.session ? self.session.stateLog : @[]; }
 
 - (void)shutdown {

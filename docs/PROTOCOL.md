@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 版本 | protocol v1 |
-| 日期 | 2026-11-16；2026-11-18 11:20 冻结；2026-11-22 帧头 v3；2026-11-23 多屏字段（v1.3） |
+| 日期 | 2026-11-16；2026-11-18 11:20 冻结；2026-11-22 帧头 v3；2026-11-23 多屏字段（v1.3）；2026-11-24 v1.4 会话内换屏 + text 输入 |
 | 状态 | **已冻结（2026-11-18 11:20），作为 M1 基线**。D-01（QUIC datagram）、D-09（采集主路径）已确认；帧通道握手/ALPN/拥塞控制在 M1 实现中按 §7 落地，不再阻塞冻结 |
 | 上位文档 | `docs/DESIGN.md` §3.2 / §4.3 / §5 |
 
@@ -44,7 +44,8 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 | `session-start` | C→H | `specs:[{w,h,hidpi,refresh}], bitrateKbps, fps` | 请求建屏 |
 | `session-resume` | C→H | `sessionID` | 重连恢复 |
 | `session-ready` | H→C | `sessionID, displays:[{displayID,w,h}]` | 全部屏 liveness+SCK 可见后才发 |
-| `session-update` | C→H | `specs[]` | 动态改分辨率/屏数；Host 事务性执行，失败回滚并 `session-error` |
+| `session-update` | C→H | `updateID, specs[]` | 动态改分辨率/屏数；Host 事务性执行，失败回滚但不结束会话 |
+| `session-update-result` | H→C | `updateID, ok, displays[]` 或 `updateID, ok:false, error{code,detail}` | 换屏结果；`ok:false` 时旧屏与会话继续可用 |
 | `session-error` | H→C | `code, detail, recoverable` | 错误码见 §5 |
 | `input` | C→H | 见 §3.1 | 高频，不要求 ack |
 | `keyframe-request` | C→H | `displayID, reason` | 丢帧/解码失败/重连后；按屏限速 300ms |
@@ -64,11 +65,12 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 
 ```json
 {"type":"input","seq":N,"displayID":4128835,"event":{
-  "kind":"mouse|key|scroll|flags",
+  "kind":"mouse|key|scroll|flags|text",
   "displayID":4128835,        // 与消息层同值；两处都带，读任一处均可（见下）
   "x":0.0,"y":0.0,            // 归一化 0..1（相对目标虚拟屏，Renderer 已做坐标变换）
   "button":"left|right|other", "action":"down|up|move|drag",
-  "keyCode":0, "unicode":"",   // key：keyCode 为主，IME 组合串走 unicode（A-03）
+  "keyCode":0, "unicode":"",   // key：keyCode 为主，unicode 为可打印字符
+  "text":"",                   // text：本地 IME 已上屏的整串文本（≤256 UTF-16）
   "flags":{"cmd":0,"shift":0,"opt":0,"ctrl":0,"caps":0},
   "dx":0.0,"dy":0.0            // scroll
 }}
@@ -81,7 +83,12 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 - 坐标一律归一化传输，Host 侧乘以目标屏实际 points 尺寸——分辨率协商变化不影响输入通路。
 - 仅 STREAMING 态收发：非该态发送方丢弃并计数，接收方丢弃并计数，都不视为协议错误。
 - 修饰键采用**状态同步**而非逐事件转发：Client 维护状态机，变化时发 `kind:"flags"` 全量；重连后必发一次全量复位。
-- Host 注入速率限制：单会话 ≤ 1000 event/s，超限丢弃 move 类（保留 down/up/key）。
+- Host 注入修饰键时把掩码增量拆成**逐键 `flagsChanged`（带 HID 键码 57/56/59/58/55，先抬后按）**；
+  只改掩码不带键码的事件在部分 App（实测文本编辑器）里不更新 Shift 状态。
+- `kind:"text"`（FR-06）：本地输入法组合完成后的整串文本，Host 用完整 unicode 串一次注入（keyCode 0），
+  不经 Host 输入法二次解释；空串或超过 256 个 UTF-16 单元视为非法事件。带 cmd/ctrl/opt 的按键由
+  Client 应用层按快捷键语义处理，不发 `text`。
+- Host 注入速率限制：单会话 ≤ 1000 event/s，超限丢弃 move 类（保留 down/up/key，`text` 不丢）。
 
 ### 3.2 多屏路由（2026-11-23，M2）
 
@@ -95,6 +102,10 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 - 输入事件内的 `displayID` 在多屏下必填（鼠标按该屏 Quartz bounds 换算）；Host 对未知 ID 的
   鼠标事件拒绝注入而不是落到默认屏。`kind:"flags"` 仍不参与屏坐标。
 - 限流（关键帧 300ms、补片 5ms）按 `displayID` 独立记账，一块屏的频繁请求不会拖住其它屏。
+- `session-update` 的 `specs` 与 `session-start` 同一套规则（条数/分辨率校验）；Host 先建新屏、
+  校验通过后才销毁旧屏，任一环节失败都回滚到旧屏并回 `session-update-result{ok:false}`，**会话不中断**。
+  成功时 Host 回新的 `displays[]`；虚拟屏是重建的，`displayID` 与 `frameSeq` 都从新屏重新开始，
+  Client 必须按结果重绑窗口/重组器，旧屏迟到的帧直接丢弃。
 
 ## 4. 帧通道二进制头（v3：26 字节，大端）
 
@@ -155,4 +166,4 @@ v2 及更早帧头一律按 `BadVersion` 拒绝，不做兼容回退（双端始
 - D-01 已决（2026-11-17，QUIC datagram）；**v1 已冻结（2026-11-18 11:20）**。帧通道实现细则（ALPN `macos-rdp-v1`、idle timeout 30s、max UDP payload 1200B、分片上限 1150B）见 D-01 与 §4，由 M1 按此实现，不再作为冻结前置；拥塞控制使用 Network.framework 默认策略，P2 双机实测后再评估调优。
 - 光标通道（FR-10, P2）预留 `type:"cursor"`，本期不实现。
 - 多屏（M2）只扩展既有消息字段（`displayID` 贯通关键帧/补片、`frameSeq` 按屏独立），不改帧头格式与 `v` 版本号；`specs` 上限 8 屏，超出由 Host 明确拒绝。
-- 变更记录：v1.3 2026-11-23 **§3 新增 `frame-nack` 与 §3.2 多屏路由**（per-display 序号/限流、`displayID=0` 兼容语义、8 屏上限）；v1.2-draft 2026-11-22 **帧头 v3（26B，内嵌 `capturedAtUs`）+ 控制通道 `time-sync`/`time-sync-reply`**，为 A-02 提供 capture→render 打点（JSON `v` 不变）；v1.1-draft 2026-11-18 **§3.1 明确 `displayID` 位置（两处都带）+ 只在 STREAMING 态收发**，实现见 D-17；v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram）；2026-11-18 分片上限由 1200 下调为 1150 B，并补齐 §3.1 输入编解码与 §2 状态机的单测实现；2026-11-18 11:20 **冻结为 v1**（评审通过，M1 基线），QUIC 实现细则以 D-01 为准，双机端到端实测转入 P2 验收。
+- 变更记录：v1.4 2026-11-24 **§3 新增 `session-update-result`、§3.1 新增 `text` 输入与逐键 `flagsChanged` 语义、§3.2 补 `session-update` 事务规则**（FR-06/FR-07，JSON `v` 仍为 1）；v1.3 2026-11-23 **§3 新增 `frame-nack` 与 §3.2 多屏路由**（per-display 序号/限流、`displayID=0` 兼容语义、8 屏上限）；v1.2-draft 2026-11-22 **帧头 v3（26B，内嵌 `capturedAtUs`）+ 控制通道 `time-sync`/`time-sync-reply`**，为 A-02 提供 capture→render 打点（JSON `v` 不变）；v1.1-draft 2026-11-18 **§3.1 明确 `displayID` 位置（两处都带）+ 只在 STREAMING 态收发**，实现见 D-17；v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram）；2026-11-18 分片上限由 1200 下调为 1150 B，并补齐 §3.1 输入编解码与 §2 状态机的单测实现；2026-11-18 11:20 **冻结为 v1**（评审通过，M1 基线），QUIC 实现细则以 D-01 为准，双机端到端实测转入 P2 验收。

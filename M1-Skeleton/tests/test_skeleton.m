@@ -130,6 +130,8 @@ static void TestTakeover(void) {
 @interface M1MockDriver : NSObject <M1SessionDriver>
 @property (nonatomic, strong) NSMutableArray<NSString *> *calls;
 @property (nonatomic, assign) BOOL failAtDisable;
+@property (nonatomic, assign) BOOL failAtReplace;
+@property (nonatomic, strong) NSArray<NSNumber *> *replacedIDs;
 @end
 
 @implementation M1MockDriver
@@ -139,7 +141,19 @@ static void TestTakeover(void) {
 - (BOOL)createVirtualDisplays:(NSArray<NSDictionary *> *)s error:(NSError **)e {
     [_calls addObject:@"createVD"]; return YES;
 }
-- (NSArray<NSNumber *> *)createdDisplayIDs { return @[@1001]; }
+- (BOOL)replaceVirtualDisplays:(NSArray<NSDictionary *> *)s error:(NSError **)e {
+    [_calls addObject:@"replaceVD"];
+    if (_failAtReplace) {
+        if (e) *e = [NSError errorWithDomain:@"mock" code:1
+            userInfo:@{NSLocalizedDescriptionKey: @"换屏失败"}];
+        return NO;
+    }
+    NSMutableArray *ids = [NSMutableArray array];
+    for (NSUInteger i = 0; i < s.count; i++) [ids addObject:@(3000 + i)];
+    _replacedIDs = ids;
+    return YES;
+}
+- (NSArray<NSNumber *> *)createdDisplayIDs { return _replacedIDs ?: @[@1001]; }
 - (BOOL)snapshotAndDisablePhysicalExcept:(NSArray<NSNumber *> *)k error:(NSError **)e {
     [_calls addObject:@"disablePhys"]; return !_failAtDisable;
 }
@@ -191,6 +205,35 @@ static void TestSession(void) {
     OK(c4.phase == M1HostSessionFailed, "phase-failed");
     OK([drv4.calls containsObject:@"restore"] && [drv4.calls containsObject:@"sleep-"],
        "failure-recovers");
+
+    // FR-07 换屏：成功替换 + 重校验隔离
+    M1MockDriver *drv5 = [M1MockDriver new];
+    M1SessionCoordinator *c5 = [[M1SessionCoordinator alloc] initWithDriver:drv5];
+    OK([c5 startWithSpecs:specs needsLogin:NO credential:nil error:&err], "update-start-ok");
+    [drv5.calls removeAllObjects];
+    NSArray *newSpecs = @[@{@"width":@1280, @"height":@720},
+                          @{@"width":@1920, @"height":@1080}];
+    OK([c5 applySpecs:newSpecs error:&err], "update-ok");
+    OK([drv5.calls isEqualToArray:(@[@"replaceVD", @"verifyISO"])], "update-sequence");
+    OK(c5.createdDisplayIDs.count == 2, "update-display-count");
+    OK(c5.specsSummary.count == 2, "update-summary-count");
+
+    // 换屏失败：旧屏/状态不变，错误码可上线
+    M1MockDriver *drv6 = [M1MockDriver new];
+    M1SessionCoordinator *c6 = [[M1SessionCoordinator alloc] initWithDriver:drv6];
+    OK([c6 startWithSpecs:specs needsLogin:NO credential:nil error:&err], "update-fail-start");
+    drv6.failAtReplace = YES;
+    [drv6.calls removeAllObjects];
+    OK(![c6 applySpecs:newSpecs error:&err], "update-fail");
+    OK(c6.createdDisplayIDs.count == 1 && [c6.createdDisplayIDs[0] isEqual:@1001],
+       "update-fail-keeps-old");
+    OK(c6.phase == M1HostSessionStreaming, "update-fail-keeps-streaming");
+    OK([err.userInfo[@"code"] isEqual:@"CREATE_FAILED"], "update-fail-code");
+
+    // 非 STREAMING 不允许换屏
+    OK(![c2 applySpecs:newSpecs error:&err], "update-needs-streaming");
+    [c5 endSessionError:NULL];
+    [c6 endSessionError:NULL];
 }
 
 #pragma mark - 驱动层纯逻辑
@@ -352,6 +395,34 @@ static void TestInputLogic(void) {
     OK(recMulti.postCount == multiCount, "inject-multi-rejected-not-posted");
     OK([injMulti injectEvent:@{ @"kind":@"flags", @"flags":@{ @"cmd":@1 } } error:&injErr],
        "inject-multi-flags-no-display-ok");
+
+    // ---- FR-06：text 注入计划 + 修饰键增量（逐键 flagsChanged）----
+    NSDictionary *textPlan = M1InjectionPlan(@{ @"kind":@"text", @"displayID":@42,
+        @"text":@"你好，VeilRD", @"flags":@{ @"shift":@1 } }, rect, &err);
+    OK(textPlan && [textPlan[@"text"] isEqualToString:@"你好，VeilRD"], "plan-text-cjk");
+    OK(textPlan && [textPlan[@"flags"] unsignedLongLongValue] == (1ULL<<17),
+       "plan-text-flags");
+    OK(M1InjectionPlan(@{ @"kind":@"text", @"text":@"" }, rect, &err) == nil && err != nil,
+       "plan-text-empty-rejected");
+
+    // 单键按下：一条 shift（HID 56），掩码已是按下后
+    NSArray *t1 = M1ModifierFlagTransitions(0, 1ULL<<17);
+    OK(t1.count == 1 && [t1[0][@"keyCode"] unsignedShortValue] == 56 &&
+       [t1[0][@"down"] boolValue] &&
+       [t1[0][@"flags"] unsignedLongLongValue] == (1ULL<<17), "mod-press-shift");
+    // 同时按两个：两条按下，顺序按表（shift 先于 cmd）
+    NSArray *t2 = M1ModifierFlagTransitions(0, (1ULL<<17)|(1ULL<<20));
+    OK(t2.count == 2 && [t2[0][@"down"] boolValue] && [t2[1][@"down"] boolValue],
+       "mod-two-presses");
+    // 全抬到 0：末尾掩码必须清零
+    NSArray *t3 = M1ModifierFlagTransitions((1ULL<<20)|(1ULL<<18), 0);
+    OK(t3.count == 2 && ![t3[0][@"down"] boolValue] && ![t3[1][@"down"] boolValue] &&
+       [t3.lastObject[@"flags"] unsignedLongLongValue] == 0, "mod-releases-end-zero");
+    // 换键：先抬旧（cmd 55）再按新（shift 56）
+    NSArray *t4 = M1ModifierFlagTransitions(1ULL<<20, 1ULL<<17);
+    OK(t4.count == 2 && ![t4[0][@"down"] boolValue] && [t4[1][@"down"] boolValue] &&
+       [t4[0][@"keyCode"] unsignedShortValue] == 55, "mod-release-before-press");
+    OK(M1ModifierFlagTransitions(0, 0).count == 0, "mod-none");
 }
 
 #pragma mark - 帧管线：分片发送与重组一致性
@@ -948,6 +1019,10 @@ static void TestControlChannel(void) {
 @property (nonatomic) NSUInteger keyframeRequests;
 @property (nonatomic) uint32_t lastKeyframeDisplayID;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *fragmentRequests;
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *updateResults;
+@property (nonatomic, strong, nullable) NSArray<NSDictionary *> *lastUpdateSpecs;
+@property (nonatomic) NSUInteger appliedUpdates;
+@property (nonatomic) BOOL failUpdate;
 @end
 
 @implementation M1TestSessionWatcher
@@ -955,8 +1030,39 @@ static void TestControlChannel(void) {
     if ((self = [super init])) {
         _inputs = [NSMutableArray array];
         _fragmentRequests = [NSMutableArray array];
+        _updateResults = [NSMutableArray array];
     }
     return self;
+}
+- (NSArray<NSDictionary *> *)controlSession:(M1ControlSession *)session
+                     applySessionUpdateSpecs:(NSArray<NSDictionary *> *)specs
+                                      error:(NSError **)error {
+    if (self.failUpdate) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"M1Test" code:1
+                userInfo:@{ NSLocalizedDescriptionKey: @"mock create failed",
+                            @"code": @"CREATE_FAILED" }];
+        }
+        return nil;
+    }
+    _lastUpdateSpecs = specs;
+    _appliedUpdates++;
+    NSMutableArray *displays = [NSMutableArray array];
+    [specs enumerateObjectsUsingBlock:^(NSDictionary *s, NSUInteger i, BOOL *stop) {
+        [displays addObject:@{ @"displayID": @(5000 + i),
+                               @"w": s[@"w"], @"h": s[@"h"] }];
+    }];
+    return displays;
+}
+- (void)controlSession:(M1ControlSession *)session
+ didCompleteSessionUpdate:(int64_t)updateID
+                     ok:(BOOL)ok
+               displays:(NSArray<NSDictionary *> *)displays
+            errorDetail:(NSString *)detail {
+    [_updateResults addObject:@{ @"updateID": @(updateID),
+                                 @"ok": @(ok),
+                                 @"displays": displays ?: @[],
+                                 @"detail": detail ?: @"" }];
 }
 - (void)controlSession:(M1ControlSession *)session
     didRequestKeyframeForDisplay:(uint32_t)displayID {
@@ -1279,6 +1385,64 @@ static void TestControlSessionTimeSync(void) {
        err.code == M1ControlSessionErrorInvalidState, "ts-pre-streaming-rejected");
 }
 
+#pragma mark - 控制会话（动态换屏）
+
+// FR-07：换屏是事务性的——成功才改屏表，失败保持旧屏，会话不能掉。
+static void TestControlSessionUpdate(void) {
+    printf("=== control session (session update) ===\n");
+    NSDictionary *r = RunPair(nil, nil, FP(@"ab"), FP(@"cd"));
+    M1ControlSession *client = r[@"client"];
+    M1ControlSession *host = r[@"host"];
+    M1TestSessionWatcher *cw = r[@"clientWatcher"];
+    M1TestSessionWatcher *hw = r[@"hostWatcher"];
+    NSMutableArray<NSArray *> *pending = r[@"pending"];
+    OK(client.reachedStreaming && host.reachedStreaming, "upd-both-streaming");
+    // Host 侧只在成功执行换屏后才记录屏表，初始为空是预期。
+    OK(client.remoteDisplays.count == 1 && host.remoteDisplays.count == 0,
+       "upd-initial-one-display");
+
+    NSArray *specs = @[ @{ @"w": @1280, @"h": @720 },
+                        @{ @"w": @1920, @"h": @1080 } ];
+    NSError *err = nil;
+    int64_t uid = [client requestSessionUpdateWithSpecs:specs error:&err];
+    OK(uid == 1 && err == nil && client.sessionUpdatesSent == 1, "upd-send-ok");
+    Pump(pending);
+    OK(hw.appliedUpdates == 1 && hw.lastUpdateSpecs.count == 2, "upd-host-applied");
+    OK(host.remoteDisplays.count == 2, "upd-host-displays");
+    OK(client.remoteDisplays.count == 2 && client.sessionUpdatesApplied == 1,
+       "upd-client-displays");
+    NSDictionary *res = cw.updateResults.firstObject;
+    OK(res && [res[@"updateID"] longLongValue] == 1 && [res[@"ok"] boolValue] &&
+       [res[@"displays"] count] == 2, "upd-client-result");
+    OK(client.reachedStreaming && host.reachedStreaming &&
+       [client.stateMachine canAcceptInput], "upd-still-streaming");
+
+    // Host 事务失败：ok:false + code 透传，两端屏表都保持不变
+    hw.failUpdate = YES;
+    err = nil;
+    uid = [client requestSessionUpdateWithSpecs:@[ @{ @"w": @800, @"h": @600 } ]
+                                          error:&err];
+    OK(uid == 2, "upd-fail-send-ok");
+    Pump(pending);
+    NSDictionary *bad = cw.updateResults.lastObject;
+    OK(cw.updateResults.count == 2 && bad && ![bad[@"ok"] boolValue] &&
+       [bad[@"detail"] length] > 0, "upd-fail-result");
+    OK([bad[@"detail"] containsString:@"CREATE_FAILED"], "upd-fail-code");
+    OK(client.remoteDisplays.count == 2 && host.remoteDisplays.count == 2,
+       "upd-fail-keeps-displays");
+    OK(client.sessionUpdatesApplied == 1, "upd-fail-not-applied");
+    OK(client.reachedStreaming && host.reachedStreaming, "upd-fail-keeps-streaming");
+
+    // 本地校验：空规格/超 8 屏不发，Host 不能反向发
+    err = nil;
+    OK([client requestSessionUpdateWithSpecs:@[] error:&err] == 0 &&
+       err.code == M1ControlSessionErrorProtocol, "upd-empty-specs-rejected");
+    OK(client.sessionUpdatesSent == 2, "upd-rejected-not-sent");
+    err = nil;
+    OK([host requestSessionUpdateWithSpecs:specs error:&err] == 0 &&
+       err.code == M1ControlSessionErrorProtocol, "upd-host-cannot-send");
+}
+
 #pragma mark - 窗口布局
 
 @interface FakeWindowLayoutProvider : NSObject <M1WindowLayoutProvider>
@@ -1437,6 +1601,7 @@ int main(void) {
         TestControlSessionInput();
         TestControlSessionKeyframe();
         TestControlSessionTimeSync();
+        TestControlSessionUpdate();
         TestWindowLayout();
         printf("\n=== %d passed, %d failed ===\n", gPass, gFail);
         printf("%s\n", gFail == 0 ? "ALL PASS" : "FAILURES");

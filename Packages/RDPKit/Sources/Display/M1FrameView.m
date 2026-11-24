@@ -9,6 +9,7 @@
 #import "P1InputCodec.h"
 #import <CoreImage/CoreImage.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 #include <stdatomic.h>
 
 // 渲染转换队列允许的峰值深度。1080p 转换 p50 ~4.5ms，12 帧在极端突发下
@@ -100,6 +101,9 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 @property (nonatomic, assign) BOOL dragging;
 @property (nonatomic, assign) BOOL rightDragging;
 @property (nonatomic, assign) BOOL otherDragging;
+// 输入法组合中的文本（marked text）：只在本端显示提示层，合成完成才以 text 事件上行。
+@property (nonatomic, copy, nullable) NSAttributedString *markedText;
+@property (nonatomic, strong) CATextLayer *markedLayer;
 @property (nonatomic, assign, readwrite) double lastRenderMs;
 @property (nonatomic, assign, readwrite) double maxRenderMs;
 @property (nonatomic, assign, readwrite) double warmUpMs;
@@ -139,6 +143,17 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
         // 与 M1AspectFitRect 的几何一致：等比适配 + 居中，黑边由 layer 自己补。
         self.layer.contentsGravity = kCAGravityResizeAspect;
         self.layer.magnificationFilter = kCAFilterLinear;
+        // 输入法组合串提示层：layer.contents 会被每帧覆盖，组合串必须放在子层。
+        _markedLayer = [CATextLayer layer];
+        _markedLayer.hidden = YES;
+        _markedLayer.alignmentMode = kCAAlignmentLeft;
+        _markedLayer.wrapped = YES;
+        _markedLayer.fontSize = 16;
+        _markedLayer.foregroundColor = [NSColor whiteColor].CGColor;
+        _markedLayer.backgroundColor = [[NSColor blackColor] colorWithAlphaComponent:0.65].CGColor;
+        _markedLayer.cornerRadius = 3;
+        _markedLayer.contentsScale = 2.0;
+        [self.layer addSublayer:_markedLayer];
         // CIContext 首次转换要编译 GPU 管线，实测 623ms（之后 3.3ms）。和 VT 会话一样，
         // 这是进程内一次性成本，提前到握手期间做掉，否则整段压在首帧上。
         dispatch_async(_renderQueue, ^{ [self warmUpRenderPath]; });
@@ -482,11 +497,28 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 #pragma mark - 输入：键盘
 
 - (void)keyDown:(NSEvent *)event {
+    NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    // 沉浸模式热键先于输入法：Cmd+Opt+F 在中文输入法里也是「切换简繁」，必须先截走。
+    if ((mods & (NSEventModifierFlagCommand | NSEventModifierFlagOption)) ==
+        (NSEventModifierFlagCommand | NSEventModifierFlagOption) &&
+        [[event.charactersIgnoringModifiers lowercaseString] isEqualToString:@"f"] &&
+        self.onToggleImmersive) {
+        self.onToggleImmersive();
+        return;
+    }
     if (self.closesOnEscape && event.keyCode == 53) {
         if (self.onCloseRequest) self.onCloseRequest();
         return;
     }
     NSDictionary *flags = [self syncModifierStateIfNeeded];
+    // cmd/ctrl/opt 组合按快捷键处理：不发 unicode（否则会把快捷键字符打进远端文本），
+    // 也不给输入法（组合阶段没有 IME 语义）。
+    if (mods & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption)) {
+        [self emitInputEvent:P1MakeKeyEvent(self.displayID, event.keyCode, nil, flags)];
+        return;
+    }
+    // 普通键入先交给输入法（拼音/日文/emoji）：组合中的按键不上行，上屏时走 text。
+    if ([self.inputContext handleEvent:event]) return;
     [self emitInputEvent:P1MakeKeyEvent(self.displayID, event.keyCode,
                                         M1PrintableCharacters(event), flags)];
 }
@@ -498,6 +530,110 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 
 - (void)flagsChanged:(NSEvent *)event {
     [self syncModifierStateIfNeeded];
+}
+
+#pragma mark - 输入法（NSTextInputClient，FR-06）
+
+- (void)setMarkedText:(id)string selectedRange:(NSRange)selectedRange
+       replacementRange:(NSRange)replacementRange {
+    if ([string isKindOfClass:[NSAttributedString class]]) {
+        self.markedText = string;
+    } else if ([string isKindOfClass:[NSString class]] && [(NSString *)string length] > 0) {
+        self.markedText = [[NSAttributedString alloc] initWithString:string];
+    } else {
+        self.markedText = nil;
+    }
+    [self updateMarkedLayer];
+}
+
+- (void)unmarkText {
+    self.markedText = nil;
+    [self updateMarkedLayer];
+}
+
+- (BOOL)hasMarkedText { return self.markedText.length > 0; }
+
+- (NSRange)markedRange {
+    return self.markedText.length > 0 ? NSMakeRange(0, self.markedText.length)
+                                      : NSMakeRange(NSNotFound, 0);
+}
+
+- (NSRange)selectedRange { return NSMakeRange(NSNotFound, 0); }
+
+- (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText { return @[]; }
+
+- (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)range
+                                                actualRange:(NSRangePointer)actualRange {
+    return nil;
+}
+
+// 组合串显示在左下角；给输入法候选窗一个锚点（屏幕坐标）。
+- (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
+    NSRect caret = NSMakeRect(NSMinX(self.bounds) + 10, NSMinY(self.bounds) + 10, 1, 22);
+    if (self.window) {
+        NSRect inWindow = [self convertRect:caret toView:nil];
+        return [self.window convertRectToScreen:inWindow];
+    }
+    return caret;
+}
+
+- (NSUInteger)characterIndexForPoint:(NSPoint)point { return 0; }
+
+- (void)doCommandBySelector:(SEL)selector {
+    const char *name = sel_getName(selector);
+    // 组合中 Esc = 取消候选，不能当“退出会话”。
+    if (strcmp(name, "cancelOperation:") == 0) {
+        [self unmarkText];
+        return;
+    }
+    CGKeyCode code = 0xFFFF;
+    if (strcmp(name, "insertNewline:") == 0) code = 36;
+    else if (strcmp(name, "insertTab:") == 0) code = 48;
+    else if (strcmp(name, "deleteBackward:") == 0) code = 51;
+    else if (strcmp(name, "deleteForward:") == 0) code = 117;
+    else if (strcmp(name, "moveLeft:") == 0) code = 123;
+    else if (strcmp(name, "moveRight:") == 0) code = 124;
+    else if (strcmp(name, "moveDown:") == 0) code = 125;
+    else if (strcmp(name, "moveUp:") == 0) code = 126;
+    if (code == 0xFFFF) return;   // 其余编辑命令没有远端语义，丢弃
+    NSDictionary *flags = [self syncModifierStateIfNeeded];
+    [self emitInputEvent:P1MakeKeyEvent(self.displayID, code, nil, flags)];
+}
+
+// 组合完成：整串文本一次上行，Host 侧用 unicode 直接注入（不经 Host 输入法）。
+- (void)insertText:(id)string replacementRange:(NSRange)replacementRange {
+    NSString *text = nil;
+    if ([string isKindOfClass:[NSAttributedString class]]) {
+        text = [(NSAttributedString *)string string];
+    } else if ([string isKindOfClass:[NSString class]]) {
+        text = string;
+    }
+    [self unmarkText];
+    if (text.length == 0) return;
+    NSDictionary *flags = [self syncModifierStateIfNeeded];
+    [self emitInputEvent:P1MakeTextEvent(self.displayID, text, flags)];
+}
+
+- (void)updateMarkedLayer {
+    if (self.markedText.length == 0) {
+        self.markedLayer.hidden = YES;
+        self.markedLayer.string = nil;
+        return;
+    }
+    self.markedLayer.hidden = NO;
+    self.markedLayer.string = self.markedText;
+    CGFloat maxW = MAX(120.0, NSWidth(self.bounds) - 20.0);
+    CGSize size = [self.markedText size];
+    CGFloat w = MIN(maxW, size.width + 16.0);
+    CGFloat h = MAX(24.0, size.height + 8.0);
+    self.markedLayer.frame = CGRectMake(NSMinX(self.bounds) + 10,
+                                        NSMinY(self.bounds) + 10, w, h);
+    if (self.window) self.markedLayer.contentsScale = self.window.backingScaleFactor;
+}
+
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    [self updateMarkedLayer];
 }
 
 @end

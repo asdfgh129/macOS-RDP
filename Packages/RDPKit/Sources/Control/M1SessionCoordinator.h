@@ -61,6 +61,11 @@ NSString *M1HostSessionPhaseName(M1HostSessionPhase phase);
 - (BOOL)createVirtualDisplays:(NSArray<NSDictionary *> *)specs
                         error:(NSError * _Nullable * _Nullable)error
     M1_SWIFT_KEEP_ERROR NS_SWIFT_NAME(createVirtualDisplays(_:error:));
+// FR-07：会话内事务换屏。实现必须先建好新屏并确认可用，再销毁旧屏；
+// 任一步失败都要只清掉新屏、保留旧屏（会话不中断）。成功后 createdDisplayIDs 返回新列表。
+- (BOOL)replaceVirtualDisplays:(NSArray<NSDictionary *> *)specs
+                         error:(NSError * _Nullable * _Nullable)error
+    M1_SWIFT_KEEP_ERROR NS_SWIFT_NAME(replaceVirtualDisplays(_:error:));
 - (NSArray<NSNumber *> *)createdDisplayIDs NS_SWIFT_NAME(createdDisplayIDs());
 - (BOOL)snapshotAndDisablePhysicalExcept:(NSArray<NSNumber *> *)keepIDs
                                    error:(NSError * _Nullable * _Nullable)error
@@ -106,6 +111,13 @@ NSString *M1HostSessionPhaseName(M1HostSessionPhase phase);
 // 现场接管（二级 fail-safe 或一级手势缓冲到期）：立即走断开，不等远程确认。
 - (BOOL)takeoverNowError:(NSError * _Nullable * _Nullable)error
     NS_SWIFT_NAME(takeoverNow());
+
+// FR-07 会话内换屏（PROTOCOL §3.2）：只在 STREAMING 态可用。
+// 事务性：驱动先建新屏、确认可用后才销毁旧屏；失败时旧屏与管线保持原样，会话不中断。
+// 成功后 createdDisplayIDs/specsSummary 更新为新值，调用方据此重建帧管线与输入坐标。
+- (BOOL)applySpecs:(NSArray<NSDictionary *> *)specs
+             error:(NSError * _Nullable * _Nullable)error
+    M1_SWIFT_KEEP_ERROR NS_SWIFT_NAME(applySpecs(_:error:));
 
 @end
 

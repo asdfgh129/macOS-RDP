@@ -102,6 +102,24 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 //   · 事件已过 P1InputCodec 校验（kind/坐标/键码/flags 合法）与 1000 event/s 限速；
 //   · 回调在控制收包队列上，注入动作若可能阻塞需自行切队列。
 - (void)controlSession:(M1ControlSession *)session didReceiveInputEvent:(NSDictionary *)event;
+
+// Host 侧：收到 session-update（FR-07 动态改分辨率/屏数）。
+//   在控制收包队列上同步调用；成功返回新的 displays[]（每项 displayID/w/h），
+//   失败返回 nil 并把错误写进 error（userInfo[@"code"] 可选，如 CREATE_FAILED）。
+//   **失败不得掀掉会话**：旧的屏与管线必须原样可用，Host 回 ok:false 而已。
+//   未实现该回调时 M1ControlSession 直接回 ok:false（error.code="UPDATE_UNSUPPORTED"）。
+- (NSArray<NSDictionary *> * _Nullable)controlSession:(M1ControlSession *)session
+                                 applySessionUpdateSpecs:(NSArray<NSDictionary *> *)specs
+                                                  error:(NSError * _Nullable * _Nullable)error;
+
+// Client 侧：session-update 的结果（Host 事务执行完毕）。
+//   ok=YES 时 displays 为新的屏表（同时已写入 remoteDisplays）；ok=NO 时会话仍可用，
+//   detail 说明失败原因，调用方应保持当前窗口/解码器不变。
+- (void)controlSession:(M1ControlSession *)session
+ didCompleteSessionUpdate:(int64_t)updateID
+                     ok:(BOOL)ok
+               displays:(NSArray<NSDictionary *> *)displays
+            errorDetail:(nullable NSString *)detail;
 @end
 
 @interface M1ControlSession : NSObject <M1ControlChannelDelegate>
@@ -181,6 +199,18 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 @property (nonatomic, readonly) int64_t clockOffsetUs;   // host epoch - client epoch
 @property (nonatomic, readonly) double timeSyncRttMs;    // 当前 offset 样本的往返时延
 @property (nonatomic, readonly) NSUInteger timeSyncSamples;
+
+#pragma mark - 动态协商（FR-07，PROTOCOL §3.2）
+
+// Client：请求 Host 换屏（分辨率/屏数）。只在 STREAMING 态可用；返回 updateID（>0），
+// 失败返回 0 并填 error（INVALID_STATE / 规格非法）。结果异步走
+// controlSession:didCompleteSessionUpdate:ok:displays:errorDetail:。
+// 不做本地乐观应用：新屏建好之前旧窗口必须继续显示。
+- (int64_t)requestSessionUpdateWithSpecs:(NSArray<NSDictionary *> *)specs
+                                   error:(NSError * _Nullable * _Nullable)error;
+
+@property (nonatomic, readonly) NSUInteger sessionUpdatesSent;
+@property (nonatomic, readonly) NSUInteger sessionUpdatesApplied;   // Host 成功换屏次数
 
 @end
 

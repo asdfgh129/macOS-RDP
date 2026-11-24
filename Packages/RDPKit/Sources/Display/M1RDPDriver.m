@@ -197,6 +197,74 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     return YES;
 }
 
+// FR-07 事务换屏：新 VDManager 先建齐并确认 active，才销毁旧管理器。
+// 失败只销毁新建的这一套；旧 _vd 原样保留（调用方此时还没有新管线）。
+- (BOOL)replaceVirtualDisplays:(NSArray<NSDictionary *> *)specs
+                         error:(NSError **)error {
+    if (P0VWindowServerHung()) {
+        if (error) *error = M1DrvErr(M1RDPDriverErrorWindowServerHung,
+            @"WindowServer 已挂起，禁止换屏");
+        return NO;
+    }
+    if (specs.count == 0) {
+        if (error) *error = M1DrvErr(M1RDPDriverErrorNoDisplays, @"无 display 规格");
+        return NO;
+    }
+    VDManager *old = _vd;
+    if (!old) {
+        if (error) *error = M1DrvErr(M1RDPDriverErrorNoDisplays,
+            @"会话内没有可替换的虚拟屏");
+        return NO;
+    }
+
+    NSDictionary *policy = P0OSPolicy();
+    BOOL conservative = [policy[@"conservativeFirst"] boolValue];
+    int modeWaitMs = [policy[@"modeWaitMs"] intValue];
+
+    // 13 上的冻结窗口与建屏路径相同：新屏创建 + 旧屏销毁都在窗口内。
+    BOOL quiesce = M1ShouldQuiesceScreenSharing();
+    if (quiesce) {
+        P0VStopScreenSharingAgents();
+        self.screenSharingQuiesced = YES;
+    }
+
+    VDManager *fresh = [[VDManager alloc] initWithConfigs:specs
+                                          identityOffset:[VDManager savedIdentityOffset]
+                                       conservativeFirst:conservative];
+    BOOL ok = [fresh createAll] && [fresh waitUntilUsableTimeoutMs:8000];
+    if (ok && conservative) {
+        [fresh waitUntilModeMatchesTimeoutMs:modeWaitMs conservative:YES];
+        [fresh promoteToTarget];
+        [fresh waitUntilModeMatchesTimeoutMs:modeWaitMs conservative:NO];
+    }
+    if (ok) {
+        // 自检：新屏必须真的进了 active list（可见），否则不能拿它替换旧屏。
+        NSArray *active = P0VActiveDisplayIDs();
+        for (NSNumber *n in fresh.displayIDs) {
+            if (![active containsObject:n]) { ok = NO; break; }
+        }
+    }
+    if (!ok) {
+        [fresh destroyAll];
+        if (quiesce) {
+            P0VResumeScreenSharingAgents();
+            self.screenSharingQuiesced = NO;
+        }
+        if (error) *error = M1DrvErr(M1RDPDriverErrorNoDisplays,
+            @"换屏失败：新虚拟屏建不起来或不可见（旧屏未动）");
+        return NO;
+    }
+
+    [old destroyAll];
+    _vd = fresh;
+    if (quiesce) {
+        P0VResumeScreenSharingAgents();
+        self.screenSharingQuiesced = NO;
+    }
+    self.lastActiveDisplayIDs = P0VActiveDisplayIDs();
+    return YES;
+}
+
 #pragma mark - 兜底护盾
 
 - (BOOL)prepareSessionShieldError:(NSError **)error {

@@ -45,6 +45,13 @@ NSDictionary *P1MakeScrollEvent(uint32_t displayID,
 // 修饰键全量同步事件；displayID 记为 0，不参与屏坐标。
 NSDictionary *P1MakeFlagsEvent(NSDictionary * _Nullable flags);
 
+// IME 提交的成串文本（本机组合、上屏即定稿）；Host 直接按 unicode 注入，
+// 不再走键码，避免组合串被 Host 侧输入法二次解释。displayID 参与屏坐标无关，
+// 但保留以供将来按屏文本路由。
+NSDictionary *P1MakeTextEvent(uint32_t displayID,
+                              NSString *text,
+                              NSDictionary * _Nullable flags);
+
 // 事件 → 完整控制消息（type:"input"，含 v/seq/event）
 NSDictionary *P1MakeInputMessage(int64_t seq, NSDictionary *event);
 
