@@ -1626,7 +1626,19 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 **P2.3 渲染基线复核（本机 Sequoia，Qoder 隐藏 + mds 暂停 + `nice -20`，离屏 8 轮，min/p50/p95 ms）**：
 - vga 2.2/2.35/2.7；720p 3.2/3.35/3.7；1080p 5.1/5.45/6.2；ultrawide 10.2/13.3/17.0；8 轮 `ALL PASS`。
 - 与 §5.38（vga 2.2/2.3/2.4、720p 3.2/3.3/5.0、1080p 5.4/5.5/6.1、ultrawide 13.5/13.9/21.1）一致，无回退。
-- 对照：Qoder 可见时首轮 vga **35.0ms** 超出 25ms 护栏；隐藏后立即回到 2.x ms，再次确认该指标对前台负载敏感，基线须在隔离负载下取。
+- 对照：Qoder 可见时首轮 vga **35.0ms** 超出 25ms 护栏；隐藏后立即回到 2.x ms，再次确认该指标对前台负载敏感，基线取数时 Qoder 不可前台可见（取数条件的进一步收敛见 §5.41）。
+
+### 5.41 P2.3 基线取数条件收敛：Qoder 仅最小化（2026-11-24 21:2x）
+
+**缘起**：§5.38/§5.40 的基线要求「Qoder 隐藏 + mds 暂停」，日常不可执行（Qoder 无法关闭或长期隐藏，索引也不宜长期暂停）。按「仅最小化后结果可接受即视同无 Qoder 负载」重新取数。
+
+**环境**：本机 Sequoia 15.5；Qoder 窗口最小化（`AXMinimized=true`，进程未挂起——测试时两个主进程采样 `%cpu` 17.1 / 7.8，仍在后台运行）；mds/mds_stores/mdsync 均未暂停；Finder 正常；离屏轮 `nice -20`；`render_selftest` 由 `M1-Skeleton/build_render_selftest.sh` 在新 HEAD 重新构建。
+
+**离屏 `render_selftest` 8 轮（每档 n=8，min/p50/p95 ms）**：
+- vga 2.30/2.50/2.77；720p 3.10/3.65/4.60；1080p 5.30/5.85/7.50；ultrawide 13.40/14.80/17.15；**8/8 `ALL PASS`**，各档余量充足（最紧的 ultrawide max 17.6 vs 护栏 100ms）。
+- 与 §5.40 隔离口径（2.2/2.35/2.7、3.2/3.35/3.7、5.1/5.45/6.2、10.2/13.3/17.0）相比 p50 差 ≤0.5ms，结论不变。
+
+**决定**：P2.3 基线取数条件定为「Qoder 最小化即可」，不再要求隐藏 Qoder 或暂停 mds；仅当 vga 出现 10ms 级异常时才回退到隐藏 + 暂停做对照。Qoder 前台可见时仍不可取数（§5.40 对照 35.0ms）。
 
 ## 6. 状态汇总
 
@@ -1643,6 +1655,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
+- v0.71-draft 2026-11-24 21:2x：**P2.3 基线取数条件收敛（§5.41）**。Qoder 仅最小化（进程未挂起、mds 未暂停）8 轮离屏：vga 2.3/2.5/2.77、720p 3.1/3.65/4.6、1080p 5.3/5.85/7.5、ultrawide 13.4/14.8/17.15ms，8/8 ALL PASS，与隔离口径 p50 差 ≤0.5ms；此后基线只需最小化 Qoder。
 - v0.70-draft 2026-11-24 21:1x：**双屏真注入 + P2.3 基线复核（§5.40）**。Tahoe host `--keep-main --inject real` × Sequoia client 双窗口：host input 15/0、光标 (10,10)→(4133,395)，client 上送 15、0 失败，1273/1273 解码上屏、0 丢帧、p50/p95 26.5/155.5ms；恢复与窗口布局正常。P2.3 隔离负载 8 轮：vga 2.2/2.35/2.7、720p 3.2/3.35/3.7、1080p 5.1/5.45/6.2、ultrawide 10.2/13.3/17.0，ALL PASS，与 §5.38 一致；Qoder 可见时 vga 35ms 超护栏，再次证明负载敏感性。
 - v0.69-draft 2026-11-24 21:0x：**M2 多屏双机实测（§5.39）**。Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，1280×720×2@15，`3e18538`）：keep-main 档 client 138/138 解码上屏、0 丢帧、`c09=skipped-keep-main`、物理屏恢复；全独占档 `c09=verified`、client 981/981 解码上屏、0 丢帧、p50/p95 129.5/308.5ms、控制间隔 1.16s、窗口布局 7/7 恢复、物理屏 2 块在位。PNG 按 `frame-d<displayID>-` 命名且两屏内容非黑。备注：host 屏睡会令 CG active=0 阻断建屏（caffeinate 唤醒）；重定向日志需 `script -q /dev/null` 才实时。
 - v0.68-draft 2026-11-23 23:1x：**P2.3 渲染基线复测（§5.38）**。Qoder/Screen Sharing 隐藏 + mds 暂停后：离屏 8 轮 min/p50/p95 为 vga 2.2/2.3/2.4、720p 3.2/3.3/5.0、1080p 5.4/5.5/6.1、ultrawide 13.5/13.9/21.1ms（ALL PASS，与 v0.61 一致）；真实 client 1080p20 本机镜像环回用 `M1_CAPTURE_BACKEND=cg`（本机 SCK HiDPI 仅 3–5fps）后采集稳定 20fps，client 579/579 解出并上屏、0 丢帧 0 积压、p50/p95 81.5/144.5ms ⇒ 渲染下限无回退；WAN mirror 积压确认为本机负载。另确认隐藏/被遮挡的 client 窗口不绘制（r1 `渲染=0` 属 AppKit 遮挡态）。
