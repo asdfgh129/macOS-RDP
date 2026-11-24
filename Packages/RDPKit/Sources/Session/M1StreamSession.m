@@ -349,15 +349,17 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     if (self.onInputEvent) self.onInputEvent(event);
 }
 
-- (void)controlSessionDidRequestKeyframe:(M1ControlSession *)session {
-    if (self.onKeyframeRequest) self.onKeyframeRequest();
+- (void)controlSession:(M1ControlSession *)session
+    didRequestKeyframeForDisplay:(uint32_t)displayID {
+    if (self.onKeyframeRequest) self.onKeyframeRequest(displayID);
 }
 
 - (void)controlSession:(M1ControlSession *)session
- didRequestFragmentsForFrame:(uint32_t)frameSeq
+ didRequestFragmentsForDisplay:(uint32_t)displayID
+             frameSeq:(uint32_t)frameSeq
              fragCount:(uint16_t)fragCount
                indices:(NSIndexSet *)indices {
-    if (self.onFrameNack) self.onFrameNack(frameSeq, fragCount, indices);
+    if (self.onFrameNack) self.onFrameNack(displayID, frameSeq, fragCount, indices);
 }
 
 - (NSArray<NSDictionary *> *)controlSession:(M1ControlSession *)session
@@ -380,44 +382,92 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 #pragma mark - M1StreamClientNode
 
-@implementation M1StreamClientNode
+@implementation M1StreamClientNode {
+    // displayID → 串行帧队列。每屏独立解码，互不阻塞（首帧建 VT 会话可达 1s）。
+    NSMutableDictionary<NSNumber *, dispatch_queue_t> *_frameQueues;
+    // 出现第二块屏后 PNG 文件名带 displayID，避免不同屏的同序号帧互相覆盖。
+    BOOL _multiDisplay;
+}
 
 - (instancetype)init {
     if ((self = [super init])) {
         _savedPaths = [NSMutableArray array];
+        _receivers = [NSMutableDictionary dictionary];
+        _frameQueues = [NSMutableDictionary dictionary];
         _saveFrames = 5;
         _saveQueue = dispatch_queue_create("m1.stream.png", DISPATCH_QUEUE_SERIAL);
-        _frameQueue = dispatch_queue_create("m1.stream.frames", DISPATCH_QUEUE_SERIAL);
     }
     return self;
 }
 
-- (void)prepareReceiver {
+- (M1FrameReceiver *)receiverForDisplayID:(uint32_t)displayID {
+    @synchronized (self) { return self.receivers[@(displayID)]; }
+}
+
+- (NSArray<NSNumber *> *)receiverDisplayIDs {
+    @synchronized (self) {
+        return [self.receivers.allKeys sortedArrayUsingSelector:@selector(compare:)];
+    }
+}
+
+- (dispatch_queue_t)frameQueueForDisplayID:(uint32_t)displayID {
+    NSNumber *key = @(displayID);
+    @synchronized (self) {
+        dispatch_queue_t q = _frameQueues[key];
+        if (!q) {
+            q = dispatch_queue_create("m1.stream.frames", DISPATCH_QUEUE_SERIAL);
+            _frameQueues[key] = q;
+        }
+        return q;
+    }
+}
+
+// 懒建：第一片到达才知道帧头 displayID。创建后立即登记，后续分片复用同一解码器。
+- (M1FrameReceiver *)ensureReceiverForDisplayID:(uint32_t)displayID {
+    M1FrameReceiver *rx = nil;
+    @synchronized (self) {
+        rx = self.receivers[@(displayID)];
+        if (rx) return rx;
+    }
+
     __weak typeof(self) weakSelf = self;
-    self.receiver = [[M1FrameReceiver alloc]
+    rx = [[M1FrameReceiver alloc]
         initWithOnFrame:^(CVPixelBufferRef pb, uint32_t frameSeq, uint64_t capturedAtUs) {
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
             double now = M1StreamNowMs();
-            if (self.firstFrameMs == 0) self.firstFrameMs = now;
-            self.lastFrameMs = now;
-            self.decodedWidth = (int32_t)CVPixelBufferGetWidth(pb);
-            self.decodedHeight = (int32_t)CVPixelBufferGetHeight(pb);
-            if (self.onPixelBuffer) self.onPixelBuffer(pb, frameSeq, capturedAtUs);
+            BOOL multi;
+            @synchronized (self) {
+                if (self.firstFrameMs == 0) self.firstFrameMs = now;
+                self.lastFrameMs = now;
+                self.decodedWidth = (int32_t)CVPixelBufferGetWidth(pb);
+                self.decodedHeight = (int32_t)CVPixelBufferGetHeight(pb);
+                multi = self->_multiDisplay;
+            }
+            if (self.onPixelBuffer) self.onPixelBuffer(displayID, pb, frameSeq, capturedAtUs);
 
             // PNG 编码离开接收/解码线程：实测 6 张同步 PNG 让心跳断了 4.5s。
-            if (self.outdir.length > 0 && self.reservedSaves < self.saveFrames &&
-                !(self.hasSavedSeq && frameSeq == self.lastSavedSeq)) {
-                self.reservedSaves += 1;
-                self.lastSavedSeq = frameSeq;
-                self.hasSavedSeq = YES;
+            BOOL reserve = NO;
+            if (self.outdir.length > 0) {
+                @synchronized (self) {
+                    if (self.reservedSaves < self.saveFrames) {
+                        self.reservedSaves += 1;
+                        reserve = YES;
+                    }
+                }
+            }
+            if (reserve) {
                 CVPixelBufferRef held = CVPixelBufferRetain(pb);
-                NSString *name = [NSString stringWithFormat:@"frame-%03u.png", frameSeq];
+                NSString *name = multi
+                    ? [NSString stringWithFormat:@"frame-d%u-%03u.png", displayID, frameSeq]
+                    : [NSString stringWithFormat:@"frame-%03u.png", frameSeq];
                 NSString *path = [self.outdir stringByAppendingPathComponent:name];
                 dispatch_async(self.saveQueue, ^{
                     if (M1SavePixelBufferPNG(held, path)) {
-                        self.savedFrames += 1;
-                        [self.savedPaths addObject:path];
+                        @synchronized (self) {
+                            self.savedFrames += 1;
+                            [self.savedPaths addObject:path];
+                        }
                     }
                     CVPixelBufferRelease(held);
                 });
@@ -426,47 +476,77 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
         onNeedKeyframe:^{
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
-            self.keyframeRequests += 1;
+            @synchronized (self) { self.keyframeRequests += 1; }
             NSError *kfErr = nil;
-            if ([self.session requestKeyframeWithError:&kfErr]) {
-                self.keyframeRequestsSent += 1;
-                [self.receiver noteKeyframeRequestSent];
+            if ([self.session requestKeyframeForDisplay:displayID error:&kfErr]) {
+                @synchronized (self) { self.keyframeRequestsSent += 1; }
+                [[self receiverForDisplayID:displayID] noteKeyframeRequestSent];
             } else if (kfErr.code != M1ControlSessionErrorRateLimited) {
-                self.keyframeRequestFailures += 1;
+                @synchronized (self) { self.keyframeRequestFailures += 1; }
             }
         }];
+
     // 缺 1~3 片先走定向补片，比整帧 IDR 快一个量级；整帧零分片改请求整帧重发。
-    self.receiver.onNeedRepair = ^(uint32_t frameSeq, uint16_t fragCount,
-                                   NSIndexSet *missingIndices, BOOL keyframe) {
+    rx.onNeedRepair = ^(uint32_t frameSeq, uint16_t fragCount,
+                        NSIndexSet *missingIndices, BOOL keyframe) {
         __strong typeof(weakSelf) self = weakSelf;
         if (!self) return;
         (void)keyframe;
-        self.repairRequests += 1;
+        @synchronized (self) { self.repairRequests += 1; }
         NSError *nackErr = nil;
         BOOL sent;
         if (missingIndices.count == 0) {
-            self.repairWholeFrameRequests += 1;
-            sent = [self.session requestWholeFrame:frameSeq error:&nackErr];
+            @synchronized (self) { self.repairWholeFrameRequests += 1; }
+            sent = [self.session requestWholeFrameForDisplay:displayID
+                                                    frameSeq:frameSeq
+                                                       error:&nackErr];
         } else {
-            sent = [self.session requestFragmentsForFrameSeq:frameSeq fragCount:fragCount
-                                                     indices:missingIndices error:&nackErr];
+            sent = [self.session requestFragmentsForDisplay:displayID
+                                                   frameSeq:frameSeq
+                                                   fragCount:fragCount
+                                                     indices:missingIndices
+                                                       error:&nackErr];
         }
-        if (sent) self.repairRequestsSent += 1;
+        if (sent) {
+            @synchronized (self) { self.repairRequestsSent += 1; }
+        }
     };
+
+    @synchronized (self) {
+        if (!self.receivers[@(displayID)]) {
+            self.receivers[@(displayID)] = rx;
+            if (!self.receiver) self.receiver = rx;
+            if (self.receivers.count > 1) _multiDisplay = YES;
+        }
+        return self.receivers[@(displayID)];
+    }
 }
 
-- (void)flushFrames { dispatch_sync(self.frameQueue, ^{}); }
-- (void)flushSaves  { dispatch_sync(self.saveQueue, ^{}); }
+- (void)flushFrames {
+    NSArray<dispatch_queue_t> *queues;
+    @synchronized (self) { queues = _frameQueues.allValues; }
+    for (dispatch_queue_t q in queues) dispatch_sync(q, ^{});
+}
+
+- (void)flushSaves { dispatch_sync(self.saveQueue, ^{}); }
 
 - (void)onFrameDatagram:(NSData *)datagram {
-    // 绝不在这里做重组/解码：首帧建 VT 解码会话实测 1092ms，同步做会堵住控制心跳。
-    dispatch_async(self.frameQueue, ^{
+    // 先解帧头拿 displayID，再投到该屏的帧队列。绝不在这里做重组/解码：
+    // 首帧建 VT 解码会话实测 1092ms，同步做会堵住控制心跳。
+    P1FrameHeader hdr;
+    uint32_t displayID = 0;
+    if (P1UnpackFrameHeader(datagram, &hdr, NULL)) displayID = hdr.displayID;
+    dispatch_queue_t q = [self frameQueueForDisplayID:displayID];
+    dispatch_async(q, ^{
+        M1FrameReceiver *rx = [self ensureReceiverForDisplayID:displayID];
         double t0 = M1StreamNowMs();
-        [self.receiver acceptDatagram:datagram error:NULL];
+        [rx acceptDatagram:datagram error:NULL];
         double dt = M1StreamNowMs() - t0;
-        if (dt > self.maxAcceptBlockMs) {
-            self.maxAcceptBlockMs = dt;
-            self.maxAcceptBlockAtMs = self.streamStartMs > 0 ? t0 - self.streamStartMs : 0;
+        @synchronized (self) {
+            if (dt > self.maxAcceptBlockMs) {
+                self.maxAcceptBlockMs = dt;
+                self.maxAcceptBlockAtMs = self.streamStartMs > 0 ? t0 - self.streamStartMs : 0;
+            }
         }
     });
 }

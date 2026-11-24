@@ -197,6 +197,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     __block M1SessionCoordinator *coord = nil;
     __block BOOL exclusiveEnded = NO;
     __block CGDirectDisplayID virtualID = 0;
+    __block NSArray<NSDictionary *> *virtualDisplays = @[];
     __block NSUInteger virtualW = 0, virtualH = 0;
     __block NSString *c09 = @"not-started";
     void (^endExclusive)(void) = ^{
@@ -260,13 +261,14 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
                                       @"w": i < conv.count ? conv[i][@"width"] : @0,
                                       @"h": i < conv.count ? conv[i][@"height"] : @0,
                                       @"synthetic": @NO}];
-            printf("  [独占] 虚拟屏 %s（%lux%lu）C-09=%s\n",
+            virtualDisplays = displays;
+            printf("  [独占] 虚拟屏 %s（首屏 %lux%lu）C-09=%s\n",
                    ids.description.UTF8String, (unsigned long)virtualW, (unsigned long)virtualH, c09.UTF8String);
             return displays;
         };
         host.onAttemptFailed = ^{
             endExclusive();
-            virtualID = 0; virtualW = 0; virtualH = 0;
+            virtualID = 0; virtualDisplays = @[]; virtualW = 0; virtualH = 0;
         };
     }
 
@@ -288,49 +290,110 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         return NO;
     }
 
-    CGDirectDisplayID captureID = virtualID ?: displayID;
-    M1FramePipelineConfig *cfg = [M1FramePipelineConfig new];
-    cfg.targetFps = fps;
-    cfg.outputWidth = outW;
-    cfg.outputHeight = outH;
+    // 要推流的屏：独占会话按新建虚拟屏全量（FR-01 N 屏）；镜像诊断只推 --display 一块。
+    NSArray<NSDictionary *> *streamDisplays = nil;
+    if (exclusive && virtualDisplays.count > 0) {
+        streamDisplays = virtualDisplays;
+    } else {
+        streamDisplays = @[ @{ @"displayID": @(displayID) } ];
+    }
+
     __block int errCount = 0;
-    M1FramePipeline *pipe = [[M1FramePipeline alloc] initWithDisplayID:captureID config:cfg
-        sink:host onError:^(NSError *e) {
+    NSMutableArray<M1FramePipeline *> *pipes = [NSMutableArray array];
+    NSMutableDictionary<NSNumber *, M1FramePipeline *> *pipeByDisplay = [NSMutableDictionary dictionary];
+    for (NSDictionary *disp in streamDisplays) {
+        NSNumber *didNum = disp[@"displayID"];
+        if (![didNum isKindOfClass:[NSNumber class]]) continue;
+        uint32_t did = didNum.unsignedIntValue;
+        if (did == 0 || pipeByDisplay[didNum]) continue;
+        M1FramePipelineConfig *cfg = [M1FramePipelineConfig new];
+        cfg.targetFps = fps;
+        cfg.outputWidth = outW;
+        cfg.outputHeight = outH;
+        M1FramePipeline *pipe = [[M1FramePipeline alloc] initWithDisplayID:(CGDirectDisplayID)did
+                                                                    config:cfg sink:host
+                                                                   onError:^(NSError *e) {
             errCount += 1;
             if (errCount <= 3) fprintf(stderr, "  [管线错误] %s\n", e.localizedDescription.UTF8String);
         }];
-    if (![pipe start:&err]) {
-        printf("✗ 管线启动失败: %s\n", err.localizedDescription.UTF8String);
+        if (![pipe start:&err]) {
+            printf("✗ 管线启动失败 displayID=%u: %s\n", did, err.localizedDescription.UTF8String);
+            for (M1FramePipeline *p in pipes) [p stop];
+            endExclusive(); [host shutdown];
+            return NO;
+        }
+        [pipes addObject:pipe];
+        pipeByDisplay[didNum] = pipe;
+        printf("推流开始：displayID=%u  %dx%d  %dms @ %dfps\n",
+               did, pipe.pixelWidth, pipe.pixelHeight, durationMs, fps);
+    }
+    if (pipes.count == 0) {
+        printf("✗ 没有可推流的显示\n");
         endExclusive(); [host shutdown];
         return NO;
     }
-    printf("推流开始：displayID=%u  %lux%u  %dms @ %dfps\n",
-           captureID, pipe.pixelWidth, pipe.pixelHeight, durationMs, fps);
 
-    __block CFAbsoluteTime lastKeyframe = 0;
-    host.onKeyframeRequest = ^{
+    // 请求按屏路由；displayID=0 是旧版客户端（单屏/全部屏）。
+    // 900ms 合并窗口也按屏独立：一块屏的在途 IDR 不应吞掉另一块屏的请求。
+    NSMutableDictionary<NSNumber *, NSNumber *> *lastKeyframeByDisplay = [NSMutableDictionary dictionary];
+    host.onKeyframeRequest = ^(uint32_t displayID) {
+        NSArray<M1FramePipeline *> *targets = pipes;
+        if (displayID != 0) {
+            M1FramePipeline *target = pipeByDisplay[@(displayID)];
+            if (!target) return;
+            targets = @[ target ];
+        }
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-        if (now - lastKeyframe < 0.9) return;
-        lastKeyframe = now;
-        [pipe requestKeyframe];
+        NSNumber *key = @(displayID);
+        @synchronized (lastKeyframeByDisplay) {
+            NSNumber *last = lastKeyframeByDisplay[key];
+            if (last && now - last.doubleValue < 0.9) return;
+            lastKeyframeByDisplay[key] = @(now);
+        }
+        for (M1FramePipeline *p in targets) [p requestKeyframe];
     };
-    host.onFrameNack = ^(uint32_t frameSeq, uint16_t fragCount, NSIndexSet *indices) {
+    host.onFrameNack = ^(uint32_t displayID, uint32_t frameSeq,
+                         uint16_t fragCount, NSIndexSet *indices) {
         (void)fragCount;
-        NSError *re = nil;
-        NSUInteger n = indices.count == 0
-            ? [pipe.sender resendAllFragmentsForFrameSeq:frameSeq error:&re]
-            : [pipe.sender resendFragmentsForFrameSeq:frameSeq indices:indices error:&re];
-        if (n == 0 && re) fprintf(stderr, "  [补片] %s\n", re.localizedDescription.UTF8String);
+        NSArray<M1FramePipeline *> *targets = pipes;
+        if (displayID != 0) {
+            M1FramePipeline *target = pipeByDisplay[@(displayID)];
+            if (!target) return;
+            targets = @[ target ];
+        }
+        for (M1FramePipeline *p in targets) {
+            NSError *re = nil;
+            NSUInteger n = indices.count == 0
+                ? [p.sender resendAllFragmentsForFrameSeq:frameSeq error:&re]
+                : [p.sender resendFragmentsForFrameSeq:frameSeq indices:indices error:&re];
+            if (n == 0 && re) fprintf(stderr, "  [补片] displayID=%u: %s\n",
+                                      displayID, re.localizedDescription.UTF8String);
+        }
     };
 
     // 输入回传：record 不真注入（单机环回安全）；real 才 CGEventPost。
+    // 每块屏的 Quartz bounds 作为该 displayID 的坐标基准。
     id<M1EventSink> sink = nil;
     M1RecordingEventSink *recorder = nil;
     if ([inject isEqualToString:@"real"]) sink = [M1CGEventSink new];
     else { recorder = [M1RecordingEventSink new]; sink = recorder; }
     M1InputInjector *injector = [[M1InputInjector alloc] initWithSink:sink];
-    injector.targetDisplayRect = CGRectMake(0, 0,
-        virtualW ?: (specW ?: 1920), virtualH ?: (specH ?: 1080));
+    NSMutableDictionary<NSNumber *, NSValue *> *rects = [NSMutableDictionary dictionary];
+    for (NSDictionary *disp in streamDisplays) {
+        NSNumber *didNum = disp[@"displayID"];
+        if (![didNum isKindOfClass:[NSNumber class]]) continue;
+        CGRect r = CGDisplayBounds((CGDirectDisplayID)didNum.unsignedIntValue);
+        if (!CGRectIsEmpty(r)) rects[didNum] = [NSValue valueWithRect:(NSRect)r];
+    }
+    if (rects.count == 0) {
+        CGRect fallback = CGRectMake(0, 0, virtualW ?: (specW ?: 1920), virtualH ?: (specH ?: 1080));
+        injector.targetDisplayRect = fallback;
+    } else {
+        injector.targetDisplayRect = [rects.allValues.firstObject rectValue];
+    }
+    injector.displayRects = rects;
+    printf("输入目标屏 %lu 块%s\n", (unsigned long)rects.count,
+           rects.count ? "" : "（无 Quartz bounds，回退到原点 rect）");
     __block NSUInteger injectOK = 0, injectFail = 0;
     host.onInputEvent = ^(NSDictionary *event) {
         NSError *ie = nil;
@@ -340,25 +403,44 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
 
     [NSThread sleepForTimeInterval:durationMs / 1000.0];
     [host flushSimulatedHeld];
-    [pipe stop];
+    for (M1FramePipeline *p in pipes) [p stop];
     [host shutdown];
     endExclusive();
 
-    M1FramePipelineStats *ps = pipe.stats;
-    printf("serve: frames captured=%llu encoded=%llu sent=%llu dropped=%llu fragments=%llu\n",
-           ps.framesCaptured, ps.framesEncoded, ps.framesSent, ps.framesDroppedBeforeEncoder,
-           ps.fragmentsSent);
+    uint64_t cap = 0, enc = 0, sent = 0, dropped = 0, fragments = 0;
+    NSMutableArray<NSDictionary *> *displayJSON = [NSMutableArray array];
+    for (M1FramePipeline *p in pipes) {
+        M1FramePipelineStats *s = p.stats;
+        cap += s.framesCaptured;
+        enc += s.framesEncoded;
+        sent += s.framesSent;
+        dropped += s.framesDroppedBeforeEncoder;
+        fragments += s.fragmentsSent;
+        [displayJSON addObject:@{
+            @"displayID": @(p.displayID), @"w": @(p.pixelWidth), @"h": @(p.pixelHeight),
+            @"framesCaptured": @(s.framesCaptured), @"framesEncoded": @(s.framesEncoded),
+            @"framesSent": @(s.framesSent), @"fragmentsSent": @(s.fragmentsSent),
+            @"keyframes": @(s.keyframes),
+        }];
+        printf("serve[%u]: captured=%llu encoded=%llu sent=%llu dropped=%llu key=%llu\n",
+               p.displayID, s.framesCaptured, s.framesEncoded, s.framesSent,
+               s.framesDroppedBeforeEncoder, s.keyframes);
+    }
+    printf("serve: 合计 frames captured=%llu encoded=%llu sent=%llu dropped=%llu fragments=%llu（%lu 屏）\n",
+           cap, enc, sent, dropped, fragments, (unsigned long)pipes.count);
     printf("serve: input ok=%lu fail=%lu record=%lu | 控制到达最大间隔=%.1fms (offset %.1fms)\n",
            (unsigned long)injectOK, (unsigned long)injectFail,
            (unsigned long)recorder.postCount, host.maxControlGapMs, host.maxGapAtOffsetMs);
     if (outPath.length > 0) {
         NSDictionary *json = @{
-            @"framesCaptured": @(ps.framesCaptured), @"framesEncoded": @(ps.framesEncoded),
-            @"framesSent": @(ps.framesSent), @"fragmentsSent": @(ps.fragmentsSent),
+            @"framesCaptured": @(cap), @"framesEncoded": @(enc),
+            @"framesSent": @(sent), @"fragmentsSent": @(fragments),
+            @"framesDroppedBeforeEncoder": @(dropped),
             @"inputOK": @(injectOK), @"inputFail": @(injectFail),
             @"maxControlGapMs": @(host.maxControlGapMs),
             @"maxGapAtOffsetMs": @(host.maxGapAtOffsetMs),
             @"c09": c09,
+            @"displays": displayJSON,
             @"stateLog": host.stateLog ?: @[],
         };
         NSData *data = [NSJSONSerialization dataWithJSONObject:json

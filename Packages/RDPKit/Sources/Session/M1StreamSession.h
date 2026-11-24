@@ -64,10 +64,11 @@ double M1StreamNowMs(void);
 // Host：为 session-start 准备真实显示；nil = 失败，空数组 = 沿用合成占位
 @property (nonatomic, copy, nullable) NSArray<NSDictionary *> *(^displayProvider)(NSDictionary *message,
                                                                               NSError **error);
-// Host：keyframe-request / frame-nack（控制收包队列上调用）
-@property (nonatomic, copy, nullable) void (^onKeyframeRequest)(void);
-@property (nonatomic, copy, nullable) void (^onFrameNack)(uint32_t frameSeq, uint16_t fragCount,
-                                                          NSIndexSet *indices);
+// Host：keyframe-request / frame-nack（控制收包队列上调用）。
+//   displayID 是请求目标屏；0 表示旧版客户端未带（单屏按唯一管线、多屏按全部管线）。
+@property (nonatomic, copy, nullable) void (^onKeyframeRequest)(uint32_t displayID);
+@property (nonatomic, copy, nullable) void (^onFrameNack)(uint32_t displayID, uint32_t frameSeq,
+                                                          uint16_t fragCount, NSIndexSet *indices);
 // 单次接入失败（握手/会话错误）：独占模式必须在此恢复显示
 @property (nonatomic, copy, nullable) void (^onAttemptFailed)(void);
 // Client：session-start 请求的规格；nil = 1920x1080
@@ -112,13 +113,19 @@ double M1StreamNowMs(void);
 
 @interface M1StreamClientNode : M1StreamNode
 
+// 多屏：每块屏（帧头 displayID）一个重组/解码器与一条串行帧队列。
+// receiver 是首块屏的快捷方式，单屏场景等价于旧行为。
 @property (nonatomic, strong, nullable) M1FrameReceiver *receiver;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, M1FrameReceiver *> *receivers;
+@property (nonatomic, readonly, copy) NSArray<NSNumber *> *receiverDisplayIDs;
+- (nullable M1FrameReceiver *)receiverForDisplayID:(uint32_t)displayID
+    NS_SWIFT_NAME(receiver(forDisplayID:));
+
 @property (nonatomic, copy, nullable) NSString *outdir;
 @property (nonatomic, assign) NSUInteger saveFrames;
 @property (nonatomic, assign) NSUInteger savedFrames;
 @property (nonatomic, assign) NSUInteger reservedSaves;
 @property (nonatomic, strong) dispatch_queue_t saveQueue;
-@property (nonatomic, strong) dispatch_queue_t frameQueue;
 @property (nonatomic, assign) uint64_t keyframeRequests;
 @property (nonatomic, assign) uint64_t keyframeRequestsSent;
 @property (nonatomic, assign) uint64_t keyframeRequestFailures;
@@ -134,11 +141,14 @@ double M1StreamNowMs(void);
 @property (nonatomic, assign) int32_t decodedWidth;
 @property (nonatomic, assign) int32_t decodedHeight;
 @property (nonatomic, strong) NSMutableArray<NSString *> *savedPaths;
-// 在帧队列回调；上屏方需自行切主线程
-@property (nonatomic, copy, nullable) void (^onPixelBuffer)(CVPixelBufferRef pb, uint32_t frameSeq,
-                                                            uint64_t capturedAtUs);
+// 在对应屏的帧队列回调；上屏方需自行切主线程。
+// displayID 来自帧头，多屏时据此把画面送到对应窗口。
+@property (nonatomic, copy, nullable) void (^onPixelBuffer)(uint32_t displayID,
+                                                        CVPixelBufferRef pb,
+                                                        uint32_t frameSeq,
+                                                        uint64_t capturedAtUs);
 
-- (void)prepareReceiver;
+// 等待所有屏的帧队列排空（退出前取统计/落盘用）。
 - (void)flushFrames;
 - (void)flushSaves;
 

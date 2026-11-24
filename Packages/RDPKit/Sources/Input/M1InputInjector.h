@@ -46,6 +46,11 @@ NS_ASSUME_NONNULL_BEGIN
 // 目标显示坐标：注入时把归一化坐标映射到该 rect。禁屏后通常是唯一 active 虚拟屏。
 @property (nonatomic, assign) CGRect targetDisplayRect;
 
+// 多屏：displayID → 该屏的 Quartz bounds。命中时优先于 targetDisplayRect；
+// 事件未带 displayID 或表中没有该屏则回退 targetDisplayRect。
+// 鼠标事件带了 displayID 却查不到 rect 时拒绝注入，避免落到错误的屏上。
+@property (nonatomic, copy, nullable) NSDictionary<NSNumber *, NSValue *> *displayRects;
+
 - (instancetype)initWithSink:(id<M1EventSink>)sink;
 
 // 注入一个已归一化的控制协议事件（kind/displayID/x/y/...）。

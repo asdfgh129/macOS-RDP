@@ -111,6 +111,8 @@ typedef void (^P1MissingFragmentsHandler)(uint32_t frameSeq, uint16_t fragCount,
 // 分片重组 v3：按 displayID + frameSeq 位图累积，容忍乱序与重复；
 // 一个帧自首片到达起超过 frameDeadlineMs 仍未收齐即判丢（其后帧一并作废），
 // 置 needsKeyframe 并只接受关键帧重启。收齐的帧按 frameSeq 顺序交付。
+// 实例按单屏工作（首次 acceptHeader 绑定 displayID，异屏分片直接忽略）；
+// 多屏时每屏各建一个实例，不要复用同一个重组器跨 displayID。
 //
 // v4 增加定向补片：首次超期时先回调 onMissingFragments 并延长 repairGraceMs，
 // 让发送端只重发缺失片；补片仍没到才按上面的规则判丢。

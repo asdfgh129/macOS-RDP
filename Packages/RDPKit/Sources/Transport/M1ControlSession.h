@@ -79,17 +79,21 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
                         prepareDisplaysForSessionStart:(NSDictionary *)message
                                               error:(NSError * _Nullable * _Nullable)error;
 
-// Host 侧：收到 Client 的 keyframe-request，应立刻让编码器产出 IDR。
+// Host 侧：收到 Client 的 keyframe-request，应立刻让对应屏的编码器产出 IDR。
+//   displayID 为请求目标屏；0 表示旧版客户端未带（单屏按唯一管线、多屏按全部管线处理）。
 //   回调在控制收包队列上；不能阻塞（码流线程可能正在等这个决定）。
-- (void)controlSessionDidRequestKeyframe:(M1ControlSession *)session;
+- (void)controlSession:(M1ControlSession *)session
+    didRequestKeyframeForDisplay:(uint32_t)displayID;
 
 // Host 侧：收到 Client 的 frame-nack，应只重发该帧缺失的分片（定向补片）。
-//   frameSeq/fragCount 来自客户端重组器；indices 为缺失片下标（已校验升序、<fragCount）。
+//   displayID 为缺失帧所属屏；0 表示旧版客户端未带（同 keyframe-request 的回退规则）。
+//   frameSeq/fragCount 来自客户端该屏的重组器；indices 为缺失片下标（已校验升序、<fragCount）。
 //   整帧补片请求时 fragCount=0、indices 为空：应重发该帧在缓存里的全部分片。
 //   回调在控制收包队列上；不能阻塞。发送端没有该帧缓存时可不处理，
 //   客户端补片窗口到期后会改走 keyframe-request。
 - (void)controlSession:(M1ControlSession *)session
- didRequestFragmentsForFrame:(uint32_t)frameSeq
+ didRequestFragmentsForDisplay:(uint32_t)displayID
+             frameSeq:(uint32_t)frameSeq
              fragCount:(uint16_t)fragCount
                indices:(NSIndexSet *)indices;
 
@@ -139,21 +143,27 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 #pragma mark - 关键帧请求（PROTOCOL §3）
 
 // Client：帧通道判定缺口后请求 Host 立即产 IDR。
-//   限流 300ms/次（Host 产 IDR 也要时间，连环请求只会互相踩）；
+//   displayID 为目标屏；0 表示沿用 session-ready 的第一块屏（旧单屏调用方）。
+//   限流 300ms/屏（Host 产 IDR 也要时间，连环请求只会互相踩）；
 //   非 STREAMING 返回 NO（INVALID_STATE），限流返回 NO（RATE_LIMITED）。
-- (BOOL)requestKeyframeWithError:(NSError * _Nullable * _Nullable)error;
+- (BOOL)requestKeyframeForDisplay:(uint32_t)displayID
+                            error:(NSError * _Nullable * _Nullable)error;
 
 // Client：帧重组停滞时请求 Host 定向补片（只重发缺失分片）。
-//   限流 5ms/次（同批多帧可能同时停滞；重组器每帧只请求一次）；indices 最多 64 个且必须 < fragCount。
+//   displayID 为该帧所属屏；0 同 requestKeyframeForDisplay 的回退。
+//   限流 5ms/屏（同批多帧可能同时停滞；重组器每帧只请求一次）；indices 最多 64 个且必须 < fragCount。
 //   非 STREAMING 返回 NO（INVALID_STATE），限流/参数错返回 NO（RATE_LIMITED/PROTOCOL）。
-- (BOOL)requestFragmentsForFrameSeq:(uint32_t)frameSeq
+- (BOOL)requestFragmentsForDisplay:(uint32_t)displayID
+                          frameSeq:(uint32_t)frameSeq
                           fragCount:(uint16_t)fragCount
                             indices:(NSIndexSet *)indices
                               error:(NSError * _Nullable * _Nullable)error;
 
 // Client：整帧一个分片都没收到时请求 Host 重发该帧全部分片（frame-nack + all:true）。
-//   独立 5ms 限流（不与定向补片互相挤占）；非 STREAMING 返回 NO（INVALID_STATE）。
-- (BOOL)requestWholeFrame:(uint32_t)frameSeq error:(NSError * _Nullable * _Nullable)error;
+//   独立 5ms/屏限流（不与定向补片互相挤占）；非 STREAMING 返回 NO（INVALID_STATE）。
+- (BOOL)requestWholeFrameForDisplay:(uint32_t)displayID
+                           frameSeq:(uint32_t)frameSeq
+                              error:(NSError * _Nullable * _Nullable)error;
 
 @property (nonatomic, readonly) NSUInteger keyframeRequestsSent;      // Client 实际发出
 @property (nonatomic, readonly) NSUInteger keyframeRequestsReceived;  // Host 收到并回调

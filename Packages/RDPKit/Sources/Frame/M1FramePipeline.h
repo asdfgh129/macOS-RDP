@@ -67,6 +67,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)requestKeyframe;
 
 @property (nonatomic, readonly, getter=isRunning) BOOL running;
+@property (nonatomic, readonly) CGDirectDisplayID displayID;   // 采集源屏（帧头里同值）
 @property (nonatomic, readonly) int32_t pixelWidth;
 @property (nonatomic, readonly) int32_t pixelHeight;
 @property (nonatomic, readonly) uint32_t nextFrameSeq;

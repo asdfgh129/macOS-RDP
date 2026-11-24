@@ -14,6 +14,7 @@
 
 ### Added
 
+- feat: 多屏（M2）——per-display 接收器/帧队列、关键帧与补片请求带 `displayID`（按屏限流）、Host 每屏一条管线、Client 每屏一窗并按屏回传输入；上限 8 屏（D-22，`docs/PROTOCOL.md` §3.2）
 - feat: 打通产品端 QUIC 端到端链路并抽出共享会话层（第4轮） (`dc10fbc`)
 - feat: 建立 VeilRD 产品骨架并完成源码分层归位 (`f1b62f4`)
 

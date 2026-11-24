@@ -153,8 +153,23 @@ static void M1Post(CGEventRef e, pid_t pid) {
 }
 
 - (BOOL)injectEvent:(NSDictionary *)event error:(NSError **)error {
+    CGRect rect = _targetDisplayRect;
+    NSNumber *displayID = event[@"displayID"];
+    if ([displayID isKindOfClass:[NSNumber class]] && self.displayRects.count > 0) {
+        NSValue *val = self.displayRects[displayID];
+        if (val) {
+            rect = val.rectValue;
+        } else if ([event[@"kind"] isEqualToString:@"mouse"]) {
+            // 鼠标坐标必须以目标屏 bounds 为基准；查不到就拒绝，
+            // 否则会静默落到另一块屏的坐标上（多屏时尤其难查）。
+            if (error) *error = [NSError errorWithDomain:@"M1InputInjector" code:3
+                userInfo:@{ NSLocalizedDescriptionKey:
+                    [NSString stringWithFormat:@"未知 displayID=%@", displayID] }];
+            return NO;
+        }
+    }
     NSError *planErr = nil;
-    NSDictionary *plan = M1InjectionPlan(event, _targetDisplayRect, &planErr);
+    NSDictionary *plan = M1InjectionPlan(event, rect, &planErr);
     if (!plan) {
         if (error) *error = planErr;
         return NO;

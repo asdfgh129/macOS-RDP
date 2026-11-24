@@ -330,6 +330,28 @@ static void TestInputLogic(void) {
        "inject-flags-recorded");
     [rec reset];
     OK(rec.postCount == 0, "inject-record-reset");
+
+    // 多屏：按事件 displayID 选择该屏 bounds；未知屏的鼠标事件拒绝而不是落错屏
+    M1RecordingEventSink *recMulti = [[M1RecordingEventSink alloc] init];
+    M1InputInjector *injMulti = [[M1InputInjector alloc] initWithSink:recMulti];
+    CGRect rectA = CGRectMake(0, 0, 100, 100);
+    CGRect rectB = CGRectMake(100, 0, 200, 100);
+    injMulti.targetDisplayRect = rectA;
+    injMulti.displayRects = @{ @7: [NSValue valueWithRect:rectA],
+                               @8: [NSValue valueWithRect:rectB] };
+    OK([injMulti injectEvent:@{ @"kind":@"mouse", @"displayID":@8, @"x":@0.5, @"y":@0.5,
+                                @"button":@"left", @"action":@"move", @"flags":@{} }
+                       error:&injErr], "inject-multi-ok");
+    NSDictionary *multiPlan = recMulti.plans.lastObject;
+    OK([multiPlan[@"x"] doubleValue] == 200 && [multiPlan[@"y"] doubleValue] == 50,
+       "inject-multi-rect-b");
+    NSUInteger multiCount = recMulti.postCount;
+    OK(![injMulti injectEvent:@{ @"kind":@"mouse", @"displayID":@9, @"x":@0.5, @"y":@0.5,
+                                 @"button":@"left", @"action":@"move", @"flags":@{} }
+                        error:&injErr], "inject-multi-unknown-display-rejected");
+    OK(recMulti.postCount == multiCount, "inject-multi-rejected-not-posted");
+    OK([injMulti injectEvent:@{ @"kind":@"flags", @"flags":@{ @"cmd":@1 } } error:&injErr],
+       "inject-multi-flags-no-display-ok");
 }
 
 #pragma mark - 帧管线：分片发送与重组一致性
@@ -924,15 +946,32 @@ static void TestControlChannel(void) {
 @property (nonatomic, strong, nullable) NSError *error;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *inputs;
 @property (nonatomic) NSUInteger keyframeRequests;
+@property (nonatomic) uint32_t lastKeyframeDisplayID;
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *fragmentRequests;
 @end
 
 @implementation M1TestSessionWatcher
 - (instancetype)init {
-    if ((self = [super init])) _inputs = [NSMutableArray array];
+    if ((self = [super init])) {
+        _inputs = [NSMutableArray array];
+        _fragmentRequests = [NSMutableArray array];
+    }
     return self;
 }
-- (void)controlSessionDidRequestKeyframe:(M1ControlSession *)session {
+- (void)controlSession:(M1ControlSession *)session
+    didRequestKeyframeForDisplay:(uint32_t)displayID {
     _keyframeRequests++;
+    _lastKeyframeDisplayID = displayID;
+}
+- (void)controlSession:(M1ControlSession *)session
+ didRequestFragmentsForDisplay:(uint32_t)displayID
+             frameSeq:(uint32_t)frameSeq
+             fragCount:(uint16_t)fragCount
+               indices:(NSIndexSet *)indices {
+    [_fragmentRequests addObject:@{ @"displayID": @(displayID),
+                                    @"frameSeq": @(frameSeq),
+                                    @"fragCount": @(fragCount),
+                                    @"indices": indices }];
 }
 - (void)controlSession:(M1ControlSession *)session didFailWithError:(NSError *)error {
     if (!self.error) self.error = error;
@@ -1145,27 +1184,52 @@ static void TestControlSessionKeyframe(void) {
     OK(client.reachedStreaming && host.reachedStreaming, "kf-both-streaming");
 
     NSError *err = nil;
-    OK([client requestKeyframeWithError:&err], "kf-send-first");
+    OK([client requestKeyframeForDisplay:1000 error:&err], "kf-send-first");
     Pump(pending);
     OK(hw.keyframeRequests == 1, "kf-host-callback");
+    OK(hw.lastKeyframeDisplayID == 1000, "kf-displayid-preserved");
     OK(host.keyframeRequestsReceived == 1, "kf-host-count");
     OK(client.keyframeRequestsSent == 1, "kf-client-sent-count");
 
-    // 300ms 内的第二次必须被限流，且不再上线
+    // 300ms 内的同一屏第二次必须被限流，且不再上线
     err = nil;
-    OK(![client requestKeyframeWithError:&err] &&
+    OK(![client requestKeyframeForDisplay:1000 error:&err] &&
        err.code == M1ControlSessionErrorRateLimited, "kf-rate-limited");
     Pump(pending);
     OK(hw.keyframeRequests == 1, "kf-rate-limit-not-delivered");
     OK(client.keyframeRequestsSent == 1, "kf-rate-limit-not-counted");
 
-    usleep(320 * 1000);
-    OK([client requestKeyframeWithError:&err], "kf-send-after-window");
+    // 限流按屏独立：另一块屏的请求不应被这 300ms 挡住
+    OK([client requestKeyframeForDisplay:2000 error:&err], "kf-other-display-not-limited");
     Pump(pending);
-    OK(hw.keyframeRequests == 2, "kf-second-delivered");
+    OK(hw.keyframeRequests == 2 && hw.lastKeyframeDisplayID == 2000,
+       "kf-other-display-delivered");
+
+    usleep(320 * 1000);
+    OK([client requestKeyframeForDisplay:1000 error:&err], "kf-send-after-window");
+    Pump(pending);
+    OK(hw.keyframeRequests == 3, "kf-second-delivered");
+
+    // frame-nack 也携带 displayID：定向补片与整帧补片各按屏限流
+    OK([client requestFragmentsForDisplay:1000 frameSeq:7 fragCount:4
+                                  indices:[NSIndexSet indexSetWithIndex:2] error:&err],
+       "nack-send");
+    Pump(pending);
+    OK(hw.fragmentRequests.count == 1, "nack-host-callback");
+    OK([hw.fragmentRequests.firstObject[@"displayID"] unsignedIntValue] == 1000,
+       "nack-displayid-preserved");
+    OK([hw.fragmentRequests.firstObject[@"frameSeq"] unsignedIntValue] == 7 &&
+       [hw.fragmentRequests.firstObject[@"fragCount"] unsignedIntValue] == 4,
+       "nack-frame-params");
+    OK([client requestWholeFrameForDisplay:2000 frameSeq:8 error:&err], "nack-whole-send");
+    Pump(pending);
+    OK(hw.fragmentRequests.count == 2 &&
+       [hw.fragmentRequests.lastObject[@"displayID"] unsignedIntValue] == 2000 &&
+       [hw.fragmentRequests.lastObject[@"fragCount"] unsignedIntValue] == 0,
+       "nack-whole-displayid");
 
     // Host 不能发、非 STREAMING 不能发
-    OK(![host requestKeyframeWithError:&err] &&
+    OK(![host requestKeyframeForDisplay:1000 error:&err] &&
        err.code == M1ControlSessionErrorProtocol, "kf-host-cannot-send");
 
     M1MemoryMessageSink *deadSink = [M1MemoryMessageSink new];
@@ -1175,7 +1239,7 @@ static void TestControlSessionKeyframe(void) {
     cfg.heartbeatIntervalMs = 0;
     M1ControlSession *lone = [[M1ControlSession alloc] initWithChannel:deadCh config:cfg];
     err = nil;
-    OK(![lone requestKeyframeWithError:&err] &&
+    OK(![lone requestKeyframeForDisplay:0 error:&err] &&
        err.code == M1ControlSessionErrorInvalidState, "kf-pre-streaming-rejected");
 }
 

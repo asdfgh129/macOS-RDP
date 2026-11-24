@@ -973,6 +973,49 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 
 ---
 
+## D-22 多屏：按 displayID 的接收器/帧序号/控制路由
+
+**日期**：2026-11-23　**状态**：已执行（M2 多屏，FR-01/FR-05）
+
+### 决定
+
+- **帧层不改格式**：v3 帧头已带 32 位 `displayID`，多屏只改变消费方式——Client 按帧头
+  `displayID` 把 datagram 分流到各自串行帧队列，每屏一个 `M1FrameReceiver`（各自重组、解码、
+  请求关键帧/补片）；Host 每块虚拟屏一条 `M1FramePipeline`，`frameSeq` 各自从 0 起。
+- **控制面贯通 displayID**：`keyframe-request` / `frame-nack` 载荷新增 `displayID`，
+  `M1ControlSession` 委托与 `M1StreamSession` host 回调都带该参数；限流表由单个时间戳改成
+  `displayID → 时间` 字典（关键帧 300ms/屏、补片 5ms/屏）。
+- **兼容语义**：Client 侧 `displayID=0` 在写线时回落到 `session-ready` 首屏（旧调用方行为不变）；
+  Host 侧 0 表示全部管线（旧单屏客户端），未知非 0 ID 忽略并计数。
+- **规格上限**：`capabilities.maxDisplays` 由 1 提到 8；`session-start.specs.count > 8` 回
+  `SPEC_UNSUPPORTED/recoverable:false`，避免无界建屏。
+- **输入按屏**：`M1InputInjector.displayRects` 用每块推流屏的 `CGDisplayBounds` 换算归一化坐标；
+  多屏下未知 displayID 的鼠标事件拒绝注入（其它类型回落默认屏）。
+- **产品入口**：`veild-host-agent --serve` 独占模式为全部虚拟屏各建管线并聚合 JSON（顶层字段保留，
+  新增 `displays[]`）；`VeilRD --connect` 支持重复/逗号分隔的 `--spec`/`--window`，每屏一窗，
+  `M1FrameView` 绑定 displayID，输入按所在窗口的屏回传。
+
+### 理由
+
+- `P1FrameReassembler` 内部锁定单个 `activeDisplay`，天然是「单屏重组器」。与其把它改成跨屏状态机，
+  不如按屏各建一个实例：缺口判据、补片缓存、解码器状态都保持既有单屏语义，回归风险最小。
+- 各屏独立序号空间后，某块屏丢帧不会让其它屏的序号判据误判；限流按屏独立，一块屏的静止/抖动
+  不会饿死另一块屏的关键帧请求。
+- 帧头与控制消息都只加字段、不改布局，探针/旧单屏路径可继续按 0 语义工作。
+
+### 影响与边界
+
+- **未跑双机真机多屏**：本轮只做单测与环回验证（控制面 displayID 透传、注入按屏拒绝、双屏
+  session-ready、环回自检）。真机多屏采集/上屏/输入验收按约定放夜间，结论按 OS 分离写
+  `RESULTS-BY-OS.md`。
+- 多屏的带宽/CPU 预算未做门禁：每屏 20fps 编码目标，合计速率受同一 QUIC 发送窗口与节拍约束；
+  发送队列满时按 `sendDatagram:error:` 现有语义丢帧，不新增跨屏优先级。
+- PNG 证据文件在多屏时命名为 `frame-d<displayID>-NNN.png`；单屏维持原名。
+- 验收：五 target 构建成功；M1/P1 单测全 PASS（含新增 `kf-displayid-preserved` /
+  `nack-displayid-preserved` / `inject-multi-*`）；`stream_session_selftest` 双屏会话 PASS。
+
+---
+
 ## 附：协议实现进度（2026-11-17）
 
 | 模块 | 状态 | 测试 |

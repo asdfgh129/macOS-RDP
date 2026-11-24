@@ -644,7 +644,8 @@ int main(int argc, char **argv) {
             // keyframe-request 落到编码器：下一帧强制 IDR。
             // 900ms 合并窗口：客户端的重试/多请求不应把在途 IDR 冲掉。
             __block CFAbsoluteTime lastForcedKeyframe = 0;
-            host.onKeyframeRequest = ^{
+            host.onKeyframeRequest = ^(uint32_t displayID) {
+                (void)displayID;   // 单管线探针：忽略屏号
                 CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
                 if (now - lastForcedKeyframe < 0.9) return;
                 lastForcedKeyframe = now;
@@ -655,7 +656,9 @@ int main(int argc, char **argv) {
             // 自己会改走 keyframe-request，不需要在这里重复判定。
             __block uint64_t nackRepaired = 0, nackMissed = 0, nackFragments = 0;
             __block uint64_t nackWholeFrames = 0;
-            host.onFrameNack = ^(uint32_t frameSeq, uint16_t fragCount, NSIndexSet *indices) {
+            host.onFrameNack = ^(uint32_t displayID, uint32_t frameSeq,
+                                 uint16_t fragCount, NSIndexSet *indices) {
+                (void)displayID;   // 单管线探针：忽略屏号
                 (void)fragCount;
                 NSError *rsErr = nil;
                 NSUInteger n;
@@ -937,12 +940,13 @@ int main(int argc, char **argv) {
         }
         client.outdir = outdir;
         client.saveFrames = saveFrames;
-        [client prepareReceiver];
         if (frameView) {
             __weak M1FrameView *weakView = frameView;
             __weak M1StreamClientNode *weakClient = client;
             __block BOOL printedAnchors = NO;
-            client.onPixelBuffer = ^(CVPixelBufferRef pb, uint32_t seq, uint64_t capturedAtUs) {
+            client.onPixelBuffer = ^(uint32_t displayID, CVPixelBufferRef pb,
+                                     uint32_t seq, uint64_t capturedAtUs) {
+                (void)displayID;   // 单窗口探针：只绑第一块屏
                 [weakView presentPixelBuffer:pb capturedAtUs:capturedAtUs];
                 // 首帧到了才有 videoSize，才能算「画面中心」的全局坐标。
                 // 驱动端不能拿「屏幕中心」当「画面中心」：窗口内容里视频是按比例

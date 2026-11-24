@@ -147,11 +147,53 @@ func parseSize(_ s: String) -> (Int, Int)? {
     return (w, h)
 }
 
+/// 一块远程屏在本地的窗口/视图。
+final class DisplaySlot {
+    let window: NSWindow
+    let view: M1FrameView
+    var displayID: UInt32 = 0
+    var inputSent = 0
+    var inputFailed = 0
+
+    init(window: NSWindow, view: M1FrameView) {
+        self.window = window
+        self.view = view
+    }
+}
+
+/// 帧队列（每屏一条）→ 主线程视图的路由。帧可能在绑定 displayID 之前到达，
+/// 单屏时按唯一视图兜底，多屏时丢弃未绑定屏的帧（下一帧即可补上）。
+final class DisplayRouter {
+    private let lock = NSLock()
+    private var views: [UInt32: M1FrameView] = [:]
+
+    func bind(_ view: M1FrameView, displayID: UInt32) {
+        lock.lock()
+        views[displayID] = view
+        lock.unlock()
+    }
+
+    func view(for displayID: UInt32) -> M1FrameView? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let v = views[displayID] { return v }
+        return views.count == 1 ? views.values.first : nil
+    }
+}
+
 func runConnect() -> Int32 {
     let args = CommandLine.arguments
     func arg(_ name: String) -> String? {
         guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
         return args[i + 1]
+    }
+    func argValues(_ name: String) -> [String] {
+        var out: [String] = []
+        var i = 0
+        while i + 1 < args.count {
+            if args[i] == name { out.append(args[i + 1]); i += 2 } else { i += 1 }
+        }
+        return out
     }
     guard let connectHost = arg("--connect"),
           let portText = arg("--port"), let port = UInt16(portText),
@@ -162,46 +204,68 @@ func runConnect() -> Int32 {
     let durationMs = Int(arg("--duration-ms") ?? "5000") ?? 5000
     let waitMs = UInt32(arg("--wait-ms") ?? "15000") ?? 15000
     let handshakeMs = UInt32(arg("--handshake-ms") ?? "12000") ?? 12000
-    let win = parseSize(arg("--window") ?? "1280x720") ?? (1280, 720)
     let saveFrames = Int(arg("--save-frames") ?? "5") ?? 5
     let outdir = arg("--outdir") ?? ""
     let outPath = arg("--out")
-    let spec = parseSize(arg("--spec") ?? "0x0")
+
+    // 多屏：--spec 可重复（也接受逗号分隔），每块屏一个窗口。
+    let specs: [(Int, Int)] = argValues("--spec")
+        .flatMap { $0.split(separator: ",").map(String.init) }
+        .compactMap { parseSize($0) }
+    let windowSizes: [(Int, Int)] = argValues("--window")
+        .flatMap { $0.split(separator: ",").map(String.init) }
+        .compactMap { parseSize($0) }
+    let displayCount = max(specs.count, 1)
+    let defaultWindow = windowSizes.first ?? (1280, 720)
+    func windowSize(_ index: Int) -> (Int, Int) {
+        windowSizes.isEmpty ? defaultWindow : windowSizes[min(index, windowSizes.count - 1)]
+    }
 
     M1FrameReceiver.prewarmDecoder()
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
 
-    let content = NSRect(x: 0, y: 0, width: win.0, height: win.1)
-    let window = NSWindow(contentRect: content,
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                          backing: .buffered, defer: false)
-    window.title = "VeilRD \(win.0)×\(win.1)（Esc 退出）"
-    window.isReleasedWhenClosed = false
-    window.acceptsMouseMovedEvents = true
-    let frameView = M1FrameView(frame: content)
-    window.contentView = frameView
-    window.center()
-    window.makeKeyAndOrderFront(nil)
-
     var closedByUser = false
-    NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
-                                           object: window, queue: .main) { _ in
-        closedByUser = true
-        NSApp.stop(nil)
+    func makeSlot(_ index: Int, _ size: (Int, Int)) -> DisplaySlot {
+        let content = NSRect(x: 0, y: 0, width: size.0, height: size.1)
+        let window = NSWindow(contentRect: content,
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                              backing: .buffered, defer: false)
+        window.title = "VeilRD \(index + 1)/\(displayCount) \(size.0)×\(size.1)（Esc 退出）"
+        window.isReleasedWhenClosed = false
+        window.acceptsMouseMovedEvents = true
+        let view = M1FrameView(frame: content)
+        window.contentView = view
+        window.center()
+        if index > 0 {
+            window.setFrameOrigin(NSPoint(x: window.frame.origin.x + CGFloat(index * 40),
+                                          y: window.frame.origin.y - CGFloat(index * 40)))
+        }
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
+                                               object: window, queue: .main) { _ in
+            closedByUser = true
+            NSApp.stop(nil)
+        }
+        window.makeKeyAndOrderFront(nil)
+        return DisplaySlot(window: window, view: view)
     }
+
+    var slots: [DisplaySlot] = (0..<displayCount).map { makeSlot($0, windowSize($0)) }
+    let router = DisplayRouter()
 
     let client = M1StreamClientNode()
     client.expectedFingerprint = fingerprint
     client.outdir = outdir
     client.saveFrames = UInt(saveFrames)
-    if let spec = spec {
-        client.requestedSpecs = [["w": spec.0, "h": spec.1, "hidpi": false, "refresh": 60]]
-        print("请求 host 规格 \(spec.0)x\(spec.1)")
+    if !specs.isEmpty {
+        client.requestedSpecs = specs.map {
+            ["w": $0.0, "h": $0.1, "hidpi": false, "refresh": 60] as [AnyHashable: Any]
+        }
+        print("请求 host 规格 \(specs.map { "\($0.0)x\($0.1)" }.joined(separator: ", "))（\(specs.count) 屏）")
     }
-    client.prepareReceiver()
-    client.onPixelBuffer = { pb, _, capturedAtUs in
-        frameView.present(pb, capturedAtUs: capturedAtUs)
+    // 解码回调在每屏的帧队列上；present 本身线程安全，这里只做 displayID → 视图查表。
+    client.onPixelBuffer = { displayID, pb, _, capturedAtUs in
+        router.view(for: displayID)?.present(pb, capturedAtUs: capturedAtUs)
     }
 
     print("连接 \(connectHost):\(port)")
@@ -218,21 +282,34 @@ func runConnect() -> Int32 {
     }
     print("已 STREAMING，接收 \(durationMs) ms")
 
-    if let display = client.session?.remoteDisplays.first,
-       let displayID = display["displayID"] as? NSNumber {
-        frameView.displayID = displayID.uint32Value
-        print("目标屏 displayID=\(frameView.displayID)")
+    let remote = client.session?.remoteDisplays ?? []
+    while slots.count < remote.count {
+        slots.append(makeSlot(slots.count, windowSize(slots.count)))
     }
-    var inputSent = 0, inputFailed = 0
-    frameView.onInputEvent = { event in
-        do {
-            try client.session?.sendInputEvent(event)
-            inputSent += 1
-        } catch { inputFailed += 1 }
+    for (i, display) in remote.enumerated() {
+        guard i < slots.count, let id = display["displayID"] as? NSNumber else { continue }
+        let displayID = id.uint32Value
+        slots[i].displayID = displayID
+        slots[i].view.displayID = displayID
+        router.bind(slots[i].view, displayID: displayID)
+        let w = (display["w"] as? NSNumber)?.intValue ?? 0
+        let h = (display["h"] as? NSNumber)?.intValue ?? 0
+        print("窗口 \(i + 1) → displayID=\(displayID)（\(w)×\(h)）")
     }
-    frameView.onCloseRequest = {
-        closedByUser = true
-        NSApp.stop(nil)
+    if remote.count < slots.count {
+        print("⚠ host 只提供 \(remote.count) 块屏，其余 \(slots.count - remote.count) 个窗口不接收画面")
+    }
+    for slot in slots {
+        slot.view.onInputEvent = { event in
+            do {
+                try client.session?.sendInputEvent(event)
+                slot.inputSent += 1
+            } catch { slot.inputFailed += 1 }
+        }
+        slot.view.onCloseRequest = {
+            closedByUser = true
+            NSApp.stop(nil)
+        }
     }
 
     let stopItem = DispatchWorkItem {
@@ -247,32 +324,73 @@ func runConnect() -> Int32 {
     DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(durationMs), execute: stopItem)
     DispatchQueue.main.async {
         NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        slots.first?.window.makeKeyAndOrderFront(nil)
     }
     app.run()
 
     client.flushFrames()
     client.flushSaves()
-    let st = client.receiver?.stats
-    print("client: 重组完成=\(st?.framesCompleted ?? 0) 解码=\(st?.framesDecoded ?? 0) "
-          + "丢帧=\(st?.framesDropped ?? 0) 渲染=\(frameView.framesRendered) "
-          + "渲染丢帧=\(frameView.framesDropped)")
-    print("client: 上屏 p50=\(frameView.presentLatencyP50Ms) ms p95=\(frameView.presentLatencyP95Ms) ms "
+
+    var totalCompleted: UInt64 = 0, totalDecoded: UInt64 = 0, totalDropped: UInt64 = 0
+    var totalRendered: UInt = 0, totalRenderDropped: UInt = 0, totalOccluded: UInt = 0
+    var maxP50 = 0.0, maxP95 = 0.0
+    var perDisplay: [[String: Any]] = []
+    for idNum in client.receiverDisplayIDs {
+        let displayID = idNum.uint32Value
+        guard let rx = client.receiver(forDisplayID: displayID) else { continue }
+        let st = rx.stats
+        let slot = slots.first { $0.displayID == displayID }
+        totalCompleted += st.framesCompleted
+        totalDecoded += st.framesDecoded
+        totalDropped += st.framesDropped
+        let rendered = slot?.view.framesRendered ?? 0
+        let renderDropped = slot?.view.framesDropped ?? 0
+        let occluded = slot?.view.framesSkippedOccluded ?? 0
+        totalRendered += rendered
+        totalRenderDropped += renderDropped
+        totalOccluded += occluded
+        let p50 = slot?.view.presentLatencyP50Ms ?? 0
+        let p95 = slot?.view.presentLatencyP95Ms ?? 0
+        maxP50 = max(maxP50, p50)
+        maxP95 = max(maxP95, p95)
+        perDisplay.append([
+            "displayID": displayID,
+            "width": rx.videoWidth, "height": rx.videoHeight,
+            "framesCompleted": st.framesCompleted,
+            "framesDecoded": st.framesDecoded,
+            "framesDropped": st.framesDropped,
+            "framesRendered": rendered,
+            "presentP50Ms": p50, "presentP95Ms": p95,
+        ])
+        print("client[\(displayID)]: 收齐=\(st.framesCompleted) 解码=\(st.framesDecoded) "
+              + "丢帧=\(st.framesDropped) 尺寸=\(rx.videoWidth)x\(rx.videoHeight) "
+              + "上屏=\(rendered) p95=\(String(format: "%.1f", p95))ms")
+    }
+    let inputSent = slots.reduce(0) { $0 + $1.inputSent }
+    let inputFailed = slots.reduce(0) { $0 + $1.inputFailed }
+    print("client: 重组完成=\(totalCompleted) 解码=\(totalDecoded) 丢帧=\(totalDropped) "
+          + "渲染=\(totalRendered) 渲染丢帧=\(totalRenderDropped)")
+    print("client: 上屏 p50=\(maxP50) ms p95=\(maxP95) ms "
           + "时钟 offset=\(client.session?.clockOffsetUs ?? 0) us（样本 \(client.session?.timeSyncSamples ?? 0)）")
     print("client: 输入上行 \(inputSent)/失败 \(inputFailed) | 控制最大间隔=\(client.maxControlGapMs) ms "
           + "PNG=\(client.savedFrames)")
     if let outPath = outPath, let data = try? JSONSerialization.data(withJSONObject: [
-        "framesCompleted": st?.framesCompleted ?? 0,
-        "framesDecoded": st?.framesDecoded ?? 0,
-        "framesDropped": st?.framesDropped ?? 0,
-        "framesRendered": frameView.framesRendered,
-        "presentP50Ms": frameView.presentLatencyP50Ms,
-        "presentP95Ms": frameView.presentLatencyP95Ms,
+        "framesCompleted": totalCompleted,
+        "framesDecoded": totalDecoded,
+        "framesDropped": totalDropped,
+        "framesRendered": totalRendered,
+        "framesRenderDropped": totalRenderDropped,
+        "framesSkippedOccluded": totalOccluded,
+        "presentP50Ms": maxP50,
+        "presentP95Ms": maxP95,
+        "decodedWidth": client.decodedWidth,
+        "decodedHeight": client.decodedHeight,
         "clockOffsetUs": client.session?.clockOffsetUs ?? 0,
         "timeSyncSamples": client.session?.timeSyncSamples ?? 0,
         "inputSent": inputSent, "inputFailed": inputFailed,
         "maxControlGapMs": client.maxControlGapMs,
         "savedPNG": client.savedFrames,
+        "displays": perDisplay,
     ], options: .prettyPrinted) {
         try? data.write(to: URL(fileURLWithPath: outPath))
     }

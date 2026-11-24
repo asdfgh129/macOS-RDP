@@ -42,7 +42,8 @@ int main(int argc, const char *argv[]) {
         host.localFingerprint = fp;
         host.displayProvider = ^NSArray<NSDictionary *> *(NSDictionary *message, NSError **perr) {
             (void)message; (void)perr;
-            return @[@{@"displayID": @8888, @"w": @1280, @"h": @720, @"synthetic": @YES}];
+            return @[@{@"displayID": @8888, @"w": @1280, @"h": @720, @"synthetic": @YES},
+                     @{@"displayID": @8889, @"w": @1280, @"h": @720, @"synthetic": @YES}];
         };
         if (![host startAsHostOnPort:0 error:&err]) {
             fprintf(stderr, "✗ host 监听: %s\n", err.localizedDescription.UTF8String ?: "unknown");
@@ -66,6 +67,28 @@ int main(int argc, const char *argv[]) {
         }
         printf("双端 STREAMING：handshake=%.1fms 控制包 host=%llu client=%llu\n",
                client.handshakeMs, host.controlDatagrams, client.controlDatagrams);
+
+        // 多屏：session-ready 里两块屏都要到客户端；keyframe-request 的 displayID 要原样到 Host。
+        if (client.session.remoteDisplays.count != 2) {
+            fprintf(stderr, "✗ session-ready 屏数=%lu（期望 2）\n",
+                    (unsigned long)client.session.remoteDisplays.count);
+            [host shutdown]; [client shutdown];
+            return 8;
+        }
+        __block uint32_t kfDisplayID = 0;
+        host.onKeyframeRequest = ^(uint32_t displayID) { kfDisplayID = displayID; };
+        [client.session requestKeyframeForDisplay:8889 error:NULL];
+        NSDate *kfDeadline = [NSDate dateWithTimeIntervalSinceNow:3.0];
+        while ([kfDeadline timeIntervalSinceNow] > 0 && kfDisplayID == 0) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                     beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        }
+        if (kfDisplayID != 8889) {
+            fprintf(stderr, "✗ keyframe-request displayID=%u（期望 8889）\n", kfDisplayID);
+            [host shutdown]; [client shutdown];
+            return 9;
+        }
+        printf("多屏 displayID 回传：keyframe-request → %u OK\n", kfDisplayID);
 
         // A-02 时钟同步探针由客户端进入 STREAMING 后投递到主队列，这里让主队列跑起来。
         NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:3.0];

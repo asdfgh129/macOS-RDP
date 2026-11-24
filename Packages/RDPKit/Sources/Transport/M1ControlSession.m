@@ -49,11 +49,8 @@ static NSString *M1ArchName(void) {
     atomic_uint_fast64_t _inputRejected;
     atomic_uint_fast64_t _kfRequestsSent;
     atomic_uint_fast64_t _kfRequestsReceived;
-    _Atomic double _lastKfRequestMs;
     atomic_uint_fast64_t _nacksSent;
     atomic_uint_fast64_t _nacksReceived;
-    _Atomic double _lastNackMs;
-    _Atomic double _lastWholeNackMs;
     atomic_bool _hasClockOffset;
     _Atomic int64_t _clockOffsetUs;
     _Atomic double _timeSyncRttMs;
@@ -76,6 +73,11 @@ static NSString *M1ArchName(void) {
 @property (nonatomic, assign) BOOL closed;
 // 注入速率限制（PROTOCOL §3.1：单会话 ≤1000 event/s，超限丢 move/scroll）
 @property (nonatomic, strong) P1InputRateLimiter *inputLimiter;
+// 每屏独立的请求限流时间戳（displayID → 毫秒）。多屏各自丢帧时互不挤占。
+// 访问统一走 @synchronized(self)：请求来自多个屏的重组队列。
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *lastKfMsByDisplay;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *lastNackMsByDisplay;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *lastWholeNackMsByDisplay;
 @end
 
 @implementation M1ControlSession
@@ -96,11 +98,11 @@ static NSString *M1ArchName(void) {
         atomic_init(&_inputRejected, 0);
         atomic_init(&_kfRequestsSent, 0);
         atomic_init(&_kfRequestsReceived, 0);
-        atomic_store(&_lastKfRequestMs, 0.0);
         atomic_init(&_nacksSent, 0);
         atomic_init(&_nacksReceived, 0);
-        atomic_store(&_lastNackMs, 0.0);
-        atomic_store(&_lastWholeNackMs, 0.0);
+        _lastKfMsByDisplay = [NSMutableDictionary dictionary];
+        _lastNackMsByDisplay = [NSMutableDictionary dictionary];
+        _lastWholeNackMsByDisplay = [NSMutableDictionary dictionary];
         atomic_init(&_hasClockOffset, false);
         atomic_init(&_clockOffsetUs, 0);
         atomic_store(&_timeSyncRttMs, 0.0);
@@ -301,7 +303,7 @@ static NSString *M1ArchName(void) {
 - (void)hostSendCapabilities {
     NSDictionary *caps = @{
         @"type": @"capabilities",
-        @"maxDisplays": @1,
+        @"maxDisplays": @8,
         @"maxResolution": @{ @"w": @5120, @"h": @2880 },
         @"hidpi": @YES,
         @"encoders": @[ @"h264-vt" ],
@@ -341,6 +343,15 @@ static NSString *M1ArchName(void) {
         [self failWith:M1SessErr(M1ControlSessionErrorProtocol, @"session-start 缺 specs")];
         [self sendPayload:@{ @"type": @"session-error", @"code": @"bad-spec",
                              @"detail": @"missing specs", @"recoverable": @YES }];
+        return;
+    }
+    // 屏数是系统边界：超出能力的请求直接拒绝，不交给建屏去撞资源上限。
+    if (specs.count > 8) {
+        [self failWith:M1SessErr(M1ControlSessionErrorProtocol,
+            [NSString stringWithFormat:@"session-start 屏数 %lu 超过上限 8",
+             (unsigned long)specs.count])];
+        [self sendPayload:@{ @"type": @"session-error", @"code": @"SPEC_UNSUPPORTED",
+                             @"detail": @"too many displays", @"recoverable": @NO }];
         return;
     }
     if (![self advance:@"session-start"]) return;
@@ -483,7 +494,31 @@ static NSString *M1ArchName(void) {
 - (NSUInteger)keyframeRequestsSent { return (NSUInteger)atomic_load(&_kfRequestsSent); }
 - (NSUInteger)keyframeRequestsReceived { return (NSUInteger)atomic_load(&_kfRequestsReceived); }
 
-- (BOOL)requestKeyframeWithError:(NSError **)error {
+// 限流查表：返回 YES 表示窗口内还没有请求；不落时间戳（发送成功后才记）。
+- (BOOL)rateLimitAllows:(NSDictionary<NSNumber *, NSNumber *> *)table
+              displayID:(uint32_t)displayID
+             intervalMs:(double)intervalMs
+                  nowMs:(double)nowMs {
+    @synchronized (self) {
+        NSNumber *last = table[@(displayID)];
+        return !(last && last.doubleValue > 0 && nowMs - last.doubleValue < intervalMs);
+    }
+}
+
+- (void)markRateLimit:(NSMutableDictionary<NSNumber *, NSNumber *> *)table
+            displayID:(uint32_t)displayID
+                nowMs:(double)nowMs {
+    @synchronized (self) { table[@(displayID)] = @(nowMs); }
+}
+
+// 请求载荷里的 displayID：显式值为 0 时回退到 session-ready 的第一块屏。
+- (NSNumber *)wireDisplayIDFor:(uint32_t)displayID {
+    if (displayID != 0) return @(displayID);
+    NSNumber *first = self.remoteDisplays.firstObject[@"displayID"];
+    return [first isKindOfClass:[NSNumber class]] ? first : nil;
+}
+
+- (BOOL)requestKeyframeForDisplay:(uint32_t)displayID error:(NSError **)error {
     if (error) *error = nil;
     if (self.role != M1ControlRoleClient) {
         if (error) *error = M1SessErr(M1ControlSessionErrorProtocol,
@@ -496,18 +531,18 @@ static NSString *M1ArchName(void) {
         return NO;
     }
     double now = [[NSDate date] timeIntervalSince1970] * 1000.0;
-    double last = atomic_load(&_lastKfRequestMs);
-    if (now - last < 300.0 && last > 0) {
+    if (![self rateLimitAllows:self.lastKfMsByDisplay displayID:displayID
+                    intervalMs:300.0 nowMs:now]) {
         if (error) *error = M1SessErr(M1ControlSessionErrorRateLimited,
-            @"关键帧请求限流（300ms）");
+            @"关键帧请求限流（300ms/屏）");
         return NO;
     }
-    NSNumber *displayID = self.remoteDisplays.firstObject[@"displayID"];
     NSMutableDictionary *payload = [@{ @"type": @"keyframe-request",
                                        @"reason": @"loss" } mutableCopy];
-    if ([displayID isKindOfClass:[NSNumber class]]) payload[@"displayID"] = displayID;
+    NSNumber *wireID = [self wireDisplayIDFor:displayID];
+    if (wireID) payload[@"displayID"] = wireID;
     if (![self sendPayload:payload]) return NO;
-    atomic_store(&_lastKfRequestMs, now);
+    [self markRateLimit:self.lastKfMsByDisplay displayID:displayID nowMs:now];
     atomic_fetch_add(&_kfRequestsSent, 1);
     return YES;
 }
@@ -519,9 +554,13 @@ static NSString *M1ArchName(void) {
         return;
     }
     if (self.closed || self.stateMachine.state != P1SessionStateStreaming) return;
+    uint32_t displayID = 0;
+    NSNumber *d = msg[@"displayID"];
+    if ([d isKindOfClass:[NSNumber class]]) displayID = d.unsignedIntValue;
     atomic_fetch_add(&_kfRequestsReceived, 1);
-    if ([self.delegate respondsToSelector:@selector(controlSessionDidRequestKeyframe:)]) {
-        [self.delegate controlSessionDidRequestKeyframe:self];
+    if ([self.delegate respondsToSelector:
+            @selector(controlSession:didRequestKeyframeForDisplay:)]) {
+        [self.delegate controlSession:self didRequestKeyframeForDisplay:displayID];
     }
 }
 
@@ -530,7 +569,8 @@ static NSString *M1ArchName(void) {
 - (NSUInteger)frameNacksSent { return (NSUInteger)atomic_load(&_nacksSent); }
 - (NSUInteger)frameNacksReceived { return (NSUInteger)atomic_load(&_nacksReceived); }
 
-- (BOOL)requestFragmentsForFrameSeq:(uint32_t)frameSeq
+- (BOOL)requestFragmentsForDisplay:(uint32_t)displayID
+                          frameSeq:(uint32_t)frameSeq
                           fragCount:(uint16_t)fragCount
                             indices:(NSIndexSet *)indices
                               error:(NSError **)error {
@@ -556,10 +596,11 @@ static NSString *M1ArchName(void) {
         return NO;
     }
     double now = [[NSDate date] timeIntervalSince1970] * 1000.0;
-    double last = atomic_load(&_lastNackMs);
-    if (now - last < 5.0 && last > 0) {   // 同批多帧停滞可能在同一毫秒内各请求一次
+    // 同批多帧停滞可能在同一毫秒内各请求一次；限流按屏独立。
+    if (![self rateLimitAllows:self.lastNackMsByDisplay displayID:displayID
+                    intervalMs:5.0 nowMs:now]) {
         if (error) *error = M1SessErr(M1ControlSessionErrorRateLimited,
-            @"补片请求限流（50ms）");
+            @"补片请求限流（5ms/屏）");
         return NO;
     }
     NSMutableArray<NSNumber *> *idx = [NSMutableArray arrayWithCapacity:indices.count];
@@ -570,15 +611,17 @@ static NSString *M1ArchName(void) {
                                        @"frameSeq": @(frameSeq),
                                        @"fragCount": @(fragCount),
                                        @"indices": idx } mutableCopy];
-    NSNumber *displayID = self.remoteDisplays.firstObject[@"displayID"];
-    if ([displayID isKindOfClass:[NSNumber class]]) payload[@"displayID"] = displayID;
+    NSNumber *wireID = [self wireDisplayIDFor:displayID];
+    if (wireID) payload[@"displayID"] = wireID;
     if (![self sendPayload:payload]) return NO;
-    atomic_store(&_lastNackMs, now);
+    [self markRateLimit:self.lastNackMsByDisplay displayID:displayID nowMs:now];
     atomic_fetch_add(&_nacksSent, 1);
     return YES;
 }
 
-- (BOOL)requestWholeFrame:(uint32_t)frameSeq error:(NSError **)error {
+- (BOOL)requestWholeFrameForDisplay:(uint32_t)displayID
+                           frameSeq:(uint32_t)frameSeq
+                              error:(NSError **)error {
     if (error) *error = nil;
     if (self.role != M1ControlRoleClient) {
         if (error) *error = M1SessErr(M1ControlSessionErrorProtocol,
@@ -591,19 +634,19 @@ static NSString *M1ArchName(void) {
         return NO;
     }
     double now = [[NSDate date] timeIntervalSince1970] * 1000.0;
-    double last = atomic_load(&_lastWholeNackMs);
-    if (now - last < 5.0 && last > 0) {
+    if (![self rateLimitAllows:self.lastWholeNackMsByDisplay displayID:displayID
+                    intervalMs:5.0 nowMs:now]) {
         if (error) *error = M1SessErr(M1ControlSessionErrorRateLimited,
-            @"整帧补片请求限流（5ms）");
+            @"整帧补片请求限流（5ms/屏）");
         return NO;
     }
     NSMutableDictionary *payload = [@{ @"type": @"frame-nack",
                                        @"frameSeq": @(frameSeq),
                                        @"all": @YES } mutableCopy];
-    NSNumber *displayID = self.remoteDisplays.firstObject[@"displayID"];
-    if ([displayID isKindOfClass:[NSNumber class]]) payload[@"displayID"] = displayID;
+    NSNumber *wireID = [self wireDisplayIDFor:displayID];
+    if (wireID) payload[@"displayID"] = wireID;
     if (![self sendPayload:payload]) return NO;
-    atomic_store(&_lastWholeNackMs, now);
+    [self markRateLimit:self.lastWholeNackMsByDisplay displayID:displayID nowMs:now];
     atomic_fetch_add(&_nacksSent, 1);
     return YES;
 }
@@ -617,16 +660,20 @@ static NSString *M1ArchName(void) {
     if (self.closed || self.stateMachine.state != P1SessionStateStreaming) return;
     NSNumber *seqNum = msg[@"frameSeq"];
     if (![seqNum isKindOfClass:[NSNumber class]]) return;
+    uint32_t displayID = 0;
+    NSNumber *d = msg[@"displayID"];
+    if ([d isKindOfClass:[NSNumber class]]) displayID = d.unsignedIntValue;
     NSNumber *allNum = msg[@"all"];
     if ([allNum isKindOfClass:[NSNumber class]] && allNum.boolValue) {
         // 整帧零分片：没有缺片下标可校验，交给发送端按 frameSeq 重发全部分片。
         atomic_fetch_add(&_nacksReceived, 1);
         if ([self.delegate respondsToSelector:
-                @selector(controlSession:didRequestFragmentsForFrame:fragCount:indices:)]) {
+                @selector(controlSession:didRequestFragmentsForDisplay:frameSeq:fragCount:indices:)]) {
             [self.delegate controlSession:self
-                 didRequestFragmentsForFrame:(uint32_t)seqNum.unsignedIntValue
-                                 fragCount:0
-                                   indices:[NSIndexSet indexSet]];
+              didRequestFragmentsForDisplay:displayID
+                                  frameSeq:(uint32_t)seqNum.unsignedIntValue
+                                  fragCount:0
+                                    indices:[NSIndexSet indexSet]];
         }
         return;
     }
@@ -649,11 +696,12 @@ static NSString *M1ArchName(void) {
     if (indices.count == 0) return;
     atomic_fetch_add(&_nacksReceived, 1);
     if ([self.delegate respondsToSelector:
-            @selector(controlSession:didRequestFragmentsForFrame:fragCount:indices:)]) {
+            @selector(controlSession:didRequestFragmentsForDisplay:frameSeq:fragCount:indices:)]) {
         [self.delegate controlSession:self
-             didRequestFragmentsForFrame:(uint32_t)seqNum.unsignedIntValue
-                             fragCount:fragCount
-                               indices:indices];
+          didRequestFragmentsForDisplay:displayID
+                              frameSeq:(uint32_t)seqNum.unsignedIntValue
+                              fragCount:fragCount
+                                indices:indices];
     }
 }
 

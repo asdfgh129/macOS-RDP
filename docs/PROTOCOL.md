@@ -3,7 +3,7 @@
 | 项 | 值 |
 |---|---|
 | 版本 | protocol v1 |
-| 日期 | 2026-11-16；2026-11-18 11:20 冻结 |
+| 日期 | 2026-11-16；2026-11-18 11:20 冻结；2026-11-22 帧头 v3；2026-11-23 多屏字段（v1.3） |
 | 状态 | **已冻结（2026-11-18 11:20），作为 M1 基线**。D-01（QUIC datagram）、D-09（采集主路径）已确认；帧通道握手/ALPN/拥塞控制在 M1 实现中按 §7 落地，不再阻塞冻结 |
 | 上位文档 | `docs/DESIGN.md` §3.2 / §4.3 / §5 |
 
@@ -47,8 +47,9 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 | `session-update` | C→H | `specs[]` | 动态改分辨率/屏数；Host 事务性执行，失败回滚并 `session-error` |
 | `session-error` | H→C | `code, detail, recoverable` | 错误码见 §5 |
 | `input` | C→H | 见 §3.1 | 高频，不要求 ack |
-| `keyframe-request` | C→H | `displayID` | 丢帧/解码失败/重连后 |
+| `keyframe-request` | C→H | `displayID, reason` | 丢帧/解码失败/重连后；按屏限速 300ms |
 | `keyframe-sent` | H→C | `displayID, frameSeq` | 响应确认 |
+| `frame-nack` | C→H | `displayID, frameSeq, fragCount, indices[]` 或 `all:true` | 定向补片：缺失分片下标（≤64）或整帧重发；按屏限速 5ms |
 | `heartbeat` | 双向 | `ts` | 1s |
 | `time-sync` | C→H | `t0` | 客户端本地 epoch 微秒；仅 STREAMING 态 |
 | `time-sync-reply` | H→C | `t0, t1` | Host 收到即回：原样带回 `t0`，`t1` 为 Host 本地 epoch 微秒 |
@@ -82,6 +83,19 @@ DISCOVERED → TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → ST
 - 修饰键采用**状态同步**而非逐事件转发：Client 维护状态机，变化时发 `kind:"flags"` 全量；重连后必发一次全量复位。
 - Host 注入速率限制：单会话 ≤ 1000 event/s，超限丢弃 move 类（保留 down/up/key）。
 
+### 3.2 多屏路由（2026-11-23，M2）
+
+- `session-start.specs` 的条数即屏数，上限 `capabilities.maxDisplays`（当前 8）；超过时 Host 回
+  `session-error{code:"SPEC_UNSUPPORTED", recoverable:false}`。`session-ready.displays[]` 给出每块虚拟屏的 `displayID`。
+- **帧序号按屏独立**：每块屏一条采集/编码管线，`frameSeq` 各自从 0 递增，跨屏不共享序号空间。
+  缺口判据、重组、补片都只在单屏内进行；接收端按屏各建一个重组器/帧队列。
+- `keyframe-request` / `frame-nack` 必须携带 `displayID`，Host 只对该屏管线响应。兼容语义：
+  发送端 `displayID=0` 表示未指定，Client 在写线时回落到 `session-ready` 的首屏；Host 收到 0 视为
+  “全部管线”（旧单屏客户端行为），未知的非 0 ID 直接忽略并计数。
+- 输入事件内的 `displayID` 在多屏下必填（鼠标按该屏 Quartz bounds 换算）；Host 对未知 ID 的
+  鼠标事件拒绝注入而不是落到默认屏。`kind:"flags"` 仍不参与屏坐标。
+- 限流（关键帧 300ms、补片 5ms）按 `displayID` 独立记账，一块屏的频繁请求不会拖住其它屏。
+
 ## 4. 帧通道二进制头（v3：26 字节，大端）
 
 | 偏移 | 字段 | 宽度 | 说明 |
@@ -111,6 +125,9 @@ v2 及更早帧头一律按 `BadVersion` 拒绝，不做兼容回退（双端始
 
 载荷：AVCC（长度前缀 NALU）；关键帧分片带 SPS/PPS（flags bit2）。`capturedAtUs` 随帧头传，仅用于延迟打点，不参与渲染调度。
 
+`frameSeq` 与 `displayID` 一起构成帧的身份：多屏时各屏序号空间独立（见 §3.2），接收端按
+`displayID` 分流到各自重组器，不把不同屏的序号放一起判缺口。
+
 丢帧策略：FrameReceiver 检测 frameSeq 缺口 → 丢弃该帧全部分片 → `keyframe-request`；解码器在关键帧到达前不产出。旧帧迟到直接丢弃（实时性优先）。已由 `P1FrameReassembler` 实现并单测。
 
 **D-01 补充**：帧通道已定为 QUIC datagram（`nw_quic_set_stream_is_datagram`）。QUIC short header + AEAD tag 约 20–30 B，分片上限已按 **1150 B** 下调（`P1FrameMaxPayload`），为 1200 B MTU 留出头部余量；帧头 payloadLen 与分片器共用该常量，并已同步单测。
@@ -137,4 +154,5 @@ v2 及更早帧头一律按 `BadVersion` 拒绝，不做兼容回退（双端始
 
 - D-01 已决（2026-11-17，QUIC datagram）；**v1 已冻结（2026-11-18 11:20）**。帧通道实现细则（ALPN `macos-rdp-v1`、idle timeout 30s、max UDP payload 1200B、分片上限 1150B）见 D-01 与 §4，由 M1 按此实现，不再作为冻结前置；拥塞控制使用 Network.framework 默认策略，P2 双机实测后再评估调优。
 - 光标通道（FR-10, P2）预留 `type:"cursor"`，本期不实现。
-- 变更记录：v1.1-draft 2026-11-18 **§3.1 明确 `displayID` 位置（两处都带）+ 只在 STREAMING 态收发**，实现见 D-17；v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram）；2026-11-18 分片上限由 1200 下调为 1150 B，并补齐 §3.1 输入编解码与 §2 状态机的单测实现；2026-11-18 11:20 **冻结为 v1**（评审通过，M1 基线），QUIC 实现细则以 D-01 为准，双机端到端实测转入 P2 验收；2026-11-22 **帧头 v3（26B，内嵌 `capturedAtUs`）+ 控制通道 `time-sync`/`time-sync-reply`**，为 A-02 提供 capture→render 打点（JSON `v` 不变）。
+- 多屏（M2）只扩展既有消息字段（`displayID` 贯通关键帧/补片、`frameSeq` 按屏独立），不改帧头格式与 `v` 版本号；`specs` 上限 8 屏，超出由 Host 明确拒绝。
+- 变更记录：v1.3 2026-11-23 **§3 新增 `frame-nack` 与 §3.2 多屏路由**（per-display 序号/限流、`displayID=0` 兼容语义、8 屏上限）；v1.2-draft 2026-11-22 **帧头 v3（26B，内嵌 `capturedAtUs`）+ 控制通道 `time-sync`/`time-sync-reply`**，为 A-02 提供 capture→render 打点（JSON `v` 不变）；v1.1-draft 2026-11-18 **§3.1 明确 `displayID` 位置（两处都带）+ 只在 STREAMING 态收发**，实现见 D-17；v1-draft 2026-11-16 首次起草；2026-11-17 按 D-01 更新 §1/§4/§6/§7（帧通道 = QUIC datagram）；2026-11-18 分片上限由 1200 下调为 1150 B，并补齐 §3.1 输入编解码与 §2 状态机的单测实现；2026-11-18 11:20 **冻结为 v1**（评审通过，M1 基线），QUIC 实现细则以 D-01 为准，双机端到端实测转入 P2 验收。
