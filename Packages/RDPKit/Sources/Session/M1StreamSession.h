@@ -67,7 +67,7 @@ double M1StreamNowMs(void);
 // Host：session-update 事务换屏；nil/错误 = 失败（旧屏保持可用），返回新的 displays[]
 @property (nonatomic, copy, nullable) NSArray<NSDictionary *> *(^onSessionUpdateSpecs)(NSArray<NSDictionary *> *specs,
                                                                                    NSError **error);
-// Host：keyframe-request / frame-nack（控制收包队列上调用）。
+// Host：keyframe-request / frame-nack（控制交付队列上调用，与传输收包线程分离）。
 //   displayID 是请求目标屏；0 表示旧版客户端未带（单屏按唯一管线、多屏按全部管线）。
 @property (nonatomic, copy, nullable) void (^onKeyframeRequest)(uint32_t displayID);
 @property (nonatomic, copy, nullable) void (^onFrameNack)(uint32_t displayID, uint32_t frameSeq,
@@ -76,7 +76,7 @@ double M1StreamNowMs(void);
 @property (nonatomic, copy, nullable) void (^onAttemptFailed)(void);
 // Client：session-start 请求的规格；nil = 1920x1080
 @property (nonatomic, copy, nullable) NSArray<NSDictionary *> *requestedSpecs;
-// Client：session-update 结果（控制收包队列上调用；ok=NO 时会话仍可用）
+// Client：session-update 结果（控制交付队列上调用；ok=NO 时会话仍可用）
 @property (nonatomic, copy, nullable) void (^onSessionUpdateResult)(int64_t updateID, BOOL ok,
                                                                NSArray<NSDictionary *> *displays,
                                                                NSString * _Nullable detail);

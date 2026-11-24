@@ -68,6 +68,13 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 #pragma mark - M1StreamNode
 
+@interface M1StreamNode ()
+// 控制消息交付专用串行队列。收包回调跑在传输线程上，直接交付会让会话处理
+// （换屏建屏/写盘等，秒级）堵住 ACK 与心跳的收包，双方控制链路在 2s 重传
+// 预算内误判失败（FR-07 实测：换屏 2.2s 后两端心跳同时消失、结果回包丢失）。
+@property (nonatomic, strong) dispatch_queue_t controlDeliveryQueue;
+@end
+
 @implementation M1StreamNode
 
 - (instancetype)init {
@@ -77,6 +84,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
         _alpn = @"rdp1";
         _readySem = dispatch_semaphore_create(0);
         _streamingSem = dispatch_semaphore_create(0);
+        _controlDeliveryQueue = dispatch_queue_create("m1.stream.control-delivery",
+                                                      DISPATCH_QUEUE_SERIAL);
         _fps = 20;
         _bitrateKbps = 12000;
         _controlArrivals = [NSMutableArray array];
@@ -295,7 +304,11 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
             [self.controlArrivals addObject:@(round(now - self.streamStartMs))];
         }
     }
-    [self.channel feedBytes:message];
+    // 交付切到专用串行队列（见 controlDeliveryQueue 注释）；link 端已先回 ACK。
+    NSData *msg = message;
+    dispatch_async(self.controlDeliveryQueue, ^{
+        [self.channel feedBytes:msg];
+    });
 }
 
 - (void)controlLink:(M1ControlLink *)link didFailWithError:(NSError *)error {
