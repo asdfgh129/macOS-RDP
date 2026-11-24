@@ -1005,9 +1005,7 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 
 ### 影响与边界
 
-- **未跑双机真机多屏**：本轮只做单测与环回验证（控制面 displayID 透传、注入按屏拒绝、双屏
-  session-ready、环回自检）。真机多屏采集/上屏/输入验收按约定放夜间，结论按 OS 分离写
-  `RESULTS-BY-OS.md`。
+- **真机多屏已验证（2026-11-24）**：Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，2×1280×720@15，`3e18538`），keep-main 与全独占两档均 PASS——keep-main client 138/138 解码上屏、`c09=skipped-keep-main`；独占 `c09=verified`、client 981/981 解码上屏、0 丢帧、窗口布局 7/7 恢复、物理屏在位。详见 `RESULTS-BY-OS.md` §5.39；输入按屏注入仍由单测覆盖，真机未操作。
 - 多屏的带宽/CPU 预算未做门禁：每屏 20fps 编码目标，合计速率受同一 QUIC 发送窗口与节拍约束；
   发送队列满时按 `sendDatagram:error:` 现有语义丢帧，不新增跨屏优先级。
 - PNG 证据文件在多屏时命名为 `frame-d<displayID>-NNN.png`；单屏维持原名。
