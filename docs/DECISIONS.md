@@ -1059,7 +1059,8 @@ M1-A 打通了跨进程推流，但客户端只会把解码帧写成 PNG——�
 - 换屏后新屏的 `frameSeq` 从 0 起、`displayID` 全新，客户端必须等新关键帧（结果回包后
   路由器清空旧视图即满足）。
 - 验收：单测 341 项全 PASS（新增 `upd-*` 14 项、`plan-text-*` 5 项、`mod-*` 6 项）；
-  五 target 构建成功。真机结论见 `RESULTS-BY-OS.md` §5.42。
+  五 target 构建成功。真机结论见 `RESULTS-BY-OS.md` §5.42（FR-07 keep-main 2→1 与 FR-06
+  真机文本注入均 PASS；沉浸模式真机目测待补）。
 
 ---
 

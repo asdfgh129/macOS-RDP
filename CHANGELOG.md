@@ -4,6 +4,22 @@
 
 格式约定：以日期为版本号构成版本节（`[YYYY-MM-DD]` + 里程碑简述），节内按 **Added / Changed / Fixed / Documentation** 分类，每条附短 commit hash；分类参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，Documentation 用于纯文档提交，本文件自身的维护提交不重复列入。真机结论按 OS 分离记录在 `docs/RESULTS-BY-OS.md`，决策编号见 `docs/DECISIONS.md`。
 
+## [2026-11-24] — M2 收口：会话内换屏（FR-07）与完整输入（FR-06）
+
+### Added（最近更新）
+
+- docs: `RESULTS-BY-OS.md` §5.42 M2 收口真机入档——FR-07 keep-main 2→1 WAN PASS（结果回包、窗口重绑、0 丢帧），FR-06 真机文本注入 PASS（`inputOK=2`、host 落盘逐字节一致）；沉浸模式目测与 FR-07 取档因 host WindowServer 脏态延后，已重启待补
+- feat: client `--send-text MS:text` 诊断钩子（按 IME 提交格式上行 text 事件）与沉浸窗口落位打印 (`610a3c7`)
+
+### Added
+
+- feat: FR-07 会话内事务换屏——`session-update/result`（协议 v1.4）、驱动「先建新-验可见-再拆旧」+ 协调器回滚、Host 管线重建、Client 窗口重绑 (`7d7041b`)
+- feat: FR-06 完整输入——`kind:"text"` 整串文本注入（≤256 UTF-16）、修饰键逐键 `flagsChanged`、`Cmd+Opt+F` 沉浸模式 (`7d7041b`)
+
+### Fixed
+
+- fix: 控制消息交付移出 QUIC 收包线程——换屏 ~2.2s 会拖死双方 ACK，250ms×8 重传预算耗尽后控制链路静默失败（帧流照常） (`7f664b6`)
+
 ## [2026-11-23] — 产品化骨架与四轮收口（VeilRD 定名 / workspace / 分层 / 静态库 / QUIC 端到端链路）
 
 ### Added（最近更新）

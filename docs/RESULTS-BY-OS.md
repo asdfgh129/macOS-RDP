@@ -1640,6 +1640,32 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 **决定**：P2.3 基线取数条件定为「Qoder 最小化即可」，不再要求隐藏 Qoder 或暂停 mds；仅当 vga 出现 10ms 级异常时才回退到隐藏 + 暂停做对照。Qoder 前台可见时仍不可取数（§5.40 对照 35.0ms）。
 
+### 5.42 M2 收口：FR-07 会话内换屏 + FR-06 完整输入真机（2026-11-24 21:3x–22:2x）
+
+**环境**：Tahoe 26.5.2（25F84）host（Mac-mini.local，WAN，SSH 走 TCP 46601 → :22）× Sequoia 15.5（24F74）client；代码 `7d7041b` + 控制交付修复 `7f664b6`（host 同步后重建）；720p15、`--keep-main`，host 由 GUI 会话内 Terminal 启动，`caffeinate -d -u` 防屏睡。
+
+**A. FR-07 会话内换屏（2 屏 → 1 屏，keep-main，WAN）**
+- client `--spec 1280x720 ×2`、`--update-at 30000 --update-spec 1024x768`；host 初始 2 块虚拟屏（4128835 / 4128834）并行推流，`c09=skipped-keep-main`。
+- 换屏：host 打印 `[换屏] 2 屏 → 1 屏（首屏 displayID=4128833）`，旧屏 4128835/4128834 标记 retired 并销毁，新屏 4128833（1024×768）建齐后才进入管线。
+- client 收到 `session-update-result ok:true`，打印「换屏 #1 成功：1 屏」「窗口 1 → displayID=4128833（1024×768）」；旧窗口关闭、新窗口重绑后持续解码上屏，PNG 采样为新屏实时内容（非黑），0 传输丢帧。
+- 控制链路存活：两端控制最大间隔 client 1.44s / host 1.19s（<3s 门禁），换屏后心跳与输入继续。
+- **根因与修复（`7f664b6`）**：换屏事务在建屏/验屏上耗时 ~2.2s；原实现把控制消息在 QUIC 收包线程上同步交付，处理期间双方 ACK 停摆，250ms×8 = 2s 重传预算耗尽后 `M1ControlLink` 静默置 failed——帧流照常、控制链路已死（首轮实测：换屏后两端心跳同时消失、`session-update-result` 丢失）。现改为专用串行交付队列（`m1.stream.control-delivery`），收包线程只入队；修复后同场景 PASS。
+
+**B. FR-06 文本注入（host `--inject real`，keep-main 1×1280x720）**
+- 发端：client `--send-text 15000:HelloVeilRD --send-text 22000:中文输入测试`（与 IME `insertText:` 同一 `kind:"text"` 事件）；收端：host 置前 Terminal 以 raw 模式 `cat > /tmp/m2-typed.txt`。
+- 首轮“失败”定位：收端 Terminal 处于行规程 canonical 模式，无换行不落盘（host 端 `inputOK=2` 注入已成功、文件却 0B）——收端问题，非协议或注入问题。
+- raw 模式复跑：`/tmp/m2-typed.txt` = `HelloVeilRD中文输入测试`（29B UTF-8，与发端逐字节一致）；host JSON `inputOK=2 / inputFail=0`；client 收齐 39 / 解码 39 / 上屏 39、0 丢帧，p50/p95 = 30.5/1085.5ms，控制最大间隔 1058ms。
+- 说明：IME 本地组字候选窗无法脚本化，仍由单测覆盖（`M1FrameView` 完整 `NSTextInputClient` + marked text 子层）；本轮真机验证的是「提交后整串文本 → HID 层 CGEvent 注入 → 目标应用落字」。
+
+**C. 沉浸模式（待补测）**
+- 实现与单测同批（`7d7041b`）：`Cmd+Opt+F` 切换 borderless 全屏 + 自动隐藏 Dock/菜单栏，退出恢复。
+- 真机目测未完成：准备阶段 host WindowServer 进入「虚拟屏 `online=true / active=false`」脏态（连续建屏/销毁后遗留，agent 进程重启无效），已按用户确认重启 host，待补测。
+- 顺带观察（待复核）：未进入 STREAMING 的失败会话里，沉浸窗口在 CGWindowList 中呈 0×0/不在屏上；已加「沉浸窗口 i: x,y WxH」落位打印，重启后一并确认是否仅为失败会话副作用。
+
+**D. 备注**
+- 同一 host agent 进程内「会话结束 → 新客户端重连」路径有旧管线/旧 displayID 帧残留迹象（复测中 client 绑新屏 4128834，却持续出现旧屏 4128835 的接收器与 0 帧会话）；正式档仍按「一客户端一 agent」执行，重连清理项记入待办。
+- SSH 入口为 TCP 46601 → host :22（`PRODUCT-DUAL-RUNBOOK.md` §0.3）；本轮曾误探 22 端口导致一度判 host 失联。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
@@ -1655,6 +1681,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
+- v0.72-draft 2026-11-24 22:3x：**M2 收口真机（§5.42）**。FR-07 keep-main 2→1 WAN 换屏 PASS：host `[换屏] 2→1（4128833 1024×768）`、旧屏 retired、client 结果 ok 并重绑窗口、0 丢帧、两端控制间隔 1.44s/1.19s；根因定位为控制消息在 QUIC 收包线程同步交付，换屏 ~2.2s 拖死 ACK、2s 重传预算耗尽后控制链路静默失效，修复 `7f664b6`（专用交付队列）。FR-06 真机文本注入 PASS：client `--send-text` 两串 → host `inputOK=2`、落盘 `HelloVeilRD中文输入测试` 29B 逐字节一致、39/39 上屏 0 丢帧；首轮收端 canonical 模式不落盘已定位。沉浸模式真机目测与 FR-07 取档因 host WindowServer 虚拟屏 `active=false` 脏态延后，已重启 host 待补。
 - v0.71-draft 2026-11-24 21:2x：**P2.3 基线取数条件收敛（§5.41）**。Qoder 仅最小化（进程未挂起、mds 未暂停）8 轮离屏：vga 2.3/2.5/2.77、720p 3.1/3.65/4.6、1080p 5.3/5.85/7.5、ultrawide 13.4/14.8/17.15ms，8/8 ALL PASS，与隔离口径 p50 差 ≤0.5ms；此后基线只需最小化 Qoder。
 - v0.70-draft 2026-11-24 21:1x：**双屏真注入 + P2.3 基线复核（§5.40）**。Tahoe host `--keep-main --inject real` × Sequoia client 双窗口：host input 15/0、光标 (10,10)→(4133,395)，client 上送 15、0 失败，1273/1273 解码上屏、0 丢帧、p50/p95 26.5/155.5ms；恢复与窗口布局正常。P2.3 隔离负载 8 轮：vga 2.2/2.35/2.7、720p 3.2/3.35/3.7、1080p 5.1/5.45/6.2、ultrawide 10.2/13.3/17.0，ALL PASS，与 §5.38 一致；Qoder 可见时 vga 35ms 超护栏，再次证明负载敏感性。
 - v0.69-draft 2026-11-24 21:0x：**M2 多屏双机实测（§5.39）**。Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，1280×720×2@15，`3e18538`）：keep-main 档 client 138/138 解码上屏、0 丢帧、`c09=skipped-keep-main`、物理屏恢复；全独占档 `c09=verified`、client 981/981 解码上屏、0 丢帧、p50/p95 129.5/308.5ms、控制间隔 1.16s、窗口布局 7/7 恢复、物理屏 2 块在位。PNG 按 `frame-d<displayID>-` 命名且两屏内容非黑。备注：host 屏睡会令 CG active=0 阻断建屏（caffeinate 唤醒）；重定向日志需 `script -q /dev/null` 才实时。
