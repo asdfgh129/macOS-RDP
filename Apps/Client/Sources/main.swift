@@ -293,6 +293,8 @@ func runConnect() -> Int32 {
                     slot.window.setFrame(screens[min(i, screens.count - 1)].frame, display: true)
                 }
                 slot.window.makeKeyAndOrderFront(nil)
+                let f = slot.window.frame
+                print("沉浸窗口 \(i + 1): \(Int(f.origin.x)),\(Int(f.origin.y)) \(Int(f.width))×\(Int(f.height))")
             } else {
                 slot.window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
                 if let f = slot.savedFrame { slot.window.setFrame(f, display: true) }
