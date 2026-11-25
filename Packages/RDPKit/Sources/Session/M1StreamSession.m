@@ -251,8 +251,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     M1QuicTransport *t = [[M1QuicTransport alloc] initAsClientToHost:host
                                                                 port:port
                                                                 alpn:self.alpn
-                                                        identityPath:nil
-                                                        identityPass:nil
+                                                        identityPath:self.identityPath
+                                                        identityPass:self.identityPass
                                                           verifyPeer:YES];
     t.expectedPeerFingerprint = self.expectedFingerprint;
     t.delegate = self;
@@ -289,8 +289,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     M1QuicTransport *t = [[M1QuicTransport alloc] initAsClientToHost:host
                                                                 port:port
                                                                 alpn:self.alpn
-                                                        identityPath:nil
-                                                        identityPass:nil
+                                                        identityPath:self.identityPath
+                                                        identityPass:self.identityPass
                                                           verifyPeer:YES];
     t.expectedPeerFingerprint = self.expectedFingerprint;
     t.delegate = self;

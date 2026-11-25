@@ -367,7 +367,7 @@ static BOOL P0VPerformTransaction(P0VCommitScope scope,
             userInfo:@{NSLocalizedDescriptionKey: @"WindowServer 已判定挂起，拒绝发起新的显示配置事务"}];
         return NO;
     }
-    if (timeoutSec <= 0) timeoutSec = 20;
+    if (timeoutSec <= 0) timeoutSec = 8;   // NFR-06：SPI 挂起 8s 内熔断
 
     __block CGError beginErr = kCGErrorSuccess;
     __block CGError commitErr = kCGErrorSuccess;

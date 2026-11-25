@@ -1200,6 +1200,14 @@ static void TestControlSessionPairingCode(void) {
        "ctl-hello-fingerprint-mismatch");
     OK(![(M1ControlSession *)fpBad[@"client"] reachedStreaming],
        "ctl-fingerprint-mismatch-not-streaming");
+
+    // NFR-07：Host 侧反向钉死客户端指纹（无人值守主机必须开 --allow-fingerprint），
+    // 客户端通告 cd、Host 钉死 zz → Host 拒绝，不进 STREAMING。
+    NSDictionary *hostPin = RunPairFull(nil, nil, FP(@"cd"), nil, FP(@"ab"), FP(@"zz"));
+    NSError *hpErr = ErrOf(hostPin[@"hostError"]);
+    OK(hpErr != nil && hpErr.code == M1ControlSessionErrorFingerprint,
+       "ctl-host-pins-client-fingerprint");
+    OK(![(M1ControlSession *)hostPin[@"host"] reachedStreaming], "ctl-host-pin-not-streaming");
 }
 
 #pragma mark - 控制会话（输入通路）

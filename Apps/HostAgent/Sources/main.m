@@ -142,8 +142,10 @@ static void AgentServeUsage(void) {
         "       [--spec WxH] [--fps N] [--duration-ms N] [--wait-ms N]\n"
         "       [--max-sessions N] [--display ID] [--mirror] [--keep-main]\n"
         "       [--inject record|real] [--identity PATH] [--pass PASS] [--out JSON]\n"
+        "       [--allow-fingerprint HEX]\n"
         "  默认独占会话（按客户端规格建虚拟屏并禁物理屏）；--mirror 采物理主屏仅作诊断。\n"
         "  --inject 默认 record；双机真机验收改 real（需辅助功能授权）。\n"
+        "  --allow-fingerprint 钉死允许接入的客户端证书指纹（NFR-07；不给则任何客户端可接入）。\n"
         "  --max-sessions 默认 1（一个客户端一个 agent）；N>1 时每个会话结束即清理并等下一个，0=不限。\n");
 }
 
@@ -158,6 +160,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     uint16_t port = 0;
     NSString *portFile = nil, *outPath = nil, *specText = nil;
     NSString *identity = @".state/rdp-identity.p12", *pass = @"rdpdev", *inject = @"record";
+    NSString *allowFp = nil;
     uint32_t waitMs = 15000;
     int durationMs = 5000, fps = 20;
     NSUInteger maxSessions = 1;
@@ -183,6 +186,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         else if (!strcmp(a, "--inject") && i + 1 < argc) inject = [NSString stringWithUTF8String:argv[++i]];
         else if (!strcmp(a, "--mirror")) exclusive = NO;
         else if (!strcmp(a, "--keep-main")) keepMain = YES;
+        else if (!strcmp(a, "--allow-fingerprint") && i + 1 < argc) allowFp = [NSString stringWithUTF8String:argv[++i]];
         else { AgentServeUsage(); return NO; }
     }
     if (specText && !AgentParseSpec(specText, &specW, &specH)) { AgentServeUsage(); return NO; }
@@ -196,10 +200,24 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         return NO;
     }
 
+    // NFR-07：无人值守主机必须钉死允许接入的客户端指纹，否则输入注入对任何
+    // 能完成 TLS 握手的对端开放。--allow-fingerprint 缺省 nil（联调/P0 兼容）。
+    NSString *pinnedFp = nil;
+    if (allowFp.length > 0) {
+        pinnedFp = M1NormalizeFingerprint(allowFp);
+        if (pinnedFp.length == 0) {
+            printf("✗ --allow-fingerprint 不是合法 SHA-256 指纹: %s\n", allowFp.UTF8String);
+            return NO;
+        }
+    } else {
+        printf("⚠ 未钉死客户端指纹（--allow-fingerprint）：任何客户端都可接入并注入输入\n");
+    }
+
     M1StreamNode *host = [M1StreamNode new];
     host.identityPath = identity;
     host.identityPass = pass;
     host.localFingerprint = localFp;
+    host.expectedFingerprint = pinnedFp;
     host.fps = fps;
 
     // 显示事务串行队列：建屏/还屏都是秒级 WindowServer 事务，跨轮必须互斥。
@@ -369,6 +387,36 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
             [pipeByDisplay removeAllObjects];
         }
     };
+
+    // M3 加固：SIGTERM/SIGINT 必须走有序收尾（停管线→还物理屏→销毁虚拟屏→摘 guardian）。
+    // 直接被杀会让 WindowServer 留在「物理屏已禁、VD 未拆」的脏态，guardian 兜底
+    // 在 Tahoe 上恢复失败（CGError 1001），机器变无头只能重启。
+    static dispatch_source_t termSrc = nil, intSrc = nil;
+    void (^handleTermination)(NSString *) = ^(NSString *signame) {
+        printf("\n[信号] 收到 %s，开始有序收尾\n", signame.UTF8String);
+        fflush(stdout);
+        [host shutdown];
+        dispatch_sync(displayTxQueue, ^{
+            retirePipelines();
+            endExclusive();
+        });
+        printf("[信号] 显示已恢复，退出\n");
+        fflush(stdout);
+        exit(0);
+    };
+    dispatch_queue_t sigQueue = dispatch_queue_create("veild.signal", DISPATCH_QUEUE_SERIAL);
+    for (NSNumber *sigNum in @[ @(SIGTERM), @(SIGINT) ]) {
+        int sig = sigNum.intValue;
+        dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)sig, 0, sigQueue);
+        if (!src) {
+            printf("⚠ 无法监听信号 %d，被杀时将无还屏保护\n", sig);
+            continue;
+        }
+        NSString *name = (sig == SIGTERM) ? @"SIGTERM" : @"SIGINT";
+        dispatch_source_set_event_handler(src, ^{ handleTermination(name); });
+        dispatch_resume(src);
+        if (sig == SIGTERM) termSrc = src; else intSrc = src;
+    }
 
     // 启动一组管线；任一失败就停掉本批并返回 NO（调用方负责回滚显示）。
     BOOL (^startPipelines)(NSArray<NSDictionary *> *) = ^BOOL(NSArray<NSDictionary *> *displays) {

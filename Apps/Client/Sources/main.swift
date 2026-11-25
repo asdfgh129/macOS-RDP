@@ -283,6 +283,23 @@ func runConnect() -> Int32 {
     let router = DisplayRouter()
     let client = M1StreamClientNode()
 
+    // NFR-07：客户端用持久身份证书接入，主机才能按指纹钉死（--allow-fingerprint）。
+    // 缺身份文件时不阻断（P0 联调兼容），但会失去配对认证这一层。
+    let identityPath = arg("--identity") ?? ".state/rdp-identity.p12"
+    let identityPass = arg("--pass")
+    if FileManager.default.fileExists(atPath: identityPath) {
+        client.identityPath = identityPath
+        if let identityPass { client.identityPass = identityPass }
+        if let fp = M1QuicIdentityFingerprint(identityPath, client.identityPass, nil) {
+            client.localFingerprint = fp
+            print("客户端身份 \(identityPath) 指纹 \(fp)")
+        } else {
+            print("⚠ 客户端身份读取失败：\(identityPath)（主机无法钉死本端）")
+        }
+    } else {
+        print("⚠ 无客户端身份 \(identityPath)：主机 --allow-fingerprint 将无法生效")
+    }
+
     // FR-06 沉浸模式：窗口铺满各自屏幕、自动隐藏 Dock/菜单栏；Cmd+Opt+F 切换。
     var immersive = false
     func applyImmersive(_ on: Bool) {

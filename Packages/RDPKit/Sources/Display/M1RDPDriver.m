@@ -17,6 +17,10 @@
 
 NSString * const M1RDPDriverErrorDomain = @"M1RDPDriver";
 
+// NFR-06：任何显示配置 SPI 挂起 8s 即熔断（置 WindowServerHung、此后拒绝新事务）。
+// 真机正常提交是毫秒级；8s 还回不来只能是 WindowServer 卡死。
+static const int M1DisplayTxTimeoutSec = 8;
+
 static NSError *M1DrvErr(M1RDPDriverErrorCode code, NSString *desc) {
     return [NSError errorWithDomain:M1RDPDriverErrorDomain code:code
         userInfo:@{ NSLocalizedDescriptionKey: desc ?: @"M1RDPDriver error" }];
@@ -289,7 +293,8 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     if (inactive.count == 0) return;
     NSDictionary *detail = nil;
     NSError *e = nil;
-    BOOL ok = P0VApplyDisplayEnabledChanges(@[], inactive, P0VCommitScopeSession, 20, &detail, &e);
+    BOOL ok = P0VApplyDisplayEnabledChanges(@[], inactive, P0VCommitScopeSession,
+                                            M1DisplayTxTimeoutSec, &detail, &e);
     printf("  [建屏] %lu 块虚拟屏未 active，显式 enable 事务%s%s\n",
            (unsigned long)inactive.count, ok ? "已提交" : "失败",
            ok ? "" : (e.localizedDescription.UTF8String ?: ""));
@@ -398,7 +403,7 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     NSDictionary *detail = nil;
     NSError *disableErr = nil;
     BOOL ok = P0VApplyDisplayEnabledChanges(physical, @[], P0VCommitScopeSession,
-                                            20, &detail, &disableErr);
+                                            M1DisplayTxTimeoutSec, &detail, &disableErr);
 
     [NSThread sleepForTimeInterval:1.0]; // 等登录 UI 迁移（D-08 实测触发条件）
     if (self.screenSharingQuiesced) {
@@ -471,7 +476,8 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     if (self.snapshot && self.snapshotPath && !P0VWindowServerHung()) {
         NSDictionary *detail = nil;
         NSError *restoreErr = nil;
-        if (!P0VRestoreSnapshot(self.snapshot, P0VCommitScopeSession, 20, &detail, &restoreErr)) {
+        if (!P0VRestoreSnapshot(self.snapshot, P0VCommitScopeSession,
+                                M1DisplayTxTimeoutSec, &detail, &restoreErr)) {
             ok = NO;
             if (error) *error = M1DrvErr(M1RDPDriverErrorRestoreFailed,
                 restoreErr.localizedDescription ?: @"恢复物理屏失败");

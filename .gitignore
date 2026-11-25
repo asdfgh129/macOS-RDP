@@ -43,6 +43,7 @@ M1-Skeleton/quic_probe
 
 # QUIC 测试身份与私钥（绝不能入库）
 M1-Skeleton/.state/
+.state/
 RDPApp/.build/
 RDPApp/rdpapp
 

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.veild.host</string>
+
+    <!-- FR-09：开机（自动登录进 GUI 会话后）自启，经 Terminal 拉起以继承
+         屏幕录制/辅助功能 TCC 授权（path 直起会被按自身进程判权，无头下无法授权）。 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>-a</string>
+        <string>Terminal</string>
+        <string>/Volumes/Data/Code/macOS-RDP/Scripts/host-deploy/run-host.command</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- open 立即退出，不能开 KeepAlive；崩溃自重启由 run-host.command 内部循环负责。 -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- 只在 Aqua（GUI）用户会话装载：TCC 授权按登录会话兑现。 -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/veild-host-launcher.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/veild-host-launcher.log</string>
+</dict>
+</plist>
