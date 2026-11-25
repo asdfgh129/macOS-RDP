@@ -378,7 +378,18 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     if (transport != self.streamConn) {
         dispatch_semaphore_signal(self.readySem);
     }
-    [self attachSessionTo:transport];
+    // attach 必须排到控制交付队列：它先要拆上一轮的控制对象，而上一轮的收尾
+    // （还屏，秒级）就在这条队列上。传输线程直接 attach 会插队到收尾前面，
+    // 收尾末尾的清理随即把新会话一起拆掉（实测：client 2 握手刚完成即被
+    // 上一轮 cleanup 取消连接，客户端报 57）。
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.controlDeliveryQueue, ^{
+        M1StreamNode *s = weakSelf;
+        if (!s) return;
+        // 期间若已换成更新的连接，这轮 attach 作废。
+        if (transport != s.streamConn) return;
+        [s attachSessionTo:transport];
+    });
 }
 
 - (void)quicTransport:(M1QuicTransport *)transport

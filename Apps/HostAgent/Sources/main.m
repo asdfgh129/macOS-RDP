@@ -579,12 +579,14 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         @synchronized (lastKeyframeByDisplay) { [lastKeyframeByDisplay removeAllObjects]; }
 
         // 客户端可能起管线期间就已离开；上一轮迟到的结束信号也不能把这一轮
-        // 瞬间判成结束——先清陈旧信号，仍在线才等真实结束。
+        // 瞬间判成结束——先清陈旧信号，再按「是否还在线」决定等真实结束。
         while (dispatch_semaphore_wait(sessionEndSem, DISPATCH_TIME_NOW) == 0) {}
-        BOOL reachedDurationEnd = YES;
-        if (host.streaming) {
+        BOOL clientLeft = !host.streaming;
+        BOOL reachedDurationEnd = NO;
+        if (!clientLeft) {
             reachedDurationEnd = dispatch_semaphore_wait(sessionEndSem,
                 dispatch_time(DISPATCH_TIME_NOW, (int64_t)durationMs * NSEC_PER_MSEC)) != 0;
+            if (!reachedDurationEnd) clientLeft = YES;
         }
         printf("  [会话 %lu] 结束（%s），收尾\n", (unsigned long)sessionsServed,
                reachedDurationEnd ? "时长到" : "客户端离开");
