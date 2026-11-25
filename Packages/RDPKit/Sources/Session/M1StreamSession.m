@@ -147,62 +147,79 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 }
 
 - (void)notifySessionClosedOnce {
+    // 先把本轮对象摘下来再异步通知：此刻还没有新一轮 attach，摘下来的都是
+    // 已结束那一轮的引用，后续 attach 的新对象不会被误拆/误取消。
+    M1ControlLink *link = nil;
+    M1ControlSession *session = nil;
+    M1ControlChannel *channel = nil;
+    M1QuicTransport *conn = nil;
     @synchronized (self) {
         if (self.sessionClosedNotified) return;
         self.sessionClosedNotified = YES;
+        self.lastControlDiagnostics = [self controlDiagnostics];
+        link = self.link; self.link = nil;
+        session = self.session; self.session = nil;
+        channel = self.channel; self.channel = nil;
+        conn = self.sessionTransport; self.sessionTransport = nil;
+        if (self.streamConn == conn) self.streamConn = nil;
     }
-    // 通知必须落在控制交付队列上：收尾（还屏/拆链路/停管线）跑在入口的
-    // onSessionClosed 里，而下一轮 session-start 也在同一条队列上处理，
-    // 串行才能保证「收尾完成」先于「下一轮建屏」（实测：两轮显示事务并发，
-    // 第二轮建出的屏被上一轮销毁）。传输线程触发的失败路径也走这里。
+    // 收尾跑在控制交付队列上：入口的 onSessionClosed 会把还屏/停管线排到
+    // 显示事务队列；这里只做轻量拆解，不阻塞任何一条队列。
     __weak typeof(self) weakSelf = self;
     dispatch_async(self.controlDeliveryQueue, ^{
         M1StreamNode *s = weakSelf;
         if (!s) return;
-        [s detachSessionObjects];
+        link.delegate = nil;
+        session.delegate = nil;
+        channel.delegate = nil;
+        (void)s;
+        // 本轮连接已无用：取消后 listener 才能接下一轮（cancel 幂等）。
+        [conn cancel];
         if (s.onSessionClosed) s.onSessionClosed();
     });
 }
 
-// 按引用拆掉本轮的控制对象（对新一轮已 attach 的对象无影响）。
+// 按引用拆掉当前一轮的控制对象（对已摘除的旧对象无影响）。
 - (void)detachSessionObjects {
-    self.lastControlDiagnostics = [self controlDiagnostics];
     M1ControlLink *link = self.link;
     M1ControlSession *session = self.session;
     M1ControlChannel *channel = self.channel;
     M1QuicTransport *conn = self.sessionTransport;
+    self.link = nil;
+    self.session = nil;
+    self.channel = nil;
+    self.sessionTransport = nil;
+    if (self.streamConn == conn) self.streamConn = nil;
     link.delegate = nil;
     session.delegate = nil;
-    if (self.link == link) self.link = nil;
-    if (self.session == session) self.session = nil;
-    if (self.channel == channel) self.channel = nil;
-    if (self.sessionTransport == conn) self.sessionTransport = nil;
-    // 出帧出口也要断开：否则旧连接的迟到错误会被认成本轮（新一轮 accept 已覆盖时不动）。
-    if (self.streamConn == conn) self.streamConn = nil;
-    // 本轮连接已无用：取消后 listener 才能接下一轮（cancel 是幂等空操作）。
+    channel.delegate = nil;
     [conn cancel];
+}
+
+// 时长到：host 主动结束仍在流的那一轮（客户端还在线）。
+// 只能在 listener 仍被本轮占用时调用——否则新一轮可能已 attach。
+- (void)endCurrentSession {
+    [self stopLivenessWatchdog];
+    M1ControlSession *session = self.session;
+    if (session && session.stateMachine.state != P1SessionStateClosed) {
+        [session closeWithReason:@"session-end"];   // 正常挥手，客户端立刻知道结束
+        [NSThread sleepForTimeInterval:0.2];        // 让 bye 真的出去再拆连接
+    }
+    [self detachSessionObjects];
+    self.streaming = NO;
 }
 
 // 会话结束到下一次 attachSessionTo 之间复位一次性状态：
 // 同一 agent 进程服务下一个客户端时，上一轮的 error/计时/控制到达记录不能带进来。
+// 控制对象已由 notifySessionClosedOnce / endCurrentSession 拆掉，这里只复位标量。
 - (void)prepareForNextSession {
     [self stopLivenessWatchdog];
-    // 时长到时 host 主动收尾：先走正常挥手，让客户端立刻知道会话结束。
-    M1ControlSession *session = self.session;
-    if (session && session.stateMachine.state != P1SessionStateClosed) {
-        [session closeWithReason:@"session-end"];
-    }
-    [self detachSessionObjects];
     self.streaming = NO;
     self.error = nil;
     self.handshakeMs = 0;
     self.streamStartMs = 0;
     self.lastControlArrivalMs = 0;
     @synchronized (self.controlArrivals) { [self.controlArrivals removeAllObjects]; }
-}
-
-- (void)performOnSessionQueue:(dispatch_block_t)block {
-    dispatch_async(self.controlDeliveryQueue, block);
 }
 
 #pragma mark 启动
@@ -378,18 +395,10 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     if (transport != self.streamConn) {
         dispatch_semaphore_signal(self.readySem);
     }
-    // attach 必须排到控制交付队列：它先要拆上一轮的控制对象，而上一轮的收尾
-    // （还屏，秒级）就在这条队列上。传输线程直接 attach 会插队到收尾前面，
-    // 收尾末尾的清理随即把新会话一起拆掉（实测：client 2 握手刚完成即被
-    // 上一轮 cleanup 取消连接，客户端报 57）。
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(self.controlDeliveryQueue, ^{
-        M1StreamNode *s = weakSelf;
-        if (!s) return;
-        // 期间若已换成更新的连接，这轮 attach 作废。
-        if (transport != s.streamConn) return;
-        [s attachSessionTo:transport];
-    });
+    // 就地 attach：控制面握手不能被上一轮的显示收尾（秒级）挡住。
+    // 上一轮的对象在 notifySessionClosedOnce 里已同步摘除，这里拆不到新会话；
+    // 显示事务的互斥交给入口的显示事务队列（displayProvider 里串行）。
+    [self attachSessionTo:transport];
 }
 
 - (void)quicTransport:(M1QuicTransport *)transport

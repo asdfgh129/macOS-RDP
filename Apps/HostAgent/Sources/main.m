@@ -202,6 +202,12 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     host.localFingerprint = localFp;
     host.fps = fps;
 
+    // 显示事务串行队列：建屏/还屏都是秒级 WindowServer 事务，跨轮必须互斥。
+    // 上一轮收尾还屏期间，下一位客户端的 session-start 要在这里排队等它做完，
+    // 否则两轮显示事务并发会互踩（实测：session 2 建出的屏被上一轮销毁）。
+    dispatch_queue_t displayTxQueue = dispatch_queue_create("veild.display-tx",
+                                                            DISPATCH_QUEUE_SERIAL);
+
     // 独占会话：session-start 到达时按客户端规格建虚拟屏 / 禁物理屏。
     __block M1RDPDriver *driver = nil;
     __block M1SessionCoordinator *coord = nil;
@@ -224,8 +230,9 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         driver = nil;
     };
     if (exclusive) {
-        host.displayProvider = ^NSArray<NSDictionary *> *(NSDictionary *message, NSError **perr) {
-            // 兜底：上一轮若没收干净（例如收尾被打断），先还屏再建新屏，
+        NSArray<NSDictionary *> *(^buildDisplays)(NSDictionary *, NSError **) =
+            ^NSArray<NSDictionary *> *(NSDictionary *message, NSError **perr) {
+            // 兜底：上一轮若没收干净（例如收尾被打断），先还屏再建屏，
             // 否则旧 coordinator 会被覆盖泄漏，旧虚拟屏永远不销毁。
             if (coord) endExclusive();
             NSArray *specs = message[@"specs"];
@@ -281,13 +288,21 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
                    ids.description.UTF8String, (unsigned long)virtualW, (unsigned long)virtualH, c09.UTF8String);
             return displays;
         };
+        host.displayProvider = ^NSArray<NSDictionary *> *(NSDictionary *message, NSError **perr) {
+            __block NSArray<NSDictionary *> *result = nil;
+            __block NSError *buildErr = nil;
+            // 门禁：等上一轮收尾（还屏，秒级）做完再建屏；运行期也与它同锁互斥。
+            dispatch_sync(displayTxQueue, ^{ result = buildDisplays(message, &buildErr); });
+            if (!result && perr) *perr = buildErr;
+            return result;
+        };
         host.onAttemptFailed = ^{
-            // 收敛到会话队列：与下一轮 session-start 的建屏事务串行。
-            [host performOnSessionQueue:^{
+            // 与建屏/还屏事务串行：失败收尾不能和下一轮的建屏并发。
+            dispatch_sync(displayTxQueue, ^{
                 endExclusive();
                 virtualID = 0; virtualDisplays = @[]; virtualConv = @[];
                 virtualW = 0; virtualH = 0;
-            }];
+            });
         };
     }
 
@@ -519,12 +534,16 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     // 每轮结束（对端 bye / 传输断 / duration 到）立即清理：停管线、还物理屏、
     // 毁虚拟屏、清键帧节流与坐标基准，再复位会话节点等下一位客户端。
     // 旧管线/旧 displayID 不能带进下一轮——客户端会按新 displayID 重新绑定。
-    // 收尾统一在控制交付队列上执行：建屏/还屏是秒级 WindowServer 事务，
-    // 与下一轮 session-start 并发会互相踩（实测：session 2 建出的屏被上一轮销毁）。
+    // 收尾统一在 displayTxQueue 上执行：建屏/还屏是秒级 WindowServer 事务，
+    // 与下一轮建屏并发会互相踩（实测：session 2 建出的屏被上一轮销毁）。
+    // 不放控制交付队列——十几秒的还屏会把下一轮的 attach/hello 饿死。
     void (^cleanupSession)(void) = ^{
         BOOL hasPipes = NO;
         @synchronized (pipes) { hasPipes = pipes.count > 0; }
         if (!coord && !hasPipes) return;   // 已收过尾（bye 与时长到可能双双到达）
+        // 这段收尾是上一轮的：若新一轮已接上（理论上要快过收尾入队），
+        // 不能拆它的显示/管线——它的建屏兜底已经还过旧屏。
+        if (host.session) return;
         [host flushSimulatedHeld];
         retirePipelines();
         endExclusive();
@@ -535,9 +554,9 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     };
     dispatch_semaphore_t sessionEndSem = dispatch_semaphore_create(0);
     host.onSessionClosed = ^{
-        // 已在控制交付队列上：清理必然先于下一轮 session-start 处理。
-        cleanupSession();
+        // 先放行主线程再看结果：收尾是秒级的，不能让下一轮的判定等它。
         dispatch_semaphore_signal(sessionEndSem);
+        dispatch_async(displayTxQueue, ^{ cleanupSession(); });
     };
     NSUInteger sessionsServed = 0, failedAttempts = 0;
     while (maxSessions == 0 || sessionsServed < maxSessions) {
@@ -546,9 +565,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
                 // 常驻模式：单次接入失败（握手/会话错误）不终止进程，也不算会话数。
                 printf("  [会话] 接入失败：%s（继续等下一位）\n",
                        host.error.localizedDescription.UTF8String ?: "unknown");
-                [host performOnSessionQueue:^{
-                    [host prepareForNextSession];
-                }];
+                [host prepareForNextSession];
                 if (++failedAttempts >= 5) {
                     printf("✗ 连续 %lu 次接入失败，放弃常驻\n", (unsigned long)failedAttempts);
                     break;
@@ -570,9 +587,11 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
 
         if (!startPipelines(streamDisplays)) {
             printf("✗ 没有可推流的显示\n");
-            retirePipelines();
-            endExclusive();
-            [host prepareForNextSession];
+            dispatch_sync(displayTxQueue, ^{
+                retirePipelines();
+                endExclusive();
+                [host prepareForNextSession];
+            });
             break;
         }
         refreshRects(streamDisplays);
@@ -591,19 +610,21 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         printf("  [会话 %lu] 结束（%s），收尾\n", (unsigned long)sessionsServed,
                reachedDurationEnd ? "时长到" : "客户端离开");
 
-        // 客户端离开：onSessionClosed 已在交付队列上清理过。
-        // 时长到是 host 主动结束，onSessionClosed 不会来：把收尾排进同一条队列，
-        // 它必然排在下一轮 session-start 之前。
+        // 客户端离开：onSessionClosed 已把收尾排进 displayTxQueue。
+        // 时长到是 host 主动结束，onSessionClosed 不会来：就地拆本轮连接再收尾，
+        // 与下一轮建屏同队列，必然串行。
         if (reachedDurationEnd) {
-            [host performOnSessionQueue:^{ cleanupSession(); }];
+            dispatch_sync(displayTxQueue, ^{
+                [host endCurrentSession];
+                cleanupSession();
+            });
         }
         fflush(stdout);
     }
-    // 等队列上挂着的收尾跑完再关停，避免 shutdown 与还屏事务并发。
-    dispatch_semaphore_t drained = dispatch_semaphore_create(0);
-    [host performOnSessionQueue:^{ dispatch_semaphore_signal(drained); }];
-    dispatch_semaphore_wait(drained, DISPATCH_TIME_FOREVER);
+    // 关停本身可能再触发一次 onSessionClosed（收尾入队），所以先 shutdown
+    // 再用队列屏障把收尾/还屏全部排干，最后才在主线程确认还屏。
     [host shutdown];
+    dispatch_sync(displayTxQueue, ^{});
     endExclusive();
 
     uint64_t cap = 0, enc = 0, sent = 0, dropped = 0, fragments = 0;

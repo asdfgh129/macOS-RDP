@@ -116,13 +116,13 @@ double M1StreamNowMs(void);
 - (BOOL)waitForStreamingTimeoutMs:(uint32_t)timeoutMs;
 
 // 会话结束后复位一次性状态（streaming/error/计时/控制到达记录），
-// 让同一进程可以接下一个客户端。管线/显示资源由入口自行清理。
+// 让同一进程可以接下一个客户端。控制对象在会话结束/endCurrentSession 里已拆掉，
+// 管线/显示资源由入口自行清理。
 - (void)prepareForNextSession;
 
-// 在控制交付串行队列上异步执行（与下一次会话的 session-start 处理互斥）。
-// Host 常驻模式收尾显示/管线时用：建屏/还屏本身就慢，必须挡住下一轮的建屏，
-// 否则两轮显示事务会在 WindowServer 上互相踩。
-- (void)performOnSessionQueue:(dispatch_block_t)block;
+// 时长到等 host 主动结束：对仍在流的会话正常挥手并拆掉本轮连接。
+// 只能在 listener 仍被本轮占用（即不可能有新客户端 attach）时调用。
+- (void)endCurrentSession;
 
 // M1DatagramSink（帧管线出口）；子类覆写 onFrameDatagram 实现收流侧
 - (BOOL)sendDatagram:(NSData *)datagram error:(NSError **)error;
