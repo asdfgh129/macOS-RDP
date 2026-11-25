@@ -80,6 +80,7 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
     self.sleepHeld = YES;
 
     // step 2 建齐全部虚拟屏（必须先于禁物理屏）
+    CFAbsoluteTime tCreateStart = CFAbsoluteTimeGetCurrent();
     _phase = M1HostSessionDisplaysCreating;
     if (![_driver createVirtualDisplays:specs error:&stepErr]) {
         [self recoverBestEffort];
@@ -91,6 +92,7 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
     self.virtualCreated = YES;
     self.createdDisplayIDs = [_driver createdDisplayIDs];
     _phase = M1HostSessionDisplaysReady;
+    CFAbsoluteTime tDisableStart = CFAbsoluteTimeGetCurrent();
 
     // step 3 禁物理屏 + C-09 隔离校验
     NSArray *keep = [_driver createdDisplayIDs];
@@ -114,6 +116,9 @@ static NSError *M1SessErr(M1SessionErrorCode code, NSString *phase, NSString *de
         return NO;
     }
     _phase = M1HostSessionPhysicalDisabled;
+    printf("  [建屏] 用时：建屏 %.2fs，禁屏/校验 %.2fs\n",
+           tDisableStart - tCreateStart, CFAbsoluteTimeGetCurrent() - tDisableStart);
+    fflush(stdout);
 
     // step 4 远程登录（Path A）：零物理屏后登录 UI 自动迁移到虚拟屏
     if (needsLogin) {
