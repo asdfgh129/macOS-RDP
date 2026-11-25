@@ -90,8 +90,12 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
     atomic_uint_fast64_t _maxMainWaitUs;
     _Atomic double _lastPresentLatencyMs;
     _Atomic double _maxPresentLatencyMs;
-    CVPixelBufferRef _outBuffer;      // 复用的 BGRA 输出（IOSurface 承载），只在 renderQueue 上动
+    // 双缓冲 BGRA 输出（IOSurface 承载），只在 renderQueue 上动。
+    // 单缓冲时每帧给 layer.contents 赋同一个 IOSurface 指针，CA 按对象身份判定
+    // 「没变化」而不再提交，窗口停在首帧；交替两块缓冲即可强制每帧刷新。
+    CVPixelBufferRef _outBuffer[2];
     CGSize _outSize;
+    NSUInteger _outNext;
 }
 @property (nonatomic, strong) CIContext *ciContext;
 @property (nonatomic, strong) dispatch_queue_t renderQueue;
@@ -161,11 +165,19 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
     return self;
 }
 
-// 复用一块 BGRA + IOSurface 的输出缓冲；尺寸变化才重建。
+// 交替复用两块 BGRA + IOSurface 输出缓冲；尺寸变化才重建。
 // 必须在 renderQueue 上调用（唯一写入方）。
-- (CVPixelBufferRef)ensureOutputBufferForSize:(CGSize)size {
-    if (_outBuffer && CGSizeEqualToSize(_outSize, size)) return _outBuffer;
-    if (_outBuffer) { CVPixelBufferRelease(_outBuffer); _outBuffer = NULL; }
+- (CVPixelBufferRef)nextOutputBufferForSize:(CGSize)size {
+    if (!CGSizeEqualToSize(_outSize, size)) {
+        for (int i = 0; i < 2; i++) {
+            if (_outBuffer[i]) { CVPixelBufferRelease(_outBuffer[i]); _outBuffer[i] = NULL; }
+        }
+        _outSize = size;
+        _outNext = 0;
+    }
+    NSUInteger idx = _outNext;
+    _outNext = (_outNext + 1) % 2;
+    if (_outBuffer[idx]) return _outBuffer[idx];
     NSDictionary *attrs = @{
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
         (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
@@ -176,13 +188,13 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
                             (__bridge CFDictionaryRef)attrs, &pb) != kCVReturnSuccess) {
         return NULL;
     }
-    _outBuffer = pb;
-    _outSize = size;
-    return _outBuffer;
+    _outBuffer[idx] = pb;
+    return pb;
 }
 
 - (CVPixelBufferRef)lastRenderedBuffer {
-    return _outBuffer;   // 借出，仅自检用；下一次渲染可能被重用
+    // 借出，仅自检用；下一次渲染可能被重用
+    return _outBuffer[(_outNext + 1) % 2];
 }
 
 // 用 16x16 的数据走完整条「CVPixelBuffer → CIImage → IOSurface」路径，结果直接丢弃。
@@ -198,7 +210,7 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
     }
     double t0 = M1ViewNowMs();
     CIImage *image = [CIImage imageWithCVPixelBuffer:pb];
-    CVPixelBufferRef out = image ? [self ensureOutputBufferForSize:image.extent.size] : NULL;
+    CVPixelBufferRef out = image ? [self nextOutputBufferForSize:image.extent.size] : NULL;
     if (image && out) {
         [self.ciContext render:image toCVPixelBuffer:out
                         bounds:image.extent colorSpace:M1ViewSRGBColorSpace()];
@@ -238,7 +250,7 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
         double t0 = M1ViewNowMs();
         M1AtomicMaxU64(&self->_maxQueueWaitUs, (uint64_t)((t0 - tPresent) * 1000.0));
         CIImage *image = [CIImage imageWithCVPixelBuffer:held];
-        CVPixelBufferRef out = image ? [self ensureOutputBufferForSize:image.extent.size] : NULL;
+        CVPixelBufferRef out = image ? [self nextOutputBufferForSize:image.extent.size] : NULL;
         if (image && out) {
             // 渲染到 IOSurface 承载的 BGRA 缓冲：全程 GPU，没有 createCGImage 的
             // GPU→CPU 回读。3440×1440 下每帧 20 MB，回读实测 0.5~0.9 s/帧。
@@ -310,7 +322,9 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
 }
 
 - (void)dealloc {
-    if (_outBuffer) CVPixelBufferRelease(_outBuffer);
+    for (int i = 0; i < 2; i++) {
+        if (_outBuffer[i]) CVPixelBufferRelease(_outBuffer[i]);
+    }
 }
 
 - (CGRect)videoRect {
