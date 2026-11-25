@@ -1666,6 +1666,33 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - 同一 host agent 进程内「会话结束 → 新客户端重连」路径有旧管线/旧 displayID 帧残留迹象（复测中 client 绑新屏 4128834，却持续出现旧屏 4128835 的接收器与 0 帧会话）；正式档仍按「一客户端一 agent」执行，重连清理项记入待办。
 - SSH 入口为 TCP 46601 → host :22（`PRODUCT-DUAL-RUNBOOK.md` §0.3）；本轮曾误探 22 端口导致一度判 host 失联。
 
+### 5.43 M2-C 收口：沉浸模式 PASS + FR-07 复测 5/5 + 画面冻结/控制面静默两个根因修复（2026-11-25）
+
+**环境**：Tahoe 26.5.2（25F84）host（Mac-mini.local，WAN，SSH TCP 46601 → :22）× Sequoia 15.5（24F74）client；基线 `62e9ddc` + 本轮工作区改动（`M1FrameView` 双缓冲、控制链路重传预算、控制面看门狗）；host agent 与 client 均重建，host 由 GUI 会话内 Terminal 启动，`caffeinate -d -u` 防屏睡。
+
+**A. 沉浸模式真机目测（§5.42 C 项补测，PASS）**
+- `Cmd+Opt+F` 切换：`NSApp.presentationOptions=[.autoHideDock,.autoHideMenuBar]`、窗口转 borderless 并铺满该屏；host 侧打印 `沉浸窗口 1: 0,0 3008×1692`，本机 Dock/菜单栏自动隐藏，退出恢复标题栏与原 frame。
+- **顺带定位并修复画面冻结（长期存量 bug）**：`M1FrameView` 每帧把同一个 IOSurface 指针赋给 `layer.contents`，CA 按对象身份判定“没变化”不再提交，窗口停在首帧；而 `framesDecoded/framesRendered` 照常增长、遮挡跳过为 0，指标看起来完全健康。修复：双缓冲（两块 BGRA IOSurface 交替出图，尺寸变化时整组重建），仅在 `renderQueue` 上操作。
+- 修复后验证（WAN，720p15，窗口 + 沉浸两种形态）：相隔 5s 的两张截图像素不同（修复前逐字节相同）；沉浸态全屏画面实时、Dock/菜单隐藏；675/675 解码并上屏、渲染丢帧 0、传输丢帧 9、控制最大间隔 1.0s、上屏 p50/p95 = 176.5/380.5ms；单测 `M1-Skeleton/build_tests.sh` 341/341。
+
+**B. FR-07 会话内换屏复测（keep-main 2 屏 → 1 屏，WAN，5/5 PASS）**
+- 统一脚本：host `--keep-main --fps 15 --duration-ms 60000`，client `--spec 1280x720 ×2 --update-at <12s|25s> --update-spec 1024x768`；主机按 60s 推流、客户端 30–45s。
+- 五轮（`m2c-fr07-1125d/e/f/g/h`）结果一致：host `[换屏] 1 屏 → 1024x768（首屏 displayID=4128833）`、旧屏 4128834/4128835 retired 并销毁；client 打印 `窗口 1 → displayID=4128833（1024×768）`、`换屏 #1 成功：1 屏`，新屏持续解码上屏（51/60/25/55/41 帧），旧屏上屏 0（窗口已重绑，属预期）；两端控制最大间隔 ≤1.12s；d/e/g/h 轮传输丢帧 0，f 轮新屏重组丢 4。
+- 结论：§5.42 的 FR-07 PASS 可重复；换屏事务本身（建新屏→起管线→成功才拆旧屏）无回归。
+
+**C. 首轮复测失败的根因：控制链路重传耗尽 → 控制面永久静默（已修复）**
+- 现象（首轮 20:58，与 §5.42 同配置）：client 打印 `换屏请求 #1` 后不再收到任何控制消息（此后再无 `[client] STREAMING` 心跳行），但画面继续解码；host 侧换屏成功且继续收到 client 心跳。`session-update-result` 永远没到 client。
+- 根因：控制链路是“序号 + 累计确认 + 250ms×8 重传”的自建可靠层，跑在不可靠 datagram 上。WAN 上与画面抢带宽时 RTT 尖峰和乱序常态（本轮实测单次 30s 会话 retransmits 111/46 条、乱序暂存 81、重复 25–46）。一旦丢的是换屏结果，后续消息全部卡在乱序暂存等那一条；8 次重传（2s）耗尽后链路静默置 failed、拒绝后续发送，而**没有任何一方检测控制面是否还活着**——帧流照常，于是表现为“假在线”。
+- 修复（两处）：
+  1. `M1ControlLink` 默认重传预算 8 → 20（250ms×20 ≈ 5s；`M1_CTRL_MAX_ATTEMPTS`/`M1_CTRL_RETRY_MS` 诊断覆盖保留）。
+  2. `M1StreamNode` 控制面看门狗：STREAMING 中连续 8s 无任何控制消息即打印 `控制面静默 Xs，判定控制链路失效`、记录 error、关闭会话并放行等待中的信号量（两端同规则）；链路/会话失败改为 stderr 显式打印，不再静默。
+  3. 诊断面：client/host JSON 增 `control` 对象（datagram 分流、链路 sent/delivered/retransmits/duplicates/held/acks/pending/failed、通道收发/解析错误），摘要同步打印到 stdout；这是本轮能把“没到/被扣住/解析错”分开定位的关键。
+- 修复后同配置连跑（f/g/h 及 d/e 复跑）全 PASS，未再出现控制面静默。
+
+**D. 备注**
+- 一客户端一 agent 的口径不变；「会话结束 → 新客户端重连」的旧管线/旧 displayID 清理仍记为待办（P2.3 → M3）。
+- 每轮结束确认：虚拟屏已销毁、物理屏 2 块在位、无遗留 agent 进程。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |

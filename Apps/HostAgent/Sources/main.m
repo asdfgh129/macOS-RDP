@@ -561,6 +561,13 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     printf("serve: input ok=%lu fail=%lu record=%lu | 控制到达最大间隔=%.1fms (offset %.1fms)\n",
            (unsigned long)injectOK, (unsigned long)injectFail,
            (unsigned long)recorder.postCount, host.maxControlGapMs, host.maxGapAtOffsetMs);
+    NSDictionary *ctlDiag = [host controlDiagnostics];
+    {
+        NSMutableArray *parts = [NSMutableArray array];
+        for (NSString *k in ctlDiag.allKeys) [parts addObject:[NSString stringWithFormat:@"%@=%@", k, ctlDiag[k]]];
+        printf("serve: 控制面 %s\n", [[parts componentsJoinedByString:@" "] UTF8String]);
+        fflush(stdout);
+    }
     if (outPath.length > 0) {
         NSDictionary *json = @{
             @"framesCaptured": @(cap), @"framesEncoded": @(enc),
@@ -572,6 +579,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
             @"c09": c09,
             @"displays": displayJSON,
             @"stateLog": host.stateLog ?: @[],
+            @"control": ctlDiag,
         };
         NSData *data = [NSJSONSerialization dataWithJSONObject:json
                                                        options:NSJSONWritingPrettyPrinted error:NULL];

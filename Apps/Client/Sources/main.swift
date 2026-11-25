@@ -491,6 +491,9 @@ func runConnect() -> Int32 {
           + "时钟 offset=\(client.session?.clockOffsetUs ?? 0) us（样本 \(client.session?.timeSyncSamples ?? 0)）")
     print("client: 输入上行 \(inputSent)/失败 \(inputFailed) | 控制最大间隔=\(client.maxControlGapMs) ms "
           + "PNG=\(client.savedFrames)")
+    let ctl = client.controlDiagnostics()
+    let ctlStr = ctl.keys.sorted().map { "\($0)=\(ctl[$0]!)" }.joined(separator: " ")
+    print("client: 控制面 \(ctlStr)")
     if !updateResults.isEmpty {
         let okCount = updateResults.filter { ($0["ok"] as? Bool) == true }.count
         print("client: 换屏请求 \(updateResults.count) 次，成功 \(okCount) 次")
@@ -513,6 +516,7 @@ func runConnect() -> Int32 {
         "savedPNG": client.savedFrames,
         "sessionUpdates": updateResults,
         "displays": perDisplay,
+        "control": client.controlDiagnostics(),
     ], options: .prettyPrinted) {
         try? data.write(to: URL(fileURLWithPath: outPath))
     }

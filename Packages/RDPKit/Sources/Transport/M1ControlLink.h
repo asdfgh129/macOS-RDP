@@ -76,7 +76,7 @@ typedef NS_ENUM(NSInteger, M1ControlLinkErrorCode) {
 
 @property (nonatomic, copy, nullable) double (^clock)(void);   // 毫秒时钟，默认 CACurrentMediaTime*1000
 @property (nonatomic, assign) uint32_t retryIntervalMs;        // 默认 250
-@property (nonatomic, assign) NSUInteger maxAttempts;          // 默认 8
+@property (nonatomic, assign) NSUInteger maxAttempts;          // 默认 20（250ms × 20 ≈ 5s）
 @property (nonatomic, assign) BOOL autoTick;                   // 默认 YES；测试置 NO
 
 @property (nonatomic, readonly) NSUInteger sentMessages;
@@ -87,6 +87,9 @@ typedef NS_ENUM(NSInteger, M1ControlLinkErrorCode) {
 @property (nonatomic, readonly) NSUInteger acksReceived;
 @property (nonatomic, readonly) uint32_t lastAckReceived;     // 对端已连续确认到的 seq
 @property (nonatomic, readonly) BOOL hasPending;               // 还有未确认的消息
+
+// 诊断快照（控制通道静默失效时靠它定位：没收到 / 乱序扣住 / 重传耗尽）
+- (NSDictionary<NSString *, id> *)diagnostics;
 
 @end
 

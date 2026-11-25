@@ -97,6 +97,10 @@ double M1StreamNowMs(void);
 @property (nonatomic, assign) uint64_t frameDatagrams;
 @property (nonatomic, assign) uint64_t unroutedDatagrams;
 
+// 控制面诊断快照：datagram 分流 + 链路重传/去重 + 通道解析计数。
+// 控制面静默失效（收不到结果/心跳）时靠它区分「没到」「被扣住」「解析错」。
+- (NSDictionary<NSString *, id> *)controlDiagnostics;
+
 // 控制通道到达间隔（判「推流是否挤掉心跳」）
 @property (nonatomic, assign) double lastControlArrivalMs;
 @property (nonatomic, assign) double maxControlGapMs;

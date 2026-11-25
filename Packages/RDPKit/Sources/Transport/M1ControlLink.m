@@ -59,7 +59,10 @@ static uint32_t GetU32(const uint8_t *p) {
         _lastDelivered = 0;
         _nextSeq = 1;
         _retryIntervalMs = 250;
-        _maxAttempts = 8;
+        // 8 次（2s）在 WAN 上与画面抢带宽时会整段丢——丢掉的那条若是
+        // session-update-result，后续消息被乱序扣住，控制面永久静默而画面照旧
+        // （2026-11-25 FR-07 实测）。20 次 = 5s 预算，仍远小于心跳兜底周期。
+        _maxAttempts = 20;
         _autoTick = YES;
         _timerQueue = dispatch_queue_create("m1.control.link", DISPATCH_QUEUE_SERIAL);
         __weak typeof(self) weakSelf = self;
@@ -282,6 +285,22 @@ static uint32_t GetU32(const uint8_t *p) {
         if (!packet) continue;
         NSError *err = nil;
         [self.sink sendDatagram:packet error:&err];
+    }
+}
+
+- (NSDictionary<NSString *, id> *)diagnostics {
+    @synchronized (self) {
+        return @{
+            @"sent": @(self.sentMessages),
+            @"delivered": @(self.deliveredMessages),
+            @"retransmits": @(self.retransmits),
+            @"duplicates": @(self.duplicatesSeen),
+            @"held": @(self.heldOutOfOrder),
+            @"acks": @(self.acksReceived),
+            @"lastAck": @(self.lastAckReceived),
+            @"pending": @(self.unacked.count),
+            @"failed": @(self.failed),
+        };
     }
 }
 

@@ -4,6 +4,22 @@
 
 格式约定：以日期为版本号构成版本节（`[YYYY-MM-DD]` + 里程碑简述），节内按 **Added / Changed / Fixed / Documentation** 分类，每条附短 commit hash；分类参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，Documentation 用于纯文档提交，本文件自身的维护提交不重复列入。真机结论按 OS 分离记录在 `docs/RESULTS-BY-OS.md`，决策编号见 `docs/DECISIONS.md`。
 
+## [2026-11-25] — M2-C 收口：沉浸模式 / FR-07 复测与控制面健壮性
+
+### Fixed
+
+- fix: `M1FrameView` 出图改双缓冲——单缓冲每帧复用同一 IOSurface 指针，CA 按对象身份判定无变化不再提交，窗口冻结在首帧而解码/渲染计数照常增长（真机截图相隔 5s 逐字节相同，换样式/改 frame 才刷新一次）；交替两块 BGRA 缓冲后窗口与沉浸两种形态均实时
+- fix: 控制链路重传预算 8 → 20（250ms×20 ≈ 5s）——WAN 上 RTT 尖峰/乱序下一条消息 8 次重传可能整段丢失，若丢的是 `session-update-result`，后续消息被乱序扣住，控制面永久静默而画面照流
+- fix: 新增控制面静默看门狗——STREAMING 中 8s 无任何控制消息即打印、记录 error 并关闭会话（两端同规则）；链路/会话失败由静默改为 stderr 显式打印
+
+### Added
+
+- feat: 控制面诊断快照入 JSON/stdout（datagram 分流、链路 sent/delivered/retransmits/duplicates/held/acks/pending/failed、通道收发与解析错误），用于区分“没到 / 被扣住 / 解析错”
+
+### Documentation
+
+- docs: `RESULTS-BY-OS.md` §5.43 M2-C 收口入档——沉浸模式真机目测 PASS（含画面冻结根因与修复）、FR-07 keep-main 2→1 WAN 复测 5/5 PASS、首轮失败的「重传耗尽 → 控制面静默」根因与两处修复
+
 ## [2026-11-24] — M2 收口：会话内换屏（FR-07）与完整输入（FR-06）
 
 ### Added（最近更新）

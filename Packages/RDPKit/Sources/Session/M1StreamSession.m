@@ -73,6 +73,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 // （换屏建屏/写盘等，秒级）堵住 ACK 与心跳的收包，双方控制链路在 2s 重传
 // 预算内误判失败（FR-07 实测：换屏 2.2s 后两端心跳同时消失、结果回包丢失）。
 @property (nonatomic, strong) dispatch_queue_t controlDeliveryQueue;
+@property (nonatomic, strong) dispatch_source_t livenessTimer;
 @end
 
 @implementation M1StreamNode
@@ -92,6 +93,48 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
         _simState = 0x9E3779B97F4A7C15ull ^ (uint64_t)getpid();
     }
     return self;
+}
+
+- (void)dealloc {
+    if (_livenessTimer) dispatch_source_cancel(_livenessTimer);
+}
+
+// 控制面静默看门狗：对端每 1s 一条心跳，8s 一条都没到就说明控制面已死
+// （链路重传耗尽 / 对端投递队列卡住），此时画面仍可能在流，不主动判死
+// 就会一直「假在线」（2026-11-25 FR-07 实测：心跳消失 20s 无任何报错）。
+- (void)startLivenessWatchdog {
+    if (self.livenessTimer) return;
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                 self.controlDeliveryQueue);
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 1000 * NSEC_PER_MSEC),
+                              1000 * NSEC_PER_MSEC, 100 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(t, ^{
+        M1StreamNode *s = weakSelf;
+        if (!s) return;
+        if (!s.streaming || s.lastControlArrivalMs <= 0) return;
+        double gapMs = M1StreamNowMs() - s.lastControlArrivalMs;
+        if (gapMs <= 8000) return;
+        fprintf(stderr, "  [%s] 控制面静默 %.1fs，判定控制链路失效\n",
+                s.isHost ? "host" : "client", gapMs / 1000.0);
+        fflush(stderr);
+        [s stopLivenessWatchdog];
+        if (!s.error) {
+            s.error = [NSError errorWithDomain:@"M1StreamSession" code:5
+                userInfo:@{NSLocalizedDescriptionKey:
+                    [NSString stringWithFormat:@"控制面静默 %.1fs", gapMs / 1000.0]}];
+        }
+        [s.session closeWithReason:@"control-timeout"];
+        dispatch_semaphore_signal(s.streamingSem);
+    });
+    self.livenessTimer = t;
+    dispatch_resume(t);
+}
+
+- (void)stopLivenessWatchdog {
+    if (!self.livenessTimer) return;
+    dispatch_source_cancel(self.livenessTimer);
+    self.livenessTimer = nil;
 }
 
 #pragma mark 启动
@@ -147,7 +190,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     self.link = [[M1ControlLink alloc] initWithSink:[M1PriorityDatagramSink sinkForTransport:conn]];
     {
         // 慢速建屏（如 13 独占 mode-commit）期间控制 ACK 可能延迟，
-        // 放宽重传窗口避免误判丢包。默认行为不变（250ms × 8）。
+        // 放宽重传窗口避免误判丢包。默认 250ms × 20。
         const char *retryMs = getenv("M1_CTRL_RETRY_MS");
         if (retryMs && atoi(retryMs) > 0) self.link.retryIntervalMs = (uint32_t)atoi(retryMs);
         const char *maxTries = getenv("M1_CTRL_MAX_ATTEMPTS");
@@ -312,8 +355,27 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 }
 
 - (void)controlLink:(M1ControlLink *)link didFailWithError:(NSError *)error {
-    if (!self.error) self.error = error;
+    // 对端已挥手后的残余重传耗尽属正常收尾，不当故障报。
+    if (self.session.stateMachine.state != P1SessionStateClosed) {
+        fprintf(stderr, "  [%s] 控制链路失败: %s\n", self.isHost ? "host" : "client",
+                error.localizedDescription.UTF8String);
+        fflush(stderr);
+        if (!self.error) self.error = error;
+    }
+    [self stopLivenessWatchdog];
     dispatch_semaphore_signal(self.streamingSem);
+}
+
+- (NSDictionary<NSString *, id> *)controlDiagnostics {
+    NSMutableDictionary *d = [[self.link diagnostics] mutableCopy];
+    d[@"dgramControl"] = @(self.controlDatagrams);
+    d[@"dgramFrame"] = @(self.frameDatagrams);
+    d[@"dgramUnrouted"] = @(self.unroutedDatagrams);
+    M1ControlChannel *ch = self.channel;
+    d[@"chanSent"] = @(ch.sentCount);
+    d[@"chanReceived"] = @(ch.receivedCount);
+    d[@"chanErrors"] = @(ch.protocolErrors);
+    return d;
 }
 
 #pragma mark 会话回调
@@ -325,6 +387,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
         // --duration 结束」的空窗算成心跳被挤（§5.36 r2 host 15.1 s 即此）。
         self.streaming = NO;
         self.lastControlArrivalMs = 0;
+        [self stopLivenessWatchdog];
         if (self.onSessionClosed) self.onSessionClosed();
     }
 }
@@ -337,6 +400,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     self.lastControlArrivalMs = 0;
     if (self.streamStartMs == 0) self.streamStartMs = M1StreamNowMs();
     dispatch_semaphore_signal(self.streamingSem);
+    [self startLivenessWatchdog];
 
     // A-02：进入 STREAMING 后打 8 个时钟同步探针（200ms 起步、150ms 间隔）。
     // 取 RTT 最小的样本，避免控制队列排队时间被误算成时钟差。
@@ -354,7 +418,14 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 }
 
 - (void)controlSession:(M1ControlSession *)session didFailWithError:(NSError *)error {
-    if (!self.error) self.error = error;
+    // 主动挥手后的 bye 发送失败等收尾错误不算会话故障。
+    if (self.session.stateMachine.state != P1SessionStateClosed) {
+        fprintf(stderr, "  [%s] 控制会话失败: %s\n", self.isHost ? "host" : "client",
+                error.localizedDescription.UTF8String);
+        fflush(stderr);
+        if (!self.error) self.error = error;
+    }
+    [self stopLivenessWatchdog];
     dispatch_semaphore_signal(self.streamingSem);
 }
 
@@ -412,6 +483,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 - (NSArray<NSString *> *)stateLog { return self.session ? self.session.stateLog : @[]; }
 
 - (void)shutdown {
+    [self stopLivenessWatchdog];
     [self.session closeWithReason:@"session-done"];
     [NSThread sleepForTimeInterval:0.25];   // 让 bye 真的出去
     [self.streamConn cancel];
