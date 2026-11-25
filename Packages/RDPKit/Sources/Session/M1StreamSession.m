@@ -76,6 +76,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 @property (nonatomic, strong) dispatch_source_t livenessTimer;
 // 一次接入只通知一次（bye 正常挥手与传输失败可能双双到达）。
 @property (nonatomic, assign) BOOL sessionClosedNotified;
+// 会话收尾时留存最后一轮控制面计数（link/channel 随即拆掉，不能再实时读）。
+@property (nonatomic, strong, nullable) NSDictionary<NSString *, id> *lastControlDiagnostics;
 - (void)notifySessionClosedOnce;
 @end
 
@@ -152,6 +154,15 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 // 同一 agent 进程服务下一个客户端时，上一轮的 error/计时/控制到达记录不能带进来。
 - (void)prepareForNextSession {
     [self stopLivenessWatchdog];
+    // 旧会话的控制对象必须连根拆掉：链路定时器还在重传，而传输已经收掉，
+    // 每次重传失败都会经 didFailWithError 回灌 self.error，把下一轮会话在
+    // 建屏途中判死（实测：session 2 被上一轮的「连接未就绪」打断）。
+    self.lastControlDiagnostics = [self controlDiagnostics];
+    self.link.delegate = nil;
+    self.session.delegate = nil;
+    self.link = nil;
+    self.channel = nil;
+    self.session = nil;
     self.streaming = NO;
     self.error = nil;
     self.handshakeMs = 0;
@@ -327,12 +338,18 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 - (void)quicTransport:(M1QuicTransport *)transport
    didAcceptConnection:(M1QuicTransport *)connection {
+    // 提前记下当前连接：握手阶段就失败时，didFailWithError 才认得出是本轮。
+    if (transport == self.listener && self.streamConn != connection) {
+        self.streamConn = connection;
+    }
     const char *peer = connection.peerDescription.UTF8String;
     printf("  [host] 已接受连接%s%s\n", peer ? " from " : "", peer ?: "");
     fflush(stdout);
 }
 
 - (void)quicTransport:(M1QuicTransport *)transport didFailWithError:(NSError *)error {
+    // 已淘汰的旧连接：收尾时取消也会走这里，不能把错误记到新一轮会话头上。
+    if (transport != self.listener && transport != self.streamConn) return;
     if (!self.error) self.error = error;
     // 会话中途传输断掉（客户端来不及挥手）：也按会话结束通知一次，
     // 否则 host 只能干等到 --duration-ms 才清理旧管线。
@@ -397,7 +414,9 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 }
 
 - (NSDictionary<NSString *, id> *)controlDiagnostics {
-    NSMutableDictionary *d = [[self.link diagnostics] mutableCopy];
+    M1ControlLink *link = self.link;
+    if (!link) return self.lastControlDiagnostics ?: @{};
+    NSMutableDictionary *d = [[link diagnostics] mutableCopy];
     d[@"dgramControl"] = @(self.controlDatagrams);
     d[@"dgramFrame"] = @(self.frameDatagrams);
     d[@"dgramUnrouted"] = @(self.unroutedDatagrams);
