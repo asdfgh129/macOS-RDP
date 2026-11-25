@@ -58,6 +58,8 @@ double M1StreamNowMs(void);
 @property (nonatomic, assign) BOOL streaming;
 @property (nonatomic, assign) double handshakeMs;
 @property (nonatomic, assign) double streamStartMs;
+// 会话结束（对端 bye 或传输中途失败）：一次接入只回调一次。
+// Host 常驻的多会话模式靠它在客户端离开时立即清理，而不是干等 duration。
 @property (nonatomic, copy, nullable) void (^onSessionClosed)(void);
 // Host：收到客户端输入事件（已在 M1ControlSession 过校验与限速）
 @property (nonatomic, copy, nullable) void (^onInputEvent)(NSDictionary *event);
@@ -112,6 +114,10 @@ double M1StreamNowMs(void);
                 timeout:(uint32_t)timeoutMs error:(NSError **)error;
 - (void)attachSessionTo:(M1QuicTransport *)conn;
 - (BOOL)waitForStreamingTimeoutMs:(uint32_t)timeoutMs;
+
+// 会话结束后复位一次性状态（streaming/error/计时/控制到达记录），
+// 让同一进程可以接下一个客户端。管线/显示资源由入口自行清理。
+- (void)prepareForNextSession;
 
 // M1DatagramSink（帧管线出口）；子类覆写 onFrameDatagram 实现收流侧
 - (BOOL)sendDatagram:(NSData *)datagram error:(NSError **)error;

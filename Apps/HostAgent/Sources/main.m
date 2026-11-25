@@ -140,10 +140,11 @@ static void AgentServeUsage(void) {
     fprintf(stderr,
         "用法: veild-host-agent --serve [--port N] [--port-file PATH]\n"
         "       [--spec WxH] [--fps N] [--duration-ms N] [--wait-ms N]\n"
-        "       [--display ID] [--mirror] [--keep-main] [--inject record|real]\n"
-        "       [--identity PATH] [--pass PASS] [--out JSON]\n"
+        "       [--max-sessions N] [--display ID] [--mirror] [--keep-main]\n"
+        "       [--inject record|real] [--identity PATH] [--pass PASS] [--out JSON]\n"
         "  默认独占会话（按客户端规格建虚拟屏并禁物理屏）；--mirror 采物理主屏仅作诊断。\n"
-        "  --inject 默认 record；双机真机验收改 real（需辅助功能授权）。\n");
+        "  --inject 默认 record；双机真机验收改 real（需辅助功能授权）。\n"
+        "  --max-sessions 默认 1（一个客户端一个 agent）；N>1 时每个会话结束即清理并等下一个，0=不限。\n");
 }
 
 static BOOL AgentParseSpec(NSString *spec, int32_t *w, int32_t *h) {
@@ -159,6 +160,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     NSString *identity = @".state/rdp-identity.p12", *pass = @"rdpdev", *inject = @"record";
     uint32_t waitMs = 15000;
     int durationMs = 5000, fps = 20;
+    NSUInteger maxSessions = 1;
     int32_t outW = 0, outH = 0, specW = 0, specH = 0;
     CGDirectDisplayID displayID = CGMainDisplayID();
     BOOL exclusive = YES, keepMain = NO;
@@ -171,6 +173,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         else if (!strcmp(a, "--duration-ms") && i + 1 < argc) durationMs = atoi(argv[++i]);
         else if (!strcmp(a, "--wait-ms") && i + 1 < argc) waitMs = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(a, "--fps") && i + 1 < argc) fps = atoi(argv[++i]);
+        else if (!strcmp(a, "--max-sessions") && i + 1 < argc) maxSessions = (NSUInteger)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(a, "--display") && i + 1 < argc) displayID = (CGDirectDisplayID)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(a, "--width") && i + 1 < argc) outW = atoi(argv[++i]);
         else if (!strcmp(a, "--height") && i + 1 < argc) outH = atoi(argv[++i]);
@@ -292,21 +295,9 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         NSString *payload = [NSString stringWithFormat:@"%u\n%@\n", host.port, localFp];
         [payload writeToFile:portFile atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     }
-    if (![host waitForStreamingTimeoutMs:waitMs]) {
-        printf("✗ %us 内未进入 STREAMING: %s\n", waitMs / 1000,
-               host.error.localizedDescription.UTF8String ?: "无客户端");
-        endExclusive(); [host shutdown];
-        return NO;
-    }
 
     // 要推流的屏：独占会话按新建虚拟屏全量（FR-01 N 屏）；镜像诊断只推 --display 一块。
-    NSArray<NSDictionary *> *streamDisplays = nil;
-    if (exclusive && virtualDisplays.count > 0) {
-        streamDisplays = virtualDisplays;
-    } else {
-        streamDisplays = @[ @{ @"displayID": @(displayID) } ];
-    }
-
+    // 每轮会话开始时重算（虚拟屏每轮新建，displayID 不复用）。
     __block int errCount = 0;
     NSMutableArray<M1FramePipeline *> *pipes = [NSMutableArray array];
     NSMutableDictionary<NSNumber *, M1FramePipeline *> *pipeByDisplay = [NSMutableDictionary dictionary];
@@ -322,6 +313,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
                     @"displayID": @(p.displayID), @"w": @(p.pixelWidth), @"h": @(p.pixelHeight),
                     @"framesCaptured": @(s.framesCaptured), @"framesEncoded": @(s.framesEncoded),
                     @"framesSent": @(s.framesSent), @"fragmentsSent": @(s.fragmentsSent),
+                    @"framesDroppedBeforeEncoder": @(s.framesDroppedBeforeEncoder),
                     @"keyframes": @(s.keyframes), @"retired": @YES,
                 }];
                 [p stop];
@@ -368,12 +360,6 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         }
         return fresh.count > 0;
     };
-
-    if (!startPipelines(streamDisplays)) {
-        printf("✗ 没有可推流的显示\n");
-        endExclusive(); [host shutdown];
-        return NO;
-    }
 
     // 请求按屏路由；displayID=0 是旧版客户端（单屏/全部屏）。
     // 900ms 合并窗口也按屏独立：一块屏的在途 IDR 不应吞掉另一块屏的请求。
@@ -447,7 +433,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         printf("输入目标屏 %lu 块%s\n", (unsigned long)fresh.count,
                fresh.count ? "" : "（无 Quartz bounds，回退到原点 rect）");
     };
-    refreshRects(streamDisplays);
+    // 输入坐标基准每轮会话起管线后按实际屏刷新（refreshRects），此处不预设。
     __block NSUInteger injectOK = 0, injectFail = 0;
     host.onInputEvent = ^(NSDictionary *event) {
         NSError *ie = nil;
@@ -522,42 +508,98 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         };
     }
 
-    [NSThread sleepForTimeInterval:durationMs / 1000.0];
-    [host flushSimulatedHeld];
-    for (M1FramePipeline *p in pipes) [p stop];
+    // 会话循环：一个进程连续服务多个客户端（--max-sessions >1 或 0）。
+    // 每轮结束（对端 bye / 传输断 / duration 到）立即清理：停管线、还物理屏、
+    // 毁虚拟屏、清键帧节流与坐标基准，再复位会话节点等下一位客户端。
+    // 旧管线/旧 displayID 不能带进下一轮——客户端会按新 displayID 重新绑定。
+    dispatch_semaphore_t sessionEndSem = dispatch_semaphore_create(0);
+    host.onSessionClosed = ^{ dispatch_semaphore_signal(sessionEndSem); };
+    NSUInteger sessionsServed = 0, failedAttempts = 0;
+    while (maxSessions == 0 || sessionsServed < maxSessions) {
+        if (![host waitForStreamingTimeoutMs:waitMs]) {
+            if (host.error && maxSessions != 1) {
+                // 常驻模式：单次接入失败（握手/会话错误）不终止进程，也不算会话数。
+                printf("  [会话] 接入失败：%s（继续等下一位）\n",
+                       host.error.localizedDescription.UTF8String ?: "unknown");
+                [host prepareForNextSession];
+                [host.streamConn cancel];
+                host.streamConn = nil;
+                if (++failedAttempts >= 5) {
+                    printf("✗ 连续 %lu 次接入失败，放弃常驻\n", (unsigned long)failedAttempts);
+                    break;
+                }
+                continue;
+            }
+            printf("✗ %us 内未进入 STREAMING: %s\n", waitMs / 1000,
+                   host.error.localizedDescription.UTF8String ?: "无客户端");
+            break;
+        }
+        failedAttempts = 0;
+        sessionsServed += 1;
+        printf("  [会话 %lu] STREAMING，开始推流（上限 %dms）\n",
+               (unsigned long)sessionsServed, durationMs);
+
+        NSArray<NSDictionary *> *streamDisplays = nil;
+        if (exclusive && virtualDisplays.count > 0) streamDisplays = virtualDisplays;
+        else streamDisplays = @[ @{ @"displayID": @(displayID) } ];
+
+        if (!startPipelines(streamDisplays)) {
+            printf("✗ 没有可推流的显示\n");
+            retirePipelines();
+            endExclusive();
+            [host prepareForNextSession];
+            break;
+        }
+        refreshRects(streamDisplays);
+        @synchronized (lastKeyframeByDisplay) { [lastKeyframeByDisplay removeAllObjects]; }
+
+        // 客户端可能起管线期间就已离开；上一轮迟到的结束信号也不能把这一轮
+        // 瞬间判成结束——先清陈旧信号，仍在线才等真实结束。
+        while (dispatch_semaphore_wait(sessionEndSem, DISPATCH_TIME_NOW) == 0) {}
+        BOOL reachedDurationEnd = YES;
+        if (host.streaming) {
+            reachedDurationEnd = dispatch_semaphore_wait(sessionEndSem,
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)durationMs * NSEC_PER_MSEC)) != 0;
+        }
+        printf("  [会话 %lu] 结束（%s），收尾\n", (unsigned long)sessionsServed,
+               reachedDurationEnd ? "时长到" : "客户端离开");
+
+        [host flushSimulatedHeld];
+        retirePipelines();
+        endExclusive();
+        virtualID = 0; virtualDisplays = @[]; virtualConv = @[];
+        virtualW = 0; virtualH = 0;
+        @synchronized (lastKeyframeByDisplay) { [lastKeyframeByDisplay removeAllObjects]; }
+        [host prepareForNextSession];
+        // 收掉旧客户端的入站连接：listener 只在 acceptedConnection 为空时接受新连接。
+        [host.streamConn cancel];
+        host.streamConn = nil;
+        fflush(stdout);
+    }
     [host shutdown];
     endExclusive();
 
     uint64_t cap = 0, enc = 0, sent = 0, dropped = 0, fragments = 0;
     NSMutableArray<NSDictionary *> *displayJSON = [NSMutableArray array];
-    // 换屏时退休的管线：统计照算，displayJSON 里带 retired:true 便于区分。
+    // 每轮结束都把管线退休记账，汇总只需读账本（retired:true 标记来自换屏或会话收尾）。
     for (NSDictionary *r in retiredPipes) {
         cap += [r[@"framesCaptured"] unsignedLongLongValue];
         enc += [r[@"framesEncoded"] unsignedLongLongValue];
         sent += [r[@"framesSent"] unsignedLongLongValue];
+        dropped += [r[@"framesDroppedBeforeEncoder"] unsignedLongLongValue];
         fragments += [r[@"fragmentsSent"] unsignedLongLongValue];
         [displayJSON addObject:r];
-    }
-    for (M1FramePipeline *p in pipes) {
-        M1FramePipelineStats *s = p.stats;
-        cap += s.framesCaptured;
-        enc += s.framesEncoded;
-        sent += s.framesSent;
-        dropped += s.framesDroppedBeforeEncoder;
-        fragments += s.fragmentsSent;
-        [displayJSON addObject:@{
-            @"displayID": @(p.displayID), @"w": @(p.pixelWidth), @"h": @(p.pixelHeight),
-            @"framesCaptured": @(s.framesCaptured), @"framesEncoded": @(s.framesEncoded),
-            @"framesSent": @(s.framesSent), @"fragmentsSent": @(s.fragmentsSent),
-            @"keyframes": @(s.keyframes),
-        }];
         printf("serve[%u]: captured=%llu encoded=%llu sent=%llu dropped=%llu key=%llu\n",
-               p.displayID, s.framesCaptured, s.framesEncoded, s.framesSent,
-               s.framesDroppedBeforeEncoder, s.keyframes);
+               [r[@"displayID"] unsignedIntValue],
+               [r[@"framesCaptured"] unsignedLongLongValue],
+               [r[@"framesEncoded"] unsignedLongLongValue],
+               [r[@"framesSent"] unsignedLongLongValue],
+               [r[@"framesDroppedBeforeEncoder"] unsignedLongLongValue],
+               [r[@"keyframes"] unsignedLongLongValue]);
     }
-    printf("serve: 合计 frames captured=%llu encoded=%llu sent=%llu dropped=%llu fragments=%llu（%lu 屏，含退休 %lu）\n",
-           cap, enc, sent, dropped, fragments, (unsigned long)(pipes.count + retiredPipes.count),
-           (unsigned long)retiredPipes.count);
+    printf("serve: 合计 frames captured=%llu encoded=%llu sent=%llu dropped=%llu fragments=%llu（%lu 屏 / %lu 会话）\n",
+           cap, enc, sent, dropped, fragments,
+           (unsigned long)retiredPipes.count, (unsigned long)sessionsServed);
     printf("serve: input ok=%lu fail=%lu record=%lu | 控制到达最大间隔=%.1fms (offset %.1fms)\n",
            (unsigned long)injectOK, (unsigned long)injectFail,
            (unsigned long)recorder.postCount, host.maxControlGapMs, host.maxGapAtOffsetMs);
@@ -577,6 +619,7 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
             @"maxControlGapMs": @(host.maxControlGapMs),
             @"maxGapAtOffsetMs": @(host.maxGapAtOffsetMs),
             @"c09": c09,
+            @"sessions": @(sessionsServed),
             @"displays": displayJSON,
             @"stateLog": host.stateLog ?: @[],
             @"control": ctlDiag,

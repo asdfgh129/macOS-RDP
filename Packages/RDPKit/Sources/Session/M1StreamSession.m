@@ -74,6 +74,9 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 // 预算内误判失败（FR-07 实测：换屏 2.2s 后两端心跳同时消失、结果回包丢失）。
 @property (nonatomic, strong) dispatch_queue_t controlDeliveryQueue;
 @property (nonatomic, strong) dispatch_source_t livenessTimer;
+// 一次接入只通知一次（bye 正常挥手与传输失败可能双双到达）。
+@property (nonatomic, assign) BOOL sessionClosedNotified;
+- (void)notifySessionClosedOnce;
 @end
 
 @implementation M1StreamNode
@@ -135,6 +138,26 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     if (!self.livenessTimer) return;
     dispatch_source_cancel(self.livenessTimer);
     self.livenessTimer = nil;
+}
+
+- (void)notifySessionClosedOnce {
+    @synchronized (self) {
+        if (self.sessionClosedNotified) return;
+        self.sessionClosedNotified = YES;
+    }
+    if (self.onSessionClosed) self.onSessionClosed();
+}
+
+// 会话结束到下一次 attachSessionTo 之间复位一次性状态：
+// 同一 agent 进程服务下一个客户端时，上一轮的 error/计时/控制到达记录不能带进来。
+- (void)prepareForNextSession {
+    [self stopLivenessWatchdog];
+    self.streaming = NO;
+    self.error = nil;
+    self.handshakeMs = 0;
+    self.streamStartMs = 0;
+    self.lastControlArrivalMs = 0;
+    @synchronized (self.controlArrivals) { [self.controlArrivals removeAllObjects]; }
 }
 
 #pragma mark 启动
@@ -211,6 +234,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     cfg.heartbeatIntervalMs = 1000;
     self.session = [[M1ControlSession alloc] initWithChannel:self.channel config:cfg];
     self.session.delegate = self;
+    self.sessionClosedNotified = NO;
     [self.session begin];
 }
 
@@ -310,6 +334,12 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 
 - (void)quicTransport:(M1QuicTransport *)transport didFailWithError:(NSError *)error {
     if (!self.error) self.error = error;
+    // 会话中途传输断掉（客户端来不及挥手）：也按会话结束通知一次，
+    // 否则 host 只能干等到 --duration-ms 才清理旧管线。
+    if (self.streaming) {
+        self.streaming = NO;
+        [self notifySessionClosedOnce];
+    }
     dispatch_semaphore_signal(self.readySem);
     dispatch_semaphore_signal(self.streamingSem);
 }
@@ -388,7 +418,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
         self.streaming = NO;
         self.lastControlArrivalMs = 0;
         [self stopLivenessWatchdog];
-        if (self.onSessionClosed) self.onSessionClosed();
+        [self notifySessionClosedOnce];
     }
 }
 
