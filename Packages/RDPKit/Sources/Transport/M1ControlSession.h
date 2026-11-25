@@ -138,6 +138,10 @@ typedef NS_ENUM(NSInteger, M1ControlRole) {
 // 正常关闭：发 bye（失败也不阻塞关闭流程）。
 - (void)closeWithReason:(NSString *)reason;
 
+// 本端判死（控制链路重传耗尽 / 心跳静默）：尽力发 bye，然后本地直接转 Closed。
+// 与「收到对端 bye」走同一条收尾路径（didChangeState: Closed → 上层会话通知）。
+- (void)abortWithReason:(NSString *)reason;
+
 @property (nonatomic, readonly) NSArray<NSString *> *stateLog;      // 状态名序列，双端比对用
 @property (nonatomic, readonly) BOOL reachedStreaming;
 @property (nonatomic, readonly, nullable) NSDictionary *remoteHello;

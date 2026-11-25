@@ -149,6 +149,16 @@ static NSString *M1ArchName(void) {
     [self sendPayload:@{ @"type": @"bye", @"reason": reason ?: @"normal" }];
 }
 
+- (void)abortWithReason:(NSString *)reason {
+    if (self.closed) return;
+    self.closed = YES;
+    [self stopHeartbeat];
+    if (self.stateMachine.state == P1SessionStateClosed) return;
+    // bye 在断链上大概率发不出去；失败由 failWith 记 first-cause，不影响本地关闭。
+    [self sendPayload:@{ @"type": @"bye", @"reason": reason ?: @"local-abort" }];
+    [self advance:@"bye"];
+}
+
 #pragma mark - 发送
 
 - (BOOL)sendPayload:(NSDictionary *)payload {

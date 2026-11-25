@@ -133,7 +133,7 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
                 userInfo:@{NSLocalizedDescriptionKey:
                     [NSString stringWithFormat:@"控制面静默 %.1fs", gapMs / 1000.0]}];
         }
-        [s.session closeWithReason:@"control-timeout"];
+        [s.session abortWithReason:@"control-timeout"];
         dispatch_semaphore_signal(s.streamingSem);
     });
     self.livenessTimer = t;
@@ -514,6 +514,12 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
         if (!self.error) self.error = error;
     }
     [self stopLivenessWatchdog];
+    // 重传耗尽即本轮控制面已死：不仅记错误，还要把会话收口（本地转 Closed），
+    // 否则会话停在 Streaming 假在线，客户端不会触发重连（FR-08 对称断路实测）。
+    M1ControlSession *sess = self.session;
+    if (sess && sess.stateMachine.state != P1SessionStateClosed) {
+        [sess abortWithReason:@"control-link-failed"];
+    }
     dispatch_semaphore_signal(self.streamingSem);
 }
 

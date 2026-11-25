@@ -403,6 +403,7 @@ func runConnect() -> Int32 {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 guard !stopping else { reconnectPending = false; return }
                 DispatchQueue.global(qos: .userInitiated).async {
+                    let started = Date()
                     do {
                         _ = try client.reconnect(to: connectHost, port: port,
                                                  timeout: handshakeMs)
@@ -411,7 +412,8 @@ func runConnect() -> Int32 {
                         DispatchQueue.main.async { retry() }
                         return
                     }
-                    print("重连握手完成 \(String(format: "%.0f", client.handshakeMs)) ms，等 STREAMING")
+                    let ms = Int(Date().timeIntervalSince(started) * 1000)
+                    print("重连握手完成 \(ms) ms，等 STREAMING")
                     guard client.wait(forStreamingTimeoutMs: 30000) else {
                         let why = client.error?.localizedDescription ?? "未进入 STREAMING"
                         print("重连未进入推流：\(why)")
