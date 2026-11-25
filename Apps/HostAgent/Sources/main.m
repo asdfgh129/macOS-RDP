@@ -230,11 +230,19 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         driver = nil;
     };
     if (exclusive) {
+        // 由 displayID 列表拼 displayProvider 返回值。
+        NSArray<NSDictionary *> *(^displayList)(NSArray<NSNumber *> *, NSArray *) =
+            ^NSArray<NSDictionary *> *(NSArray<NSNumber *> *ids, NSArray *conv) {
+            NSMutableArray *displays = [NSMutableArray array];
+            for (NSUInteger i = 0; i < ids.count; i++)
+                [displays addObject:@{@"displayID": ids[i],
+                                      @"w": i < conv.count ? conv[i][@"width"] : @0,
+                                      @"h": i < conv.count ? conv[i][@"height"] : @0,
+                                      @"synthetic": @NO}];
+            return displays;
+        };
         NSArray<NSDictionary *> *(^buildDisplays)(NSDictionary *, NSError **) =
             ^NSArray<NSDictionary *> *(NSDictionary *message, NSError **perr) {
-            // 兜底：上一轮若没收干净（例如收尾被打断），先还屏再建屏，
-            // 否则旧 coordinator 会被覆盖泄漏，旧虚拟屏永远不销毁。
-            if (coord) endExclusive();
             NSArray *specs = message[@"specs"];
             if (![specs isKindOfClass:[NSArray class]] || specs.count == 0) {
                 if (perr) *perr = [NSError errorWithDomain:@"veild.agent" code:6
@@ -251,6 +259,29 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
                 if (perr) *perr = [NSError errorWithDomain:@"veild.agent" code:6
                     userInfo:@{NSLocalizedDescriptionKey: @"session-start 缺可用宽高"}];
                 return nil;
+            }
+            // 会话之间不还屏：同进程销毁后再 initWithDescriptor 会让新屏永远
+            // online=0（Tahoe 实测两次），只有「先建新再拆旧」的换屏路径安全。
+            // 规格相同直接沿用；不同就走会话内换屏。
+            if (coord) {
+                if ([conv isEqualToArray:virtualConv]) {
+                    printf("  [独占] 沿用虚拟屏 %s（规格未变）\n", virtualDisplays.description.UTF8String);
+                    return virtualDisplays;
+                }
+                NSError *ae = nil;
+                if (![coord applySpecs:conv error:&ae]) {
+                    if (perr) *perr = ae;
+                    return nil;
+                }
+                NSArray<NSNumber *> *newIDs = coord.createdDisplayIDs;
+                virtualDisplays = displayList(newIDs, conv);
+                virtualConv = conv;
+                virtualID = newIDs.firstObject.unsignedIntValue;
+                virtualW = [conv.firstObject[@"width"] unsignedIntegerValue];
+                virtualH = [conv.firstObject[@"height"] unsignedIntegerValue];
+                printf("  [独占] 换屏 %s（首屏 %lux%lu）\n",
+                       newIDs.description.UTF8String, (unsigned long)virtualW, (unsigned long)virtualH);
+                return virtualDisplays;
             }
             driver = [M1RDPDriver new];
             M1SessionCoordinator *c = [[M1SessionCoordinator alloc] initWithDriver:driver];
@@ -276,17 +307,11 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
             virtualW = [conv.firstObject[@"width"] unsignedIntegerValue];
             virtualH = [conv.firstObject[@"height"] unsignedIntegerValue];
             c09 = keepMain ? @"skipped-keep-main" : @"verified";
-            NSMutableArray *displays = [NSMutableArray array];
-            for (NSUInteger i = 0; i < ids.count; i++)
-                [displays addObject:@{@"displayID": ids[i],
-                                      @"w": i < conv.count ? conv[i][@"width"] : @0,
-                                      @"h": i < conv.count ? conv[i][@"height"] : @0,
-                                      @"synthetic": @NO}];
-            virtualDisplays = displays;
+            virtualDisplays = displayList(ids, conv);
             virtualConv = conv;
             printf("  [独占] 虚拟屏 %s（首屏 %lux%lu）C-09=%s\n",
                    ids.description.UTF8String, (unsigned long)virtualW, (unsigned long)virtualH, c09.UTF8String);
-            return displays;
+            return virtualDisplays;
         };
         host.displayProvider = ^NSArray<NSDictionary *> *(NSDictionary *message, NSError **perr) {
             __block NSArray<NSDictionary *> *result = nil;
@@ -297,11 +322,11 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
             return result;
         };
         host.onAttemptFailed = ^{
-            // 与建屏/还屏事务串行：失败收尾不能和下一轮的建屏并发。
+            // 显示保留给下一次接入复用（销毁再建会弄坏 VD 注册）。这里只需
+            // 与显示事务串行地确认旧管线已停，避免它还在往死连接推帧。
             dispatch_sync(displayTxQueue, ^{
-                endExclusive();
-                virtualID = 0; virtualDisplays = @[]; virtualConv = @[];
-                virtualW = 0; virtualH = 0;
+                printf("  [独占] 接入失败，虚拟屏保留待复用\n");
+                fflush(stdout);
             });
         };
     }
@@ -531,24 +556,19 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     }
 
     // 会话循环：一个进程连续服务多个客户端（--max-sessions >1 或 0）。
-    // 每轮结束（对端 bye / 传输断 / duration 到）立即清理：停管线、还物理屏、
-    // 毁虚拟屏、清键帧节流与坐标基准，再复位会话节点等下一位客户端。
-    // 旧管线/旧 displayID 不能带进下一轮——客户端会按新 displayID 重新绑定。
-    // 收尾统一在 displayTxQueue 上执行：建屏/还屏是秒级 WindowServer 事务，
-    // 与下一轮建屏并发会互相踩（实测：session 2 建出的屏被上一轮销毁）。
-    // 不放控制交付队列——十几秒的还屏会把下一轮的 attach/hello 饿死。
+    // 每轮结束（对端 bye / 传输断 / duration 到）立即清理：停管线、清键帧节流。
+    // 显示不还：同进程销毁虚拟屏后再建会让新屏永远 online=0（Tahoe 实测），
+    // 下一轮按规格复用/换屏。物理屏在整个常驻期间保持独占，进程退出才恢复。
+    // 收尾统一在 displayTxQueue 上执行：与下一轮建屏/换屏是同一串行域。
     void (^cleanupSession)(void) = ^{
         BOOL hasPipes = NO;
         @synchronized (pipes) { hasPipes = pipes.count > 0; }
-        if (!coord && !hasPipes) return;   // 已收过尾（bye 与时长到可能双双到达）
+        if (!hasPipes) return;   // 已收过尾（bye 与时长到可能双双到达）
         // 这段收尾是上一轮的：若新一轮已接上（理论上要快过收尾入队），
-        // 不能拆它的显示/管线——它的建屏兜底已经还过旧屏。
+        // 不能拆它的管线。
         if (host.session) return;
         [host flushSimulatedHeld];
         retirePipelines();
-        endExclusive();
-        virtualID = 0; virtualDisplays = @[]; virtualConv = @[];
-        virtualW = 0; virtualH = 0;
         @synchronized (lastKeyframeByDisplay) { [lastKeyframeByDisplay removeAllObjects]; }
         [host prepareForNextSession];
     };
@@ -589,7 +609,6 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
             printf("✗ 没有可推流的显示\n");
             dispatch_sync(displayTxQueue, ^{
                 retirePipelines();
-                endExclusive();
                 [host prepareForNextSession];
             });
             break;
@@ -622,10 +641,12 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         fflush(stdout);
     }
     // 关停本身可能再触发一次 onSessionClosed（收尾入队），所以先 shutdown
-    // 再用队列屏障把收尾/还屏全部排干，最后才在主线程确认还屏。
+    // 再用队列屏障把收尾/还屏全部排干，最后才还屏退出。
     [host shutdown];
-    dispatch_sync(displayTxQueue, ^{});
-    endExclusive();
+    dispatch_sync(displayTxQueue, ^{
+        retirePipelines();
+        endExclusive();
+    });
 
     uint64_t cap = 0, enc = 0, sent = 0, dropped = 0, fragments = 0;
     NSMutableArray<NSDictionary *> *displayJSON = [NSMutableArray array];
