@@ -177,7 +177,13 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     _vd = [[VDManager alloc] initWithConfigs:specs
                               identityOffset:[VDManager savedIdentityOffset]
                            conservativeFirst:conservative];
-    if (![_vd createAll] || ![_vd waitUntilUsableTimeoutMs:8000]) {
+    BOOL ready = [_vd createAll] && [_vd waitUntilUsableTimeoutMs:8000];
+    if (!ready && _vd.displayIDs.count > 0) {
+        // 常见失败形态是 online 但永不 active，显式 enable 后再给一轮等待。
+        [self forceEnableInactiveDisplaysOf:_vd];
+        ready = [_vd waitUntilUsableTimeoutMs:8000];
+    }
+    if (!ready) {
         [_vd destroyAll];
         _vd = nil;
         if (self.screenSharingQuiesced) {
@@ -232,6 +238,10 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
                                           identityOffset:[VDManager savedIdentityOffset]
                                        conservativeFirst:conservative];
     BOOL ok = [fresh createAll] && [fresh waitUntilUsableTimeoutMs:8000];
+    if (!ok && fresh.displayIDs.count > 0) {
+        [self forceEnableInactiveDisplaysOf:fresh];
+        ok = [fresh waitUntilUsableTimeoutMs:8000];
+    }
     if (ok && conservative) {
         [fresh waitUntilModeMatchesTimeoutMs:modeWaitMs conservative:YES];
         [fresh promoteToTarget];
@@ -263,6 +273,27 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     }
     self.lastActiveDisplayIDs = P0VActiveDisplayIDs();
     return YES;
+}
+
+#pragma mark - 建屏后修复
+
+// Tahoe 真机偶发：新建虚拟屏 online 却不 active（WindowServer 脏态，重启能解但
+// 无人值守/连续跑测不该依赖重启）。显式 enable 事务能把它拉进 active list
+// （2026-11-25 Tahoe 实测：4128835 online=1 active=0 十秒不变，enable 提交后立刻 active=1）。
+// 只 enable 本会话新建的虚拟屏，物理屏不动。
+- (void)forceEnableInactiveDisplaysOf:(VDManager *)vd {
+    NSMutableArray<NSNumber *> *inactive = [NSMutableArray array];
+    for (NSNumber *n in vd.displayIDs) {
+        if (!CGDisplayIsActive((CGDirectDisplayID)n.unsignedIntValue)) [inactive addObject:n];
+    }
+    if (inactive.count == 0) return;
+    NSDictionary *detail = nil;
+    NSError *e = nil;
+    BOOL ok = P0VApplyDisplayEnabledChanges(@[], inactive, P0VCommitScopeSession, 20, &detail, &e);
+    printf("  [建屏] %lu 块虚拟屏未 active，显式 enable 事务%s%s\n",
+           (unsigned long)inactive.count, ok ? "已提交" : "失败",
+           ok ? "" : (e.localizedDescription.UTF8String ?: ""));
+    fflush(stdout);
 }
 
 #pragma mark - 兜底护盾
