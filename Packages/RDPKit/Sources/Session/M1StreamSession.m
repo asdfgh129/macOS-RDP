@@ -270,6 +270,45 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
     return YES;
 }
 
+- (BOOL)reconnectAsClientTo:(NSString *)host port:(uint16_t)port
+                    timeout:(uint32_t)timeoutMs error:(NSError **)error {
+    self.isHost = NO;
+    // 上一轮已结束：对象可能已被 notifySessionClosedOnce 摘掉，这里再按引用清一次
+    // （幂等），并取消旧连接，避免 listener 侧继续认为旧会话占用。
+    [self detachSessionObjects];
+    [self stopLivenessWatchdog];
+    while (dispatch_semaphore_wait(self.streamingSem, DISPATCH_TIME_NOW) == 0) {}
+    self.streaming = NO;
+    self.error = nil;
+    self.handshakeMs = 0;
+    self.streamStartMs = 0;
+    self.lastControlArrivalMs = 0;
+    @synchronized (self.controlArrivals) { [self.controlArrivals removeAllObjects]; }
+    self.sessionClosedNotified = NO;
+
+    M1QuicTransport *t = [[M1QuicTransport alloc] initAsClientToHost:host
+                                                                port:port
+                                                                alpn:self.alpn
+                                                        identityPath:nil
+                                                        identityPass:nil
+                                                          verifyPeer:YES];
+    t.expectedPeerFingerprint = self.expectedFingerprint;
+    t.delegate = self;
+    self.streamConn = t;
+    double t0 = M1StreamNowMs();
+    [t start];
+    if (![t waitUntilReadyTimeoutMs:timeoutMs]) {
+        [t cancel];
+        if (error) *error = [NSError errorWithDomain:@"M1StreamSession" code:2
+            userInfo:@{NSLocalizedDescriptionKey:
+                [NSString stringWithFormat:@"重连握手未在 %ums 内完成", timeoutMs]}];
+        return NO;
+    }
+    self.handshakeMs = M1StreamNowMs() - t0;
+    if (self.error) { if (error) *error = self.error; return NO; }
+    return YES;
+}
+
 - (void)attachSessionTo:(M1QuicTransport *)conn {
     // 新一轮接入：先把上一轮可能残留的控制对象按引用拆掉，再复位一次性状态。
     [self detachSessionObjects];

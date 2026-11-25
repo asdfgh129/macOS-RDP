@@ -215,6 +215,9 @@ func runConnect() -> Int32 {
     let durationMs = Int(arg("--duration-ms") ?? "5000") ?? 5000
     let waitMs = UInt32(arg("--wait-ms") ?? "15000") ?? 15000
     let handshakeMs = UInt32(arg("--handshake-ms") ?? "12000") ?? 12000
+    // FR-08：--reconnect 开启断线自动重连，窗口从检测到断开起算。
+    let reconnectEnabled = CommandLine.arguments.contains("--reconnect")
+    let reconnectWindowMs = Int(arg("--reconnect-window-ms") ?? "60000") ?? 60000
     let saveFrames = Int(arg("--save-frames") ?? "5") ?? 5
     let outdir = arg("--outdir") ?? ""
     let outPath = arg("--out")
@@ -250,6 +253,7 @@ func runConnect() -> Int32 {
     app.setActivationPolicy(.regular)
 
     var closedByUser = false
+    var stopping = false
     func makeSlot(_ index: Int, _ size: (Int, Int)) -> DisplaySlot {
         let content = NSRect(x: 0, y: 0, width: size.0, height: size.1)
         let window = NSWindow(contentRect: content,
@@ -268,6 +272,7 @@ func runConnect() -> Int32 {
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
                                                object: window, queue: .main) { _ in
             closedByUser = true
+            stopping = true
             NSApp.stop(nil)
         }
         window.makeKeyAndOrderFront(nil)
@@ -349,6 +354,7 @@ func runConnect() -> Int32 {
         }
         slot.view.onCloseRequest = {
             closedByUser = true
+            stopping = true
             NSApp.stop(nil)
         }
         slot.view.onToggleImmersive = { applyImmersive(!immersive) }
@@ -373,6 +379,58 @@ func runConnect() -> Int32 {
     if remote.count < slots.count {
         print("⚠ host 只提供 \(remote.count) 块屏，其余 \(slots.count - remote.count) 个窗口不接收画面")
     }
+
+    // FR-08：断线自动重连（--reconnect）。检测到会话结束后按 0.5→1→2→4→5s 退避
+    // 重连，窗口内恢复就按新屏表重绑窗口继续收流；host 桌面状态保持不变。
+    var reconnects = 0
+    var reconnectPending = false
+    func scheduleReconnect() {
+        guard reconnectEnabled, !stopping, !reconnectPending else { return }
+        reconnectPending = true
+        let deadline = Date().addingTimeInterval(Double(reconnectWindowMs) / 1000.0)
+        print("⚠ 会话断开，开始自动重连（窗口 \(reconnectWindowMs) ms）")
+        var attempt = 0
+        func retry() {
+            guard !stopping else { reconnectPending = false; return }
+            guard Date() < deadline else {
+                print("✗ 重连窗口内未恢复（\(reconnectWindowMs) ms），放弃")
+                reconnectPending = false
+                return
+            }
+            attempt += 1
+            let delay = min(5.0, 0.5 * pow(2.0, Double(attempt - 1)))
+            print("重连第 \(attempt) 次（\(String(format: "%.1f", delay))s 后）")
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard !stopping else { reconnectPending = false; return }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        _ = try client.reconnect(to: connectHost, port: port,
+                                                 timeout: handshakeMs)
+                    } catch {
+                        print("重连握手失败：\(error.localizedDescription)")
+                        DispatchQueue.main.async { retry() }
+                        return
+                    }
+                    print("重连握手完成 \(String(format: "%.0f", client.handshakeMs)) ms，等 STREAMING")
+                    guard client.wait(forStreamingTimeoutMs: 30000) else {
+                        let why = client.error?.localizedDescription ?? "未进入 STREAMING"
+                        print("重连未进入推流：\(why)")
+                        DispatchQueue.main.async { retry() }
+                        return
+                    }
+                    DispatchQueue.main.async {
+                        reconnectPending = false
+                        reconnects += 1
+                        router.reset()
+                        bindSlots(client.session?.remoteDisplays ?? [], allowShrink: true)
+                        print("✓ 重连成功（第 \(reconnects) 次），恢复推流")
+                    }
+                }
+            }
+        }
+        retry()
+    }
+    client.onSessionClosed = { DispatchQueue.main.async { scheduleReconnect() } }
 
     // FR-07：换屏结果回到主线程重绑窗口；失败保持原窗口（Host 会保持旧屏）。
     var updateResults: [[String: Any]] = []
@@ -429,6 +487,7 @@ func runConnect() -> Int32 {
     }
 
     let stopItem = DispatchWorkItem {
+        stopping = true
         if !closedByUser { NSApp.stop(nil) }
         if let wake = NSEvent.otherEvent(with: .applicationDefined,
                                          location: .zero, modifierFlags: [], timestamp: 0,
@@ -445,6 +504,7 @@ func runConnect() -> Int32 {
     }
     app.run()
 
+    stopping = true
     client.flushFrames()
     client.flushSaves()
 
@@ -490,7 +550,7 @@ func runConnect() -> Int32 {
     print("client: 上屏 p50=\(maxP50) ms p95=\(maxP95) ms "
           + "时钟 offset=\(client.session?.clockOffsetUs ?? 0) us（样本 \(client.session?.timeSyncSamples ?? 0)）")
     print("client: 输入上行 \(inputSent)/失败 \(inputFailed) | 控制最大间隔=\(client.maxControlGapMs) ms "
-          + "PNG=\(client.savedFrames)")
+          + "PNG=\(client.savedFrames) | 断线重连 \(reconnects) 次")
     let ctl = client.controlDiagnostics()
     let ctlStr = ctl.keys.sorted().map { "\($0)=\(ctl[$0]!)" }.joined(separator: " ")
     print("client: 控制面 \(ctlStr)")
@@ -512,6 +572,7 @@ func runConnect() -> Int32 {
         "clockOffsetUs": client.session?.clockOffsetUs ?? 0,
         "timeSyncSamples": client.session?.timeSyncSamples ?? 0,
         "inputSent": inputSent, "inputFailed": inputFailed,
+        "reconnects": reconnects,
         "maxControlGapMs": client.maxControlGapMs,
         "savedPNG": client.savedFrames,
         "sessionUpdates": updateResults,

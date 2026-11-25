@@ -112,6 +112,11 @@ double M1StreamNowMs(void);
 - (BOOL)startAsHostOnPort:(uint16_t)port error:(NSError **)error;
 - (BOOL)startAsClientTo:(NSString *)host port:(uint16_t)port
                 timeout:(uint32_t)timeoutMs error:(NSError **)error;
+// Client 断线重连（FR-08）：拆掉上一轮连接与控制对象，按同一身份重新握手。
+// 只能在上一轮会话已结束时调用；解码器与统计留在本节点上继续累计。
+- (BOOL)reconnectAsClientTo:(NSString *)host port:(uint16_t)port
+                    timeout:(uint32_t)timeoutMs error:(NSError **)error
+    NS_SWIFT_NAME(reconnect(to:port:timeout:));
 - (void)attachSessionTo:(M1QuicTransport *)conn;
 - (BOOL)waitForStreamingTimeoutMs:(uint32_t)timeoutMs;
 
