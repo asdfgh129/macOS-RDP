@@ -23,6 +23,7 @@
 3. `P2-CHECKLIST.md`：探针路径的双机验收清单
 4. `P2-NEXT-PLAN.md` / `P2-TONIGHT-RUNBOOK.md`：探针路径的夜间执行计划与 runbook
 5. `SSH-SETUP.md`：测试机 SSH / 端口映射
+6. `SECURITY-CHECKLIST.md`：NFR-07 渗透自查清单（A–F 28 项，含发布前执行步骤）；M3 无人值守/soak 见 `Scripts/host-deploy/`、`Scripts/soak/`
 
 ## 3. 工程骨架
 

@@ -4,6 +4,28 @@
 
 格式约定：以日期为版本号构成版本节（`[YYYY-MM-DD]` + 里程碑简述），节内按 **Added / Changed / Fixed / Documentation** 分类，每条附短 commit hash；分类参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，Documentation 用于纯文档提交，本文件自身的维护提交不重复列入。真机结论按 OS 分离记录在 `docs/RESULTS-BY-OS.md`，决策编号见 `docs/DECISIONS.md`。
 
+## [2026-11-25] — M3 开工：FR-08 断网重连、宿主有序收尾、SPI 8s 熔断、指纹钉死
+
+### Added
+
+- feat: 客户端 `--reconnect` 自动重连——指数退避 0.5→1→2→4→5s 封顶、窗口默认 60s；`reconnect(to:port:timeout:)` 阻塞握手 + 30s 等 STREAMING，成功后 `router.reset()` + 按新屏表重绑窗口；控制台/JSON 输出重连次数（`ac196c5`）
+- feat: 宿主 `--allow-fingerprint HEX` 按 hello 指纹钉死允许接入的客户端（NFR-07）；未配置时启动横幅显式告警；客户端改用 `.state/rdp-identity.p12` 持久身份接入并上报指纹，根 `.state/` 入 gitignore（`3c06c1c`）
+- feat: FR-09 无人值守资产 `Scripts/host-deploy/`——LaunchAgent 经 Terminal 拉起以继承屏幕录制/辅助功能授权、崩溃 10s 自重启循环、pmset/锁屏关闭脚本；soak 工具链 `Scripts/soak/`（72h 客户端驱动、host 采样、`analyze-soak.py` 汇总）（`3c06c1c`）
+- test: 新增 `ctl-host-pins-client-fingerprint`（Host 侧指纹钉死负向用例），343/343 PASS（`3c06c1c`）
+
+### Fixed
+
+- fix: 控制链路重传耗尽时只记错误不关会话——对称断路下收包线程死亡，状态机永远停在 Streaming（僵尸在线），客户端不触发重连（真机 `控制链路失败 seq=18 重传 20 次` 后 `断线重连 0 次`）；新增 `M1ControlSession abortWithReason:`（尽力 bye → 本地 Closed → 同一收尾通知），链路失败与 8s 看门狗统一走它（`75e976c`）
+- fix: host agent 被杀时无还屏保护——新增 SIGTERM/SIGINT 处理（dispatch_source）：`shutdown` → 停管线 → 还物理屏 → 销毁虚拟屏 → 摘 guardian → exit；直接 SIGTERM 会把 Tahoe WindowServer 留成「物理屏已禁、VD 未拆」脏态，guardian 兜底恢复 `CGError 1001` 只能重启（`3c06c1c`）
+- fix: 显示配置 SPI 死线 20s → 8s（`M1DisplayTxTimeoutSec`，`P0VPerformTransaction` 默认值同步），满足 NFR-06「任何 SPI 挂起 8s 内熔断」；超时仍只置 `WindowServerHung`、绝不重试（`3c06c1c`）
+
+### Documentation
+
+- docs: `RESULTS-BY-OS.md` §5.45 M3 开工入档——断网注入方法对比（ifconfig/blackhole/单向 pf 均无效；双向 pf + 清 state 可用）、FR-08 三轮 PASS 数据、对称断路缺陷与修复、Tahoe 显示脏态事故与 host 失联时间线
+- docs: 新增 `docs/SECURITY-CHECKLIST.md`（NFR-07 渗透自查清单，A–F 28 项，含执行步骤）
+- test: FR-08 断网复现脚本归档 `Scripts/tests/fr08-reconnect/`（双向/单向 pf 断路 + 清 state，`sudo -v` 预授权、不含口令，带 PASS/僵尸回归断言）
+
+
 ## [2026-11-25] — M2 重连清理：多会话常驻、显示事务串行、会话间复用虚拟屏
 
 ### Fixed

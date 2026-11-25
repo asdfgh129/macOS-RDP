@@ -1718,6 +1718,54 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - host 侧物理屏在会话间保持禁用属有意行为；若 M3 要求「无人值守但人在场时恢复」，需单独设计空闲恢复策略。
 - 会话间复用显示后，「旧 displayID 残留」不再存在（同一块屏继续用），但**旧管线必须每轮退休**（本轮 `cleanupSession` 保留此项）。
 
+### 5.45 M3 开工：FR-08 断网重连真机（部分）+ 对称断路缺陷修复 + Tahoe 显示脏态事故与 host 失联（2026-11-25 21:4x–22:4x）
+
+**环境**：Tahoe 26.5.2（25F84）host（Mac-mini.local，WAN 112.5.32.34:46600，SSH 46601）× Sequoia 15.5（24F74）client（WAN）；基线 `7b63413` + FR-08 客户端重连改动（`ac196c5`）。host 由 GUI 会话内 Terminal 启动（`--max-sessions 0`，会话时长 `--duration-ms` 由客户端决定），客户端 `VeilRD --reconnect --reconnect-window-ms 60000`，两端 720p15~20。
+
+**A. 断网注入方法（本地 macOS 客户端侧）**
+- ❌ `ifconfig en1 down`：configd 数秒内自动拉起，会话不断，不可用。
+- ❌ `route add -host 112.5.32.34 -blackhole`：报 `Invalid argument`；改走网关 `.254` 黑洞也被网关正常转发。
+- ❌ 单向 `pf` block（仅 client→host）：ping 已 100% 丢，但 QUIC 会话仍存活（`client.log`：287/287 帧、`reconnects=0`）——已建立的 UDP 流有 pf state 条目（`pfctl -s states`），规则不命中，且 host→client 方向仍通。
+- ✅ **双向 pf block + 清 state**：`/tmp/fr08-pf.conf` =
+  `block drop quick inet from any to 112.5.32.34` + `block drop quick inet from 112.5.32.34 to any` + `pass`；
+  `pfctl -e; pfctl -f conf; pfctl -F states` 后 ping 100% 丢（`ping-probe.log` 3/6 → `ping3.log` 0/6），会话在 8s 级判死。恢复 = `pfctl -f /etc/pf.conf; pfctl -F states; pfctl -d`。
+- 日志实时性：客户端 stdout 重定向到文件是块缓冲，必须 `script -q /dev/null <cmd> >> log`；`script` 的 stdout 再接管道会报 `tcgetattr: Operation not supported on socket`，时序标记直接追加进日志文件。
+- 复现脚本已归档：`Scripts/tests/fr08-reconnect/`（预先 `sudo -v`，无明文口令；支持双向/单向断路器）。
+
+**B. FR-08 单向/近对称断路验证（PASS，3 轮）**
+
+| 轮 | 断法 | 判死/重连时序 | 结果（client JSON） |
+|---|---|---|---|
+| r1 `test.sh`（21:54） | 12s（3+6+3s）双向 block + 清 state | `控制面静默 8.8s` → 第 1 次重连握手 8000ms 超时（网络仍断）→ 第 2 次成功 | 195/195 解码上屏、**0 丢帧**、`reconnects=1`、断后沿用 `displayID=4128835`、控制最大间隔 1034ms、p50/p95 32.5/767.5ms |
+| r2 `test10.sh`（21:56） | 10s 双向 block + 清 state | 判死 → 重连成功 | 118/118、0 丢帧、`reconnects=1`、间隔 1318ms、p50/p95 29.5/688.5ms |
+| r3 `diag.sh`（21:47） | 10s 单向 block（未清 state，仍靠判死兜底） | 判死 → 重连成功 | 103/103、0 丢帧、`reconnects=1`、间隔 1042ms、p50/p95 19.5/463.5ms |
+
+- 退避实测：`0.5s → 1s → 2s…` 封顶 5s，窗口 60s；首轮重连握手超时（8s）不掀窗口，下一轮继续。
+- 关键点：重连后**沿用同一虚拟屏 4128835**（§5.44 的会话间复用策略），不再有 20s 首轮建屏成本。
+
+**C. 对称断路暴露的产品缺陷（已修，`75e976c`，待复测）**
+- 现象（`final.sh`，22:00，12s **双向** block + 清 state）：客户端 `控制面静默 8.0s，判定控制链路失效` → `控制链路失败: seq=18 重传 20 次仍未确认`，随后 **`断线重连 0 次`**，会话停在僵尸 STREAMING；JSON：63/63、丢帧 20、间隔 154.7ms、`reconnects=0`。host 侧仍显示流在跑。
+- 根因：单向断路时 host→client 仍有帧到达，`M1StreamNode` 的 `controlLink:didFailWithError:` 只记错误、不关会话；对称断路后收包线程死亡，状态机永远停在 Streaming，客户端不会触发重连。
+- 修复：`M1ControlSession abortWithReason:`（尽力发 bye → 本地转 Closed → 走同一条 `didChangeState: Closed` 收尾通知）；`controlLink:didFailWithError:` 与 8s 看门狗均改走 `abortWithReason:`（`control-link-failed` / `control-timeout`）。单测 343/343 PASS。
+- **复测被 host 失联阻塞**（见 D），恢复后按同一脚本预期：判死 ≤8s → 重连 → host 复用 VD、`reconnects=1`。
+
+**D. Tahoe 显示脏态事故与 host 失联（21:5x–22:4x）**
+1. 收尾阶段用 `SIGTERM` 杀掉 host agent（无信号处理 → 不走 `endExclusive`、guardian 没收到 `.done`）。
+2. guardian 兜底恢复失败：`enable 817925634 -> CGError 1001`（Tahoe 上该状态不可恢复）；两块物理屏 displayID 变为无效（`-1`），只剩合成内建屏 1104977159（1280×720）为主屏。
+3. 尝试 disable 该合成屏后主机完全无头，再 enable 仍 1001 → 唯一解为重启；重启前补配无人值守前提：FileVault 已 Off，写 `/etc/kcpassword`（root:wheel 0600）+ `defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser bemin`（读回确认）。
+4. 22:08 `sudo shutdown -r now`；至 22:38 **SSH 46601 仍拒连**。WAN ping「通」是路由器代答（不可信）；同网段 192.168.31.0/24 ARP+端口全扫（含 .92/.106/.219 等 8 个活跃邻居）无 22/5900/46601 ⇒ host 未完成启动/掉电或卡在更新，**需物理检查**。
+- 教训（已入代码）：kill 路径必须有序收尾（见 E1）；guardian 恢复失败仍是无头风险，M3 需补「恢复失败 → 不 disable 物理屏」的预检。
+
+**E. M3 代码侧同步落地（`3c06c1c`，已推送）**
+1. host agent 捕获 SIGTERM/SIGINT（dispatch_source）→ `[host shutdown]` → 停管线 → 还物理屏 → 销毁 VD → 摘 guardian → `exit(0)`（真机待验）。
+2. NFR-06：显示事务死线 20s→**8s**（`M1DisplayTxTimeoutSec`，`P0VPerformTransaction` 默认值同步），超时只置 `WindowServerHung` 不重试。
+3. NFR-07：host `--allow-fingerprint HEX` 按 hello 指纹钉死客户端；客户端以 `.state/rdp-identity.p12` 持久身份接入并上报指纹；新增单测 `ctl-host-pins-client-fingerprint`（343 PASS）。未给钉死值时 host 启动横幅显式告警。
+4. FR-09 资产：`Scripts/host-deploy/`（LaunchAgent 经 Terminal 继承 TCC、10s 崩溃自重启、pmset/锁屏关闭）；`Scripts/soak/`（72h 驱动/采样/汇总）；`docs/SECURITY-CHECKLIST.md`（A–F 28 项渗透自查）。
+
+**F. 遗留**
+- FR-08 对称断路 12s 复测（新二进制）待 host 恢复。
+- guardian 失败兜底与「恢复失败不 disable」预检、FR-09 真机装载、8s 熔断故障注入、72h soak 全部待 host。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
@@ -1733,6 +1781,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
+- v0.74-draft 2026-11-25 22:4x：**M3 开工（§5.45）**。FR-08 断网重连真机 3 轮 PASS（10–12s 双向 pf 阻断 + 清 state）：判死 8.8s、退避 0.5→1→2s、重连后沿用 VD 4128835，0 丢帧、`reconnects=1`（195/195、118/118、103/103）。对称断路暴露僵尸 STREAMING（`控制链路失败 seq=18 重传 20 次` 后 `断线重连 0 次`），修复 `75e976c`（`abortWithReason:` 接入链路失败与 8s 看门狗），复测被 host 失联阻塞。同轮落地（`3c06c1c`）：host SIGTERM/SIGINT 有序还屏、显示事务死线 8s（NFR-06）、`--allow-fingerprint` 客户端指纹钉死 + 客户端持久身份、无人值守/soak 资产、安全自查清单；单测 343 PASS。事故：SIGTERM 杀 agent → guardian 恢复 `CGError 1001` → 物理屏 ID 失效、仅合成主屏 → 配好自动登录后 22:08 重启，至 22:38 SSH/WAN/LAN 全不可达，待物理检查。
 - v0.73-draft 2026-11-25 21:2x：**M2 重连清理 PASS（§5.44）**。Tahoe 26.5.2 host（WAN）× Sequoia 15.5 client，`--max-sessions 2`：会话 1 1920×1080 17/17 上屏、客户端离开；会话 2 1280×720 `[独占] 换屏 4128834` 23/23 上屏、host 时长到收尾；`sessions=2`、sent=40、fragments=633、控制面 0 异常、退出 0、物理屏恢复、无遗留进程。两个根因：① 显示收尾（16s+）占着控制交付队列，饿死下一轮 attach/hello（`57`/重传耗尽）；② Tahoe 同进程销毁虚拟屏后再建必 `online=0`，身份 offset 无效——改为会话间复用虚拟屏（规格变则 create-then-destroy 换屏），物理屏常驻期保持禁用。
 - v0.72-draft 2026-11-24 22:3x：**M2 收口真机（§5.42）**。FR-07 keep-main 2→1 WAN 换屏 PASS：host `[换屏] 2→1（4128833 1024×768）`、旧屏 retired、client 结果 ok 并重绑窗口、0 丢帧、两端控制间隔 1.44s/1.19s；根因定位为控制消息在 QUIC 收包线程同步交付，换屏 ~2.2s 拖死 ACK、2s 重传预算耗尽后控制链路静默失效，修复 `7f664b6`（专用交付队列）。FR-06 真机文本注入 PASS：client `--send-text` 两串 → host `inputOK=2`、落盘 `HelloVeilRD中文输入测试` 29B 逐字节一致、39/39 上屏 0 丢帧；首轮收端 canonical 模式不落盘已定位。沉浸模式真机目测与 FR-07 取档因 host WindowServer 虚拟屏 `active=false` 脏态延后，已重启 host 待补。
 - v0.71-draft 2026-11-24 21:2x：**P2.3 基线取数条件收敛（§5.41）**。Qoder 仅最小化（进程未挂起、mds 未暂停）8 轮离屏：vga 2.3/2.5/2.77、720p 3.1/3.65/4.6、1080p 5.3/5.85/7.5、ultrawide 13.4/14.8/17.15ms，8/8 ALL PASS，与隔离口径 p50 差 ≤0.5ms；此后基线只需最小化 Qoder。
