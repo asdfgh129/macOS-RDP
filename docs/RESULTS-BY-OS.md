@@ -1693,6 +1693,31 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - 一客户端一 agent 的口径不变；「会话结束 → 新客户端重连」的旧管线/旧 displayID 清理仍记为待办（P2.3 → M3）。
 - 每轮结束确认：虚拟屏已销毁、物理屏 2 块在位、无遗留 agent 进程。
 
+### 5.44 M2 重连清理：多会话常驻真机 PASS + Tahoe「销毁后重建虚拟屏必挂」根因与复用方案（2026-11-25）
+
+**环境**：Tahoe 26.5.2（25F84）host（Mac-mini.local，WAN，SSH TCP 46601 → :22）× Sequoia 15.5（24F74）client；基线 `62e9ddc` + 本轮改动（收尾移出控制交付队列、显示事务串行队列、会话间复用虚拟屏）；两端重建，host 由 GUI 会话内 Terminal 启动。
+
+**A. 两个根因（均已修复）**
+1. **控制面被显示收尾饿死**：会话结束的还屏/恢复（秒级，实测 16s+）原本跑在控制交付队列上，下一轮客户端的 attach/hello 排在它后面；客户端先报 `seq=1 重传 20 次仍未确认`，再报 `57`。修复分三层：
+   - 节点 `M1StreamNode`：会话关闭时**同步**摘掉本轮控制对象（link/session/channel/conn）再异步去 nil 委托/取消连接/通知入口；新连接 `attachSessionTo:` 就地执行不再排队；新增 `endCurrentSession`（正常挥手 0.2s 后拆连接），`prepareForNextSession` 只复位标量。
+   - 入口：新增 `veild.display-tx` 串行队列，建屏/禁屏/恢复/会话收尾全部在其上串行；`onSessionClosed` 先放行主线程判定，再把收尾入队。
+   - 时长到：`endCurrentSession` + 同队列收尾；进程退出时统一 `endExclusive`（还屏 + 窗口布局恢复）。
+2. **Tahoe 上「销毁虚拟屏后再建」必失败**：同一 agent 进程里把虚拟屏销毁后再 `initWithDescriptor:`，新建的屏**永远 `online=0`**（bounds 1×1、mode 1×1，10s mode-wait 超时，报 `建屏失败或超时`）；两次尝试复现，identity offset 0→1 无效。对照：首次建屏必成功、FR-07 换屏（create-then-destroy，进程内始终有存活虚拟屏）必成功 ⇒ 进程内虚拟屏注册不能从「有」回到「零」再重建。方案：**会话之间不还屏**，下一轮 session-start 复用：
+   - 规格相同 → 直接沿用现有 displayID；
+   - 规格不同 → `coordinator applySpecs:`（先建新屏、成功才拆旧屏）。
+   - 物理屏在整个常驻期保持禁用，进程退出才恢复（行为变化，M3 无人值守档按此口径）。
+
+**B. 真机验证（`--max-sessions 2`，1920×1080 → 1280×720）**
+- 会话 1（`1920x1080`，client 8s）：`[建屏] 用时：建屏 8.35s，禁屏/校验 11.54s`；`[会话 1] STREAMING`，收齐/解码/上屏 17/17/0 丢；客户端离开后 `[会话 1] 结束（客户端离开），收尾`，显示保留。
+- 会话 2（`1280x720`，client 20s）：`[独占] 换屏 (4128834)（首屏 1280x720）`，`[会话 2] STREAMING`，收齐/解码/上屏 23/23/0 丢；host `--duration-ms 12000` 到点 `[会话 2] 结束（时长到），收尾`。
+- 汇总 `host.json`：`sessions=2`、`framesCaptured=42 / encoded=40 / sent=40 / dropped=0`、`fragmentsSent=633`；控制面 `delivered=27 acks=26 chanErrors=0 dgramUnrouted=0 pending=0 retransmits=2`；退出 `EXIT=0`，`[独占] 已恢复物理屏并销毁虚拟屏`，两块物理屏 active、无遗留 agent/guardian 进程。
+- 单测 `M1-Skeleton/build_tests.sh` 341/341。
+
+**C. 备注 / 遗留**
+- 首轮建屏 20s（禁屏/校验 ~11.5s）仍是重连首帧的主要成本；复用后重连换屏不再走禁屏事务，client 侧握手 110ms 即进入 STREAMING。
+- host 侧物理屏在会话间保持禁用属有意行为；若 M3 要求「无人值守但人在场时恢复」，需单独设计空闲恢复策略。
+- 会话间复用显示后，「旧 displayID 残留」不再存在（同一块屏继续用），但**旧管线必须每轮退休**（本轮 `cleanupSession` 保留此项）。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
@@ -1708,6 +1733,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
+- v0.73-draft 2026-11-25 21:2x：**M2 重连清理 PASS（§5.44）**。Tahoe 26.5.2 host（WAN）× Sequoia 15.5 client，`--max-sessions 2`：会话 1 1920×1080 17/17 上屏、客户端离开；会话 2 1280×720 `[独占] 换屏 4128834` 23/23 上屏、host 时长到收尾；`sessions=2`、sent=40、fragments=633、控制面 0 异常、退出 0、物理屏恢复、无遗留进程。两个根因：① 显示收尾（16s+）占着控制交付队列，饿死下一轮 attach/hello（`57`/重传耗尽）；② Tahoe 同进程销毁虚拟屏后再建必 `online=0`，身份 offset 无效——改为会话间复用虚拟屏（规格变则 create-then-destroy 换屏），物理屏常驻期保持禁用。
 - v0.72-draft 2026-11-24 22:3x：**M2 收口真机（§5.42）**。FR-07 keep-main 2→1 WAN 换屏 PASS：host `[换屏] 2→1（4128833 1024×768）`、旧屏 retired、client 结果 ok 并重绑窗口、0 丢帧、两端控制间隔 1.44s/1.19s；根因定位为控制消息在 QUIC 收包线程同步交付，换屏 ~2.2s 拖死 ACK、2s 重传预算耗尽后控制链路静默失效，修复 `7f664b6`（专用交付队列）。FR-06 真机文本注入 PASS：client `--send-text` 两串 → host `inputOK=2`、落盘 `HelloVeilRD中文输入测试` 29B 逐字节一致、39/39 上屏 0 丢帧；首轮收端 canonical 模式不落盘已定位。沉浸模式真机目测与 FR-07 取档因 host WindowServer 虚拟屏 `active=false` 脏态延后，已重启 host 待补。
 - v0.71-draft 2026-11-24 21:2x：**P2.3 基线取数条件收敛（§5.41）**。Qoder 仅最小化（进程未挂起、mds 未暂停）8 轮离屏：vga 2.3/2.5/2.77、720p 3.1/3.65/4.6、1080p 5.3/5.85/7.5、ultrawide 13.4/14.8/17.15ms，8/8 ALL PASS，与隔离口径 p50 差 ≤0.5ms；此后基线只需最小化 Qoder。
 - v0.70-draft 2026-11-24 21:1x：**双屏真注入 + P2.3 基线复核（§5.40）**。Tahoe host `--keep-main --inject real` × Sequoia client 双窗口：host input 15/0、光标 (10,10)→(4133,395)，client 上送 15、0 失败，1273/1273 解码上屏、0 丢帧、p50/p95 26.5/155.5ms；恢复与窗口布局正常。P2.3 隔离负载 8 轮：vga 2.2/2.35/2.7、720p 3.2/3.35/3.7、1080p 5.1/5.45/6.2、ultrawide 10.2/13.3/17.0，ALL PASS，与 §5.38 一致；Qoder 可见时 vga 35ms 超护栏，再次证明负载敏感性。

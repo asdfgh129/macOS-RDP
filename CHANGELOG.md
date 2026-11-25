@@ -4,6 +4,22 @@
 
 格式约定：以日期为版本号构成版本节（`[YYYY-MM-DD]` + 里程碑简述），节内按 **Added / Changed / Fixed / Documentation** 分类，每条附短 commit hash；分类参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，Documentation 用于纯文档提交，本文件自身的维护提交不重复列入。真机结论按 OS 分离记录在 `docs/RESULTS-BY-OS.md`，决策编号见 `docs/DECISIONS.md`。
 
+## [2026-11-25] — M2 重连清理：多会话常驻、显示事务串行、会话间复用虚拟屏
+
+### Fixed
+
+- fix: 多会话收尾移出控制交付队列，改为显示事务串行队列——还屏（16s+）占着交付队列会饿死下一轮的 attach/hello（客户端 `seq=1 重传 20 次仍未确认`，随后 `57`）；节点改为关闭时同步摘除本轮控制对象、新连接就地 attach，入口新增 `veild.display-tx` 串行域承载建屏/还屏/收尾，`onSessionClosed` 先放行主线程判定再入队（`0f7178f`）
+- fix: 新增 `M1StreamNode endCurrentSession`——时长到由 host 主动正常挥手（bye 0.2s 后拆连接），`prepareForNextSession` 只复位标量；`attachSessionTo:` 不再排到控制队列（`0f7178f`）
+
+### Changed
+
+- feat: 常驻会话间复用虚拟屏——Tahoe 实测同进程销毁后再 `initWithDescriptor:` 新建的屏永远 `online=0`（mode 停 1×1、10s 超时，换 identity offset 无效），只有 create-then-destroy 的换屏路径可用；会话结束只停管线不清屏，下一轮规格相同直接沿用、不同走 `applySpecs` 换屏；物理屏整个常驻期保持禁用，进程退出统一恢复
+- diag: `M1SessionCoordinator` 打印建屏/禁屏分段用时（本轮首轮建屏 8.35s + 禁屏/校验 11.54s）
+
+### Documentation
+
+- docs: `RESULTS-BY-OS.md` §5.44 M2 重连清理入档——`--max-sessions 2` 真机 PASS（1920×1080 17 帧 → 换屏 1280×720 23 帧、时长到收尾、退出 0、物理屏恢复），两个根因（控制交付队列饿死、销毁后重建 VD 必挂）与复用方案；单测 341/341
+
 ## [2026-11-25] — M2-C 收口：沉浸模式 / FR-07 复测与控制面健壮性
 
 ### Fixed
