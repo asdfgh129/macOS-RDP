@@ -119,6 +119,11 @@ double M1StreamNowMs(void);
 // 让同一进程可以接下一个客户端。管线/显示资源由入口自行清理。
 - (void)prepareForNextSession;
 
+// 在控制交付串行队列上异步执行（与下一次会话的 session-start 处理互斥）。
+// Host 常驻模式收尾显示/管线时用：建屏/还屏本身就慢，必须挡住下一轮的建屏，
+// 否则两轮显示事务会在 WindowServer 上互相踩。
+- (void)performOnSessionQueue:(dispatch_block_t)block;
+
 // M1DatagramSink（帧管线出口）；子类覆写 onFrameDatagram 实现收流侧
 - (BOOL)sendDatagram:(NSData *)datagram error:(NSError **)error;
 - (void)onFrameDatagram:(NSData *)datagram;

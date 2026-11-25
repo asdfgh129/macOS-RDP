@@ -225,6 +225,9 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     };
     if (exclusive) {
         host.displayProvider = ^NSArray<NSDictionary *> *(NSDictionary *message, NSError **perr) {
+            // 兜底：上一轮若没收干净（例如收尾被打断），先还屏再建新屏，
+            // 否则旧 coordinator 会被覆盖泄漏，旧虚拟屏永远不销毁。
+            if (coord) endExclusive();
             NSArray *specs = message[@"specs"];
             if (![specs isKindOfClass:[NSArray class]] || specs.count == 0) {
                 if (perr) *perr = [NSError errorWithDomain:@"veild.agent" code:6
@@ -279,8 +282,12 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
             return displays;
         };
         host.onAttemptFailed = ^{
-            endExclusive();
-            virtualID = 0; virtualDisplays = @[]; virtualW = 0; virtualH = 0;
+            // 收敛到会话队列：与下一轮 session-start 的建屏事务串行。
+            [host performOnSessionQueue:^{
+                endExclusive();
+                virtualID = 0; virtualDisplays = @[]; virtualConv = @[];
+                virtualW = 0; virtualH = 0;
+            }];
         };
     }
 
@@ -512,8 +519,26 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     // 每轮结束（对端 bye / 传输断 / duration 到）立即清理：停管线、还物理屏、
     // 毁虚拟屏、清键帧节流与坐标基准，再复位会话节点等下一位客户端。
     // 旧管线/旧 displayID 不能带进下一轮——客户端会按新 displayID 重新绑定。
+    // 收尾统一在控制交付队列上执行：建屏/还屏是秒级 WindowServer 事务，
+    // 与下一轮 session-start 并发会互相踩（实测：session 2 建出的屏被上一轮销毁）。
+    void (^cleanupSession)(void) = ^{
+        BOOL hasPipes = NO;
+        @synchronized (pipes) { hasPipes = pipes.count > 0; }
+        if (!coord && !hasPipes) return;   // 已收过尾（bye 与时长到可能双双到达）
+        [host flushSimulatedHeld];
+        retirePipelines();
+        endExclusive();
+        virtualID = 0; virtualDisplays = @[]; virtualConv = @[];
+        virtualW = 0; virtualH = 0;
+        @synchronized (lastKeyframeByDisplay) { [lastKeyframeByDisplay removeAllObjects]; }
+        [host prepareForNextSession];
+    };
     dispatch_semaphore_t sessionEndSem = dispatch_semaphore_create(0);
-    host.onSessionClosed = ^{ dispatch_semaphore_signal(sessionEndSem); };
+    host.onSessionClosed = ^{
+        // 已在控制交付队列上：清理必然先于下一轮 session-start 处理。
+        cleanupSession();
+        dispatch_semaphore_signal(sessionEndSem);
+    };
     NSUInteger sessionsServed = 0, failedAttempts = 0;
     while (maxSessions == 0 || sessionsServed < maxSessions) {
         if (![host waitForStreamingTimeoutMs:waitMs]) {
@@ -521,9 +546,9 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
                 // 常驻模式：单次接入失败（握手/会话错误）不终止进程，也不算会话数。
                 printf("  [会话] 接入失败：%s（继续等下一位）\n",
                        host.error.localizedDescription.UTF8String ?: "unknown");
-                [host prepareForNextSession];
-                [host.streamConn cancel];
-                host.streamConn = nil;
+                [host performOnSessionQueue:^{
+                    [host prepareForNextSession];
+                }];
                 if (++failedAttempts >= 5) {
                     printf("✗ 连续 %lu 次接入失败，放弃常驻\n", (unsigned long)failedAttempts);
                     break;
@@ -564,18 +589,18 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
         printf("  [会话 %lu] 结束（%s），收尾\n", (unsigned long)sessionsServed,
                reachedDurationEnd ? "时长到" : "客户端离开");
 
-        [host flushSimulatedHeld];
-        retirePipelines();
-        endExclusive();
-        virtualID = 0; virtualDisplays = @[]; virtualConv = @[];
-        virtualW = 0; virtualH = 0;
-        @synchronized (lastKeyframeByDisplay) { [lastKeyframeByDisplay removeAllObjects]; }
-        [host prepareForNextSession];
-        // 收掉旧客户端的入站连接：listener 只在 acceptedConnection 为空时接受新连接。
-        [host.streamConn cancel];
-        host.streamConn = nil;
+        // 客户端离开：onSessionClosed 已在交付队列上清理过。
+        // 时长到是 host 主动结束，onSessionClosed 不会来：把收尾排进同一条队列，
+        // 它必然排在下一轮 session-start 之前。
+        if (reachedDurationEnd) {
+            [host performOnSessionQueue:^{ cleanupSession(); }];
+        }
         fflush(stdout);
     }
+    // 等队列上挂着的收尾跑完再关停，避免 shutdown 与还屏事务并发。
+    dispatch_semaphore_t drained = dispatch_semaphore_create(0);
+    [host performOnSessionQueue:^{ dispatch_semaphore_signal(drained); }];
+    dispatch_semaphore_wait(drained, DISPATCH_TIME_FOREVER);
     [host shutdown];
     endExclusive();
 
