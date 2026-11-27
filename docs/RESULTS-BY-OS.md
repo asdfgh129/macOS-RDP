@@ -1963,9 +1963,26 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - 本机 Tahoe 是**双物理屏**：`2026701824` 3440×1440（main）+ `817925634` 1080×1920 竖屏，另有 6 个 `0xFFFFFFFF` 残留虚拟槽位（`4128829…4128835`），`v01probe probe` 只读即可复现。
 - 14 重启会清空 `/private/tmp`（本轮测试脚本与二进制需重新分发）；13 默认 1 分钟内屏睡，任何 client 测试前都要先 `caffeinate -d -u`。
 
-**F. 本轮仍未闭合（含理由）**
+**F. 双物理屏独占（本机 Tahoe 26.5.2，17:02）——OS 层边界，已加安全闸**
 
-- **双物理屏独占**：唯一能构造的是本机 Tahoe（3440×1440 + 1080×1920），执行时两块屏会同时黑 30–60s，且 13 机型在 1080p 独占有 layer-blit 崩溃史；需用户在场并接受短暂中断，留待确认后的窗口。
+本机是唯一能构造双物理屏的机器（`2026701824` 3440×1440 + `817925634` 1080×1920）。独占 720p 一次实测：
+
+| 阶段 | 结果 |
+|---|---|
+| host 准备 | 快照 8 个窗口（AX trusted=1）、guardian 就绪握手通过、虚拟屏 `4128835` 建成且 mode-commit ok |
+| 客户端 | 握手 335ms → `DISPLAYS_READY` → **`CLOSED`**（25s 未进 STREAMING）；host 侧 40s 无客户端退出 |
+| 事后显示栈 | WindowServer 注册表只剩 **8 个 `vendor=0x756e6b6e`（"unkn"）合成屏**：7 个 1×1 offline + 1 个 1280×720 online/active；**两块物理屏从 WS 列表消失** |
+| 硬件层 | `ioreg -c IODisplayConnect` 仍枚举到两块显示器（ProductID 13328 / 568）——**线没掉，是 WS 丢了显示列表** |
+| guardian | 父进程未正常收尾 → 兜底恢复**失败**（快照里的 displayID 在新注册表中已不存在） |
+| 恢复尝试 | `pmset displaysleepnow` + 唤醒无效；`recover_displays`（enable all + 重设 mode）`commit=1001` 失败 ⇒ 只能重启 WindowServer / 整机 |
+
+判读：这与 13 机型 1080p 独占的 `layer_blit` 崩溃同族——**把全部物理屏一次性禁掉**会让 WS 进入「无物理屏」合成态，显示 ID 全部失效，任何软件层恢复（含 guardian）都无从下手。它不是「禁屏 API 不可用」，而是「双物理屏独占在本项目的 Intel GPU 上不可恢复」的 OS 层边界。多屏独占的**逻辑**仍按 B 的证据成立（1 物理 + 1 外部虚拟屏，禁屏集合 = active − 本会话虚拟屏）。
+
+**处置**：`M1RDPDriver` 增加默认拒绝的安全闸——`physical.count > 1` 时直接拒绝独占并给出重启提示，只有显式 `M1_ALLOW_MULTI_DISPLAY_EXCLUSIVE=1` 才放行（`M1RDPDriver.m`；单测 343/343 PASS）。本机显示栈需重启恢复。
+
+**G. 本轮仍未闭合（含理由）**
+
+- **双物理屏独占**：已按 F 判为 OS 层边界并加闸，不再作为待测项；若后续换 AMD/Apple Silicon 平台需重新评估。
 - **锁屏态远端解锁**（C 的新边界）：需要 HID 级注入（`CGEventPost` 到 HID tap 亦被 secure input 拦）或认证插件，属产品能力缺口，不是测试缺口。
 - **72h soak** 与 **A-02 玻璃到玻璃**：前者需跨日窗口，后者需相机/外部计时硬件。
 
@@ -1986,7 +2003,7 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 ## 7. 变更记录
 
-- v0.79-draft 2026-11-27 15:0x：**§5.48 I 剩余项收敛（§5.49）**。①真挂起硬熔断改用事务层注入（`P0V_FAULT_TX=hang|wsfreeze`，不冻结 WindowServer、不改物理屏）：先补实现缺口——收敛判据 `verify()` 本身是 WS IPC，真挂起会永久阻塞、熔断永不触发；改为「探活+verify 同一个 1s 有界窗口」，超时即判 `ws-unresponsive`。三机实测：`wsfreeze` 8.3–9.3s 熔断、`hang` 20.2s 熔断、熔断后新事务 code 10 即时拒绝（<200ms），normal 基线 0.01–0.02s。②多屏独占用「1 物理 + 1 外部虚拟屏」构造 PASS：禁屏后 active 仅会话虚拟屏（两块非会话屏全关）、C-09 verified、50/50 上屏 0 丢帧、收尾两块都恢复。③**纠正 §5.32 ③**：Aqua 上下文下独占态可上锁（`screenIsLocked=1`、secure input pid 168），登录 UI 完整画在会话虚拟屏上、推流不中断；此前失败的真实变量是调用上下文。新边界：锁屏态远程解锁被 secure input 拦住（登录窗态仍可键入）。④soak 未执行，前置与判据已列清（需跨日窗口 + client 保持未锁屏）。本机 Tahoe 确认为双物理屏（3440×1440 + 1080×1920），双物理屏独占仍留待在场窗口。
+- v0.79-draft 2026-11-27 15:0x：**§5.48 I 剩余项收敛（§5.49）**。①真挂起硬熔断改用事务层注入（`P0V_FAULT_TX=hang|wsfreeze`，不冻结 WindowServer、不改物理屏）：先补实现缺口——收敛判据 `verify()` 本身是 WS IPC，真挂起会永久阻塞、熔断永不触发；改为「探活+verify 同一个 1s 有界窗口」，超时即判 `ws-unresponsive`。三机实测：`wsfreeze` 8.3–9.3s 熔断、`hang` 20.2s 熔断、熔断后新事务 code 10 即时拒绝（<200ms），normal 基线 0.01–0.02s。②多屏独占用「1 物理 + 1 外部虚拟屏」构造 PASS：禁屏后 active 仅会话虚拟屏（两块非会话屏全关）、C-09 verified、50/50 上屏 0 丢帧、收尾两块都恢复。③**纠正 §5.32 ③**：Aqua 上下文下独占态可上锁（`screenIsLocked=1`、secure input pid 168），登录 UI 完整画在会话虚拟屏上、推流不中断；此前失败的真实变量是调用上下文。新边界：锁屏态远程解锁被 secure input 拦住（登录窗态仍可键入）。④soak 未执行，前置与判据已列清（需跨日窗口 + client 保持未锁屏）。本机 Tahoe 确认为双物理屏（3440×1440 + 1080×1920）；**双物理屏独占实测判为 OS 层边界**：一次禁 2 块物理屏后 WS 只余 `vendor=0x756e6b6e` 合成屏、物理屏从 WS 列表消失（IOKit 仍在）、guardian 恢复失败，只能重启 ⇒ 已加默认拒绝的安全闸（`M1_ALLOW_MULTI_DISPLAY_EXCLUSIVE=1` 才放行）。
 - v0.78-draft 2026-11-27 11:2x：**8s 死线误判修复 + 13/14 全独占 720p 双向 PASS + FR-08/FR-09 闭合（§5.48，代码 `f216f90`）**。显示事务改为「8s 软死线 + 12s 状态收敛观察期」，只有状态也没收敛才熔断；驱动层以实际 active 集合复核禁屏/恢复，解除误判的挂起标志。真机：14 host 独占 720p 采集 409/发 408、client 408/408 上屏 0 丢帧、C-09 verified、恢复 8.3s 迟到生效、物理屏回来；13 host 独占 720p 采集 294/发 285、client 285/285、无 WS 崩溃。FR-08 用「只断 UDP 46600」的 pf 规则（SSH 全程可达）复测：判死→重连第 2 次握手 15ms→`reconnects=1`、80/80 上屏 0 丢帧；同时定位两种不能用于验收的 host 形态（单次 host、独占 teardown 窗口）。FR-09：14 装载 LaunchAgent 经 Terminal 继承 TCC，重启后 agent 自动拉起并被 13 接入 STREAMING（33 帧 PASS）。另修客户端上屏计数（单屏按唯一 slot 兜底），`framesRendered` 与解码数一致；记录锁屏机器无法靠注入解锁，需 `autoLoginUserScreenLocked=false` + 自动登录。
 - v0.77-draft 2026-11-27 08:5x：**产品客户端上屏计数根因（§5.47 E）**。13 host + 14 `rdpapp` 两轮 657 帧、0 丢帧，会话中整屏截图确认 VeilRD 窗口真实显示远端桌面；`framesRendered=0` 源于窗口绑定 `displayID=1000` 与帧流 `1535231424` 不一致导致汇总查不到 slot，属指标口径缺陷，不改产品代码。另记录本机 Tahoe 重建/单测 PASS，及跨网段 UDP 未达导致 NFR-07 指纹钉死未测（§5.47 F）。
 - v0.76-draft 2026-11-27 08:3x：**Sonoma 授权后反向链路入档（§5.47）**。本机确认为 Tahoe host 并先核对环境；Sonoma GUI Terminal `capture=1` 后 14 host → 13 client：镜像 413/412、keep-main 408/408 规格一致，两项 `summary` PASS；全独占 720p 在禁屏事务 8s 熔断、客户端 rc=4，无 WS 崩溃且物理屏恢复，按开发项记录不重试。8s 死线「恢复成功却报失败」在 13/14 均复现；Sonoma 已补自动登录兜底。

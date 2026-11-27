@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- fix: 多屏独占默认拒绝——本机 Tahoe 双物理屏实测一次禁 2 块屏会让 WindowServer 丢掉物理屏显示列表（只剩 `vendor=0x756e6b6e` 合成屏、ID 全失效、guardian 无法恢复），`M1RDPDriver` 在 `physical.count > 1` 时直接拒绝并提示重启风险，显式 `M1_ALLOW_MULTI_DISPLAY_EXCLUSIVE=1` 才放行（§5.49 F/G）
 - fix: 显示事务 8s 误判（`f216f90`）——改为「8s 软死线只报慢提交 + 12s 按实际显示状态收敛判定」，13/14 真机 8.3–10.0s 的迟到生效不再被熔断；驱动层以实际 active 集合复核禁屏/恢复，并解除误判的挂起标志
 - fix: 产品客户端 `framesRendered` 恒 0（`f216f90`）——按 displayID 查不到 slot 时，单屏按唯一 slot 兜底，与 `DisplayRouter.view(for:)` 同口径
 

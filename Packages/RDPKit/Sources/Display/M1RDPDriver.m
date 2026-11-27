@@ -36,6 +36,13 @@ static BOOL M1ShouldQuiesceScreenSharing(void) {
     return !(q && !strcasecmp(q, "0"));
 }
 
+// 多屏独占闸门：默认关闭。§5.49 G 实测一次禁 2 块物理屏会把 WindowServer 打进
+// 「无物理屏」合成态，显示 ID 全部失效、只能重启恢复。
+static BOOL M1AllowMultiDisplayExclusive(void) {
+    const char *v = getenv("M1_ALLOW_MULTI_DISPLAY_EXCLUSIVE");
+    return v && !strcmp(v, "1");
+}
+
 #pragma mark - 进程查找（复用 P0V 的 libproc 路径，不依赖 shell）
 
 static pid_t M1FindPID(NSString *name) {
@@ -413,6 +420,25 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
             self.screenSharingQuiesced = NO;
         }
         return YES; // 已全是目标虚拟屏，无需配置事务
+    }
+
+    // 安全闸：一次禁掉 2 块以上物理屏，在本项目验证过的 Intel GPU 上会让 WindowServer
+    // 进入「无物理屏」合成态——显示列表被重置成 vendor=0x756e6b6e 的 1×1 占位，两块
+    // 真实屏从 WS 注册表消失（IOKit 仍能看到），guardian 因快照 ID 失效而恢复失败，
+    // 只能重启（2026-11-27 本机 Tahoe 双屏独占实测，见 RESULTS-BY-OS §5.49 G）。
+    // 默认拒绝；确实要验证多屏独占时显式设 M1_ALLOW_MULTI_DISPLAY_EXCLUSIVE=1。
+    if (physical.count > 1 && !M1AllowMultiDisplayExclusive()) {
+        if (self.screenSharingQuiesced) {
+            P0VResumeScreenSharingAgents();
+            self.screenSharingQuiesced = NO;
+        }
+        if (error) *error = M1DrvErr(M1RDPDriverErrorDisableFailed,
+            [NSString stringWithFormat:
+                @"检测到 %lu 块物理屏：多屏独占会使 WindowServer 丢失显示列表且无法自动恢复"
+                @"（§5.49 G）。默认拒绝；确认风险并做好重启准备后设 "
+                @"M1_ALLOW_MULTI_DISPLAY_EXCLUSIVE=1 再试",
+                (unsigned long)physical.count]);
+        return NO;
     }
 
     // 13 上 CGDisplayStream 与显示重配置竞态的冻结窗口已从建屏开始（§5.28），
