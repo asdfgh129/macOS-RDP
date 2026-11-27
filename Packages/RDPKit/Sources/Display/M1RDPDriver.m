@@ -362,11 +362,29 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     return _vd.displayIDs ?: @[];
 }
 
+// 恢复判定的唯一依据：快照里的物理屏是否真的回到 active list。
+// 事务返回值在慢提交时会失真（8s 软死线先到、提交 9–12s 才生效），
+// 只有实际 active 集合能证明「物理屏回来了」。
+- (BOOL)snapshotDisplaysActive {
+    NSArray<NSNumber *> *ids = [self.snapshot displayIDs];
+    if (ids.count == 0) return NO;
+    NSSet *active = [NSSet setWithArray:P0VActiveDisplayIDs()];
+    for (NSNumber *n in ids) if (![active containsObject:n]) return NO;
+    return YES;
+}
+
 - (BOOL)snapshotAndDisablePhysicalExcept:(NSArray<NSNumber *> *)keepIDs
                                    error:(NSError **)error {
     if (P0VWindowServerHung()) {
-        if (error) *error = M1DrvErr(M1RDPDriverErrorWindowServerHung, @"WindowServer 已挂起");
-        return NO;
+        // 上一事务可能只是慢提交被判挂起：若物理屏本来就都在，说明没有真实故障，
+        // 解除误判后继续；否则仍然拒绝（NFR-06 的熔断语义不变）。
+        if (self.disabledDisplayIDs.count == 0 || ![self snapshotDisplaysActive]) {
+            if (error) *error = M1DrvErr(M1RDPDriverErrorWindowServerHung, @"WindowServer 已挂起");
+            return NO;
+        }
+        P0VResetWindowServerHung();
+        printf("  [独占] 解除上一轮慢提交造成的挂起误判（物理屏均在 active list）\n");
+        fflush(stdout);
     }
     // 护盾未就绪（无快照 / 无守护）时绝不禁屏：没有兜底的禁屏只能靠强制重启收场。
     if (!self.snapshot || self.snapshotPath.length == 0) {
@@ -411,6 +429,21 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
         self.screenSharingQuiesced = NO;
     }
 
+    if (!ok) {
+        // 慢提交兜底：软死线报超时，但物理屏实际已经全部关掉 —— 以状态为准判成功，
+        // 否则会把一次成功的独占拖成 session-error（13/14 均复现，见 §5.48）。
+        BOOL converged = YES;
+        for (NSNumber *n in physical) {
+            if (CGDisplayIsActive(n.unsignedIntValue)) { converged = NO; break; }
+        }
+        if (converged) {
+            P0VResetWindowServerHung();
+            ok = YES;
+            disableErr = nil;
+            printf("  [独占] 禁屏事务报超时，但物理屏实际已全部关闭（状态收敛）→ 按成功判定\n");
+            fflush(stdout);
+        }
+    }
     if (!ok) {
         if (error) *error = M1DrvErr(M1RDPDriverErrorDisableFailed,
             disableErr.localizedDescription ?: @"禁用物理屏失败");
@@ -472,15 +505,31 @@ static void M1PostUnicodeToPid(pid_t pid, UniChar u, CGKeyCode code, BOOL down) 
     P0VResumeScreenSharingAgents();
     self.screenSharingQuiesced = NO;
     BOOL ok = YES;
+    // 0. 上一事务把进程判成挂起、但物理屏其实已经回来（慢提交）：先按状态解除熔断，
+    //    否则下面的 restore 会被直接拒绝，把可恢复状态拖成「恢复失败」（§5.46/§5.47）。
+    if (P0VWindowServerHung() && self.disabledDisplayIDs.count > 0 && [self snapshotDisplaysActive]) {
+        P0VResetWindowServerHung();
+        printf("  [恢复] 解除慢提交造成的挂起误判（物理屏已在 active list）\n");
+        fflush(stdout);
+    }
     // 1. 恢复物理屏快照（先启用物理屏）
     if (self.snapshot && self.snapshotPath && !P0VWindowServerHung()) {
         NSDictionary *detail = nil;
         NSError *restoreErr = nil;
         if (!P0VRestoreSnapshot(self.snapshot, P0VCommitScopeSession,
                                 M1DisplayTxTimeoutSec, &detail, &restoreErr)) {
-            ok = NO;
-            if (error) *error = M1DrvErr(M1RDPDriverErrorRestoreFailed,
-                restoreErr.localizedDescription ?: @"恢复物理屏失败");
+            // 慢提交：事务报失败但物理屏实际已恢复 —— 以状态为准，不谎报恢复失败。
+            if ([self snapshotDisplaysActive]) {
+                P0VResetWindowServerHung();
+                if (error) *error = nil;
+                printf("  [恢复] restore 事务报失败，但物理屏实际已恢复（%s）→ 按状态判定成功\n",
+                       (restoreErr.localizedDescription.UTF8String ?: "unknown"));
+                fflush(stdout);
+            } else {
+                ok = NO;
+                if (error) *error = M1DrvErr(M1RDPDriverErrorRestoreFailed,
+                    restoreErr.localizedDescription ?: @"恢复物理屏失败");
+            }
         }
     }
     // 2. 通知守护：恢复完成，无需兜底

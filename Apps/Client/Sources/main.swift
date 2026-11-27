@@ -535,7 +535,12 @@ func runConnect() -> Int32 {
         let displayID = idNum.uint32Value
         guard let rx = client.receiver(forDisplayID: displayID) else { continue }
         let st = rx.stats
+        // 窗口绑定的是 host 协商屏表里的 displayID，接收器键的却是实际采集屏 displayID；
+        // mirror 场景两者不同（窗口 1000 / 采集 1535231424），按 id 精确查会落空，
+        // 使 framesRendered/present 恒为 0（画面其实已上屏，见 RESULTS-BY-OS §5.47）。
+        // 与 DisplayRouter.view(for:) 保持同一兜底口径：单屏时按唯一 slot 统计。
         let slot = slots.first { $0.displayID == displayID }
+            ?? (slots.count == 1 ? slots.first : nil)
         totalCompleted += st.framesCompleted
         totalDecoded += st.framesDecoded
         totalDropped += st.framesDropped
@@ -551,6 +556,7 @@ func runConnect() -> Int32 {
         maxP95 = max(maxP95, p95)
         perDisplay.append([
             "displayID": displayID,
+            "windowDisplayID": slot?.displayID ?? 0,
             "width": rx.videoWidth, "height": rx.videoHeight,
             "framesCompleted": st.framesCompleted,
             "framesDecoded": st.framesDecoded,

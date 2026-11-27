@@ -357,11 +357,28 @@ static CGConfigureOption P0VOption(P0VCommitScope scope) {
 
 // body 返回 detail；*shouldCommit=NO 时取消事务。
 // 返回 YES 仅当 begin 与 commit 都成功且未超时。
-static BOOL P0VPerformTransaction(P0VCommitScope scope,
-                                  int timeoutSec,
-                                  NSDictionary * (^body)(CGDisplayConfigRef cfg, BOOL *shouldCommit),
-                                  NSDictionary **outDetail,
-                                  NSError **error) {
+//
+// 死线分两级（2026-11-27 修正，见 RESULTS-BY-OS §5.48）：
+//   软死线 timeoutSec（NFR-06 的 8s）：到点只报「慢提交」，不立刻判挂起；
+//   宽限期 P0V_TX_GRACE_SEC（默认 12s）：期间按 verify() 的实际显示状态收敛判定。
+// 真机依据：13/14 的独占禁屏与恢复事务在 8s 边界的误报率极高（慢提交 9–12s 才生效，
+// 状态最终是对的），一刀切置 WindowServerHung 会把可恢复状态拖成「恢复失败」并让
+// 后续 restore 直接被拒。挂起与慢提交的区分不能只看耗时，必须看状态是否收敛。
+static int P0VTxGraceSec(void) {
+    const char *v = getenv("P0V_TX_GRACE_SEC");
+    if (!v || !*v) return 12;
+    int n = atoi(v);
+    if (n < 0) n = 0;
+    if (n > 60) n = 60;
+    return n;
+}
+
+static BOOL P0VPerformTransactionV(P0VCommitScope scope,
+                                   int timeoutSec,
+                                   NSDictionary * (^body)(CGDisplayConfigRef cfg, BOOL *shouldCommit),
+                                   BOOL (^verify)(void),
+                                   NSDictionary **outDetail,
+                                   NSError **error) {
     if (P0VWindowServerHung()) {
         if (error) *error = [NSError errorWithDomain:@"P0V" code:10
             userInfo:@{NSLocalizedDescriptionKey: @"WindowServer 已判定挂起，拒绝发起新的显示配置事务"}];
@@ -369,10 +386,15 @@ static BOOL P0VPerformTransaction(P0VCommitScope scope,
     }
     if (timeoutSec <= 0) timeoutSec = 8;   // NFR-06：SPI 挂起 8s 内熔断
 
+    // 目标终态若在事务开始前就已成立，状态收敛不能作为「事务已生效」的证据
+    // （否则真挂起会被误判成成功）。
+    BOOL verifyUsable = (verify != NULL) && !verify();
+
     __block CGError beginErr = kCGErrorSuccess;
     __block CGError commitErr = kCGErrorSuccess;
     __block NSDictionary *detail = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         CGDisplayConfigRef cfg = NULL;
@@ -390,23 +412,61 @@ static BOOL P0VPerformTransaction(P0VCommitScope scope,
         dispatch_semaphore_signal(sem);
     });
 
+    BOOL commitConfirmed = NO;
+    BOOL lateCommit = NO;
+
     if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
-                                                   (int64_t)timeoutSec * NSEC_PER_SEC)) != 0) {
-        atomic_store(&gWindowServerHung, true);
-        P0Error(@"显示配置事务 %ds 未返回：WindowServer 疑似挂起；不再重试，交由守护进程兜底恢复",
-                timeoutSec);
-        if (outDetail) {
-            *outDetail = @{ @"timedOut": @YES, @"timeoutSec": @(timeoutSec),
-                            @"warning": @"事务可能迟到生效，不要重复提交" };
+                                                  (int64_t)timeoutSec * NSEC_PER_SEC)) == 0) {
+        commitConfirmed = YES;
+    } else {
+        int grace = P0VTxGraceSec();
+        P0Error(@"显示配置事务 %ds 未返回：进入 %ds 收敛观察期（按实际显示状态判定，不重复提交）",
+                timeoutSec, grace);
+        double graceEnd = CFAbsoluteTimeGetCurrent() + grace;
+        while (CFAbsoluteTimeGetCurrent() < graceEnd) {
+            if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                                                           250 * NSEC_PER_MSEC)) == 0) {
+                commitConfirmed = YES;
+                lateCommit = YES;
+                break;
+            }
+            if (verifyUsable && verify()) { lateCommit = YES; break; }
         }
-        if (error) *error = [NSError errorWithDomain:@"P0V" code:11
-            userInfo:@{NSLocalizedDescriptionKey: @"显示配置事务超时（WindowServer 疑似挂起）"}];
-        return NO;
+        if (!lateCommit) {
+            atomic_store(&gWindowServerHung, true);
+            P0Error(@"显示配置事务 %.1fs 未生效且显示状态未收敛：判定 WindowServer 挂起；"
+                    @"不再重试，交由守护进程兜底恢复", CFAbsoluteTimeGetCurrent() - t0);
+            if (outDetail) {
+                *outDetail = @{ @"timedOut": @YES, @"timeoutSec": @(timeoutSec),
+                                @"graceSec": @(grace), @"elapsedSec": @(CFAbsoluteTimeGetCurrent() - t0),
+                                @"warning": @"事务可能迟到生效，不要重复提交" };
+            }
+            if (error) *error = [NSError errorWithDomain:@"P0V" code:11
+                userInfo:@{NSLocalizedDescriptionKey: @"显示配置事务超时（WindowServer 疑似挂起）"}];
+            return NO;
+        }
+        P0Log(@"显示配置事务迟到 %.1fs 生效（软死线 %ds），按实际状态判定成功",
+              CFAbsoluteTimeGetCurrent() - t0, timeoutSec);
+        if (!commitConfirmed) {
+            // 状态已收敛但提交线程还没回来：此时读 beginErr/commitErr 是竞态，
+            // 直接以状态为准返回成功，并明确标注「未确认」，禁止调用方重复提交。
+            if (outDetail) {
+                *outDetail = @{ @"lateCommit": @YES, @"commitConfirmed": @NO,
+                                @"stateVerified": @YES, @"timeoutSec": @(timeoutSec),
+                                @"elapsedSec": @(CFAbsoluteTimeGetCurrent() - t0),
+                                @"note": @"事务迟到生效，已按实际显示状态判定成功；不要重复提交" };
+            }
+            return YES;
+        }
     }
 
     NSMutableDictionary *merged = [detail mutableCopy] ?: [NSMutableDictionary dictionary];
     merged[@"beginResult"] = @(beginErr);
     merged[@"commitResult"] = @(commitErr);
+    if (lateCommit) {
+        merged[@"lateCommit"] = @YES;
+        merged[@"elapsedSec"] = @(CFAbsoluteTimeGetCurrent() - t0);
+    }
     if (outDetail) *outDetail = merged;
 
     if (beginErr != kCGErrorSuccess || commitErr != kCGErrorSuccess) {
@@ -420,6 +480,15 @@ static BOOL P0VPerformTransaction(P0VCommitScope scope,
     }
     return YES;
 }
+
+static BOOL P0VPerformTransaction(P0VCommitScope scope,
+                                  int timeoutSec,
+                                  NSDictionary * (^body)(CGDisplayConfigRef cfg, BOOL *shouldCommit),
+                                  NSDictionary **outDetail,
+                                  NSError **error) {
+    return P0VPerformTransactionV(scope, timeoutSec, body, NULL, outDetail, error);
+}
+
 
 BOOL P0VApplyDisplayEnabledChanges(NSArray<NSNumber *> *toDisable,
                                    NSArray<NSNumber *> *toEnable,
@@ -438,7 +507,19 @@ BOOL P0VApplyDisplayEnabledChanges(NSArray<NSNumber *> *toDisable,
         return YES;
     }
 
-    return P0VPerformTransaction(scope, timeoutSec, ^NSDictionary *(CGDisplayConfigRef cfg, BOOL *shouldCommit) {
+    // 状态收敛判据：禁用的屏不再 active、启用的屏已 active。
+    // 只用公开 CG 查询，不依赖事务返回值（返回值会因慢提交在软死线后失真）。
+    BOOL (^verify)(void) = ^BOOL{
+        for (NSNumber *num in toDisable) {
+            if (CGDisplayIsActive(num.unsignedIntValue)) return NO;
+        }
+        for (NSNumber *num in toEnable) {
+            if (!CGDisplayIsActive(num.unsignedIntValue)) return NO;
+        }
+        return YES;
+    };
+
+    return P0VPerformTransactionV(scope, timeoutSec, ^NSDictionary *(CGDisplayConfigRef cfg, BOOL *shouldCommit) {
         NSMutableArray *ops = [NSMutableArray array];
         NSMutableArray *errors = [NSMutableArray array];
 
@@ -465,7 +546,7 @@ BOOL P0VApplyDisplayEnabledChanges(NSArray<NSNumber *> *toDisable,
             }
         }
         return @{ @"ops": ops, @"errors": errors };
-    }, detail, error);
+    }, verify, detail, error);
 }
 
 static CGDisplayModeRef P0VLookupMode(CGDirectDisplayID did,
