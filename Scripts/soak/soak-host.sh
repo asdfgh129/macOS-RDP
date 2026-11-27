@@ -26,9 +26,10 @@ sample() {
     for name in $HOST_PROCS; do
         p=$(pgrep -n -x "$name" || true)
         [ -z "$p" ] && continue
-        line=$(ps -o %cpu=,rss= -p "$p" 2>/dev/null) || continue
-        cpu=${line%% *}; rss=${line##* }
-        echo "$(date +%s),$name,$p,$cpu,$rss" >> "$OUT/host-rss.csv"
+        # ps 的字段带前导空格，用 awk 取，别用 ${line%% *}（会取到空串）。
+        vals=$(ps -o %cpu=,rss= -p "$p" 2>/dev/null | awk '{print $1","$2}')
+        [ -z "$vals" ] && continue
+        echo "$(date +%s),$name,$p,$vals" >> "$OUT/host-rss.csv"
     done
 }
 

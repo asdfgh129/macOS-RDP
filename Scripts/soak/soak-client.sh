@@ -45,7 +45,7 @@ if [ -z "$HOST_IP" ] || [ -z "$PORT" ] || [ -z "$FP" ]; then
 fi
 [ -n "$WINDOW" ] || WINDOW="$SPEC"
 if [ ! -x "$BIN" ]; then
-    echo "✗ 找不到可执行客户端: $BIN（用 --bin 或 VEILRD_BIN 指定）" >&2
+    echo "✗ 找不到可执行客户端: ${BIN}（用 --bin 或 VEILRD_BIN 指定）" >&2
     exit 2
 fi
 
@@ -61,7 +61,7 @@ CAFF_PID=""
 if [ "${SOAK_NO_CAFFEINATE:-0}" != "1" ]; then
     caffeinate -d -i -u -t $((HOURS * 3600 + 600)) >/dev/null 2>&1 &
     CAFF_PID=$!
-    echo "已起 caffeinate(-d -i -u) pid=$CAFF_PID，防止屏睡/空闲睡眠" | tee -a "$OUT/driver.log"
+    echo "已起 caffeinate(-d -i -u) pid=${CAFF_PID}，防止屏睡/空闲睡眠" | tee -a "$OUT/driver.log"
 fi
 
 sampler() {

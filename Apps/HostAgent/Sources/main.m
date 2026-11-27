@@ -14,6 +14,8 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <fcntl.h>
+#import <unistd.h>
 #import "M1Pairing.h"
 #import "M1SessionCoordinator.h"
 #import "M1FramePipeline.h"
@@ -243,16 +245,42 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     __block NSArray<NSDictionary *> *virtualConv = @[];
     __block NSUInteger virtualW = 0, virtualH = 0;
     __block NSString *c09 = @"not-started";
+    // 收尾取证（F2）：独立文件 + 逐行 fsync。stdout 经 pty/script 到日志，进程退出时会丢尾行，
+    // 首次 F2 测试因此分不清「没走到收尾」还是「收尾失败」。
+    static int gTdFd = -1;
+    if (gTdFd < 0) {
+        gTdFd = open("/tmp/veild-teardown.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    }
+    void (^tdTrace)(NSString *) = ^(NSString *msg) {
+        if (gTdFd < 0) return;
+        NSString *line = [NSString stringWithFormat:@"[%ld] %@\n", (long)time(NULL), msg];
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        ssize_t wrote = write(gTdFd, d.bytes, d.length);
+        (void)wrote;
+        fsync(gTdFd);
+    };
     void (^endExclusive)(void) = ^{
-        if (exclusiveEnded || !coord) return;
+        if (exclusiveEnded || !coord) {
+            tdTrace(@"endExclusive 跳过：已收尾或会话未建立");
+            return;
+        }
         exclusiveEnded = YES;
         M1SessionCoordinator *c = coord;
         coord = nil;
+        tdTrace([NSString stringWithFormat:@"endExclusive 开始 phase=%s active=%lu",
+                 M1HostSessionPhaseName(c.phase).UTF8String,
+                 (unsigned long)P0VActiveDisplayIDs().count]);
         NSError *e = nil;
-        if (![c endSessionError:&e])
+        BOOL ended = [c endSessionError:&e];
+        if (!ended) {
+            tdTrace([NSString stringWithFormat:@"endExclusive 失败: %@",
+                     e.localizedDescription ?: @"unknown"]);
             printf("  [独占] 恢复失败: %s\n", e.localizedDescription.UTF8String ?: "unknown");
-        else
+        } else {
+            tdTrace([NSString stringWithFormat:@"endExclusive 成功 active=%lu",
+                     (unsigned long)P0VActiveDisplayIDs().count]);
             printf("  [独占] 已恢复物理屏并销毁虚拟屏\n");
+        }
         driver = nil;
     };
     if (exclusive) {
@@ -401,18 +429,27 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     // 在 Tahoe 上恢复失败（CGError 1001），机器变无头只能重启。
     static dispatch_source_t termSrc = nil, intSrc = nil;
     void (^handleTermination)(NSString *) = ^(NSString *signame) {
+        tdTrace([NSString stringWithFormat:@"收到信号 %@，开始有序收尾", signame]);
         printf("\n[信号] 收到 %s，开始有序收尾\n", signame.UTF8String);
         fflush(stdout);
         [host shutdown];
+        tdTrace(@"host shutdown 完成，进入 displayTxQueue");
         dispatch_sync(displayTxQueue, ^{
             retirePipelines();
             endExclusive();
         });
+        tdTrace(@"displayTxQueue 收尾完成，退出");
         printf("[信号] 显示已恢复，退出\n");
         fflush(stdout);
         exit(0);
     };
     dispatch_queue_t sigQueue = dispatch_queue_create("veild.signal", DISPATCH_QUEUE_SERIAL);
+    // 关键：先把默认处置换成 SIG_IGN，再建信号源。
+    // dispatch 的信号源背后是 kqueue 事件，事件投递与「SIG_DFL 立即终止进程」是两条独立路径，
+    // 谁先到没有保证；不忽略的话进程可能在收尾之前就被内核杀掉（F2 实测：空闲态偶尔能收到、
+    // 推流负载下每次都直接死，收尾日志一行都没有，物理屏就留在被禁状态）。
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGINT, SIG_IGN);
     for (NSNumber *sigNum in @[ @(SIGTERM), @(SIGINT) ]) {
         int sig = sigNum.intValue;
         dispatch_source_t src = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)sig, 0, sigQueue);
