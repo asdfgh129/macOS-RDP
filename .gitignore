@@ -68,3 +68,7 @@ M1-Skeleton/stream_probe
 M1-Skeleton/vt_session_cost
 M1-Skeleton/cursor_move
 M1-Skeleton/render_selftest
+
+# A-02 时钟+截屏工具的构建产物（源码入库，二进制不入库）
+Scripts/tests/a02/a02_clock
+Scripts/tests/a02/a02_shot

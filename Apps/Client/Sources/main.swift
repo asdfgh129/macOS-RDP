@@ -150,9 +150,65 @@ func parseSize(_ s: String) -> (Int, Int)? {
     return (w, h)
 }
 
+/// A-02（玻璃到玻璃，时钟+截屏替代法）的**本机参考钟**（`--ref-barcode`）。
+///
+/// 为什么放在客户端进程内：副屏（显示器各自独立 Space）上由**另一个进程**创建的窗口
+/// 拿不到合成——实测 orderFrontRegardless / 激活 / screenSaver 层级 / 全局坐标 setFrame
+/// 全部无效，副屏始终只有壁纸；而客户端自己的窗口本来就在那块屏上。
+/// 参考钟作为本窗口的子视图 ⇒ 与远端画面在**同一帧**合成，截屏时刻不参与计算：
+///     延迟 = 参考钟读数 − 流里条码读数
+/// 条码格式与 `Scripts/tests/a02/a02_clock.m` 完全一致（48 位 epoch 毫秒 + 8 位校验，
+/// 青色外框 = 本机参考，洋红外框 = 被采集的画面）。
+final class A02RefBarcodeView: NSView {
+    private var timer: Timer?
+    override var isFlipped: Bool { true }
+
+    func start() {
+        let t = Timer(timeInterval: 0.008, repeats: true) { [weak self] _ in
+            self?.needsDisplay = true
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    deinit { timer?.invalidate() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(bounds)
+
+        let ms = UInt64(Date().timeIntervalSince1970 * 1000)
+        var bytes = [UInt8](repeating: 0, count: 7)
+        for i in 0..<6 { bytes[i] = UInt8((ms >> UInt64(8 * (5 - i))) & 0xFF) }
+        var xr: UInt8 = 0
+        for i in 0..<6 { xr ^= bytes[i] }
+        bytes[6] = xr ^ 0xA5
+
+        let w = bounds.width, h = bounds.height
+        let stripW = w * 0.92
+        let c = stripW / 56
+        let x0 = (w - stripW) / 2
+        let y0 = (h - 4 * c) / 2
+
+        ctx.setFillColor(NSColor(calibratedRed: 0, green: 1, blue: 1, alpha: 1).cgColor)
+        ctx.fill(CGRect(x: x0 - c / 2, y: y0 - c / 2, width: stripW + c, height: 4 * c))
+        ctx.setFillColor(NSColor.white.cgColor)
+        ctx.fill(CGRect(x: x0, y: y0, width: stripW, height: c))
+        ctx.fill(CGRect(x: x0, y: y0 + c, width: stripW, height: c))
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(CGRect(x: x0, y: y0 + 2 * c, width: stripW, height: c))
+        for i in 0..<56 {
+            if ((bytes[i / 8] >> UInt8(7 - i % 8)) & 1) == 1 { continue }
+            let inset = c * 0.12
+            ctx.fill(CGRect(x: x0 + CGFloat(i) * c + inset, y: y0 + c + inset,
+                            width: c - 2 * inset, height: c - 2 * inset))
+        }
+    }
+}
+
 /// 一块远程屏在本地的窗口/视图。
-final class DisplaySlot {
-    let window: NSWindow
+final class DisplaySlot {    let window: NSWindow
     let view: M1FrameView
     var displayID: UInt32 = 0
     var inputSent = 0
@@ -231,6 +287,9 @@ func runConnect() -> Int32 {
         .compactMap { parseSize($0) }
     let displayCount = max(specs.count, 1)
     let defaultWindow = windowSizes.first ?? (1280, 720)
+    // A-02 时钟+截屏测量用：把第 i 块屏的沉浸窗口放到「第 i + offset 块 NSScreen」，
+    // 这样同机环回时客户端窗口可以避开被采集的那块屏（否则会出现镜中镜）。
+    let immersiveScreenOffset = Int(arg("--immersive-screen") ?? "0") ?? 0
     func windowSize(_ index: Int) -> (Int, Int) {
         windowSizes.isEmpty ? defaultWindow : windowSizes[min(index, windowSizes.count - 1)]
     }
@@ -280,6 +339,14 @@ func runConnect() -> Int32 {
     }
 
     var slots: [DisplaySlot] = (0..<displayCount).map { makeSlot($0, windowSize($0)) }
+    // A-02 测量：把本机参考钟画进第 1 块屏的窗口左下角（见 A02RefBarcodeView 注释）。
+    if CommandLine.arguments.contains("--ref-barcode") {
+        let ref = A02RefBarcodeView(frame: NSRect(x: 16, y: 16, width: 900, height: 110))
+        ref.autoresizingMask = [.maxXMargin, .maxYMargin]
+        ref.start()
+        slots.first?.window.contentView?.addSubview(ref)
+        print("A-02 参考条码已挂到窗口左下角（900×110，青色）")
+    }
     let router = DisplayRouter()
     let client = M1StreamClientNode()
 
@@ -318,7 +385,8 @@ func runConnect() -> Int32 {
                 slot.savedFrame = slot.window.frame
                 slot.window.styleMask = [.borderless]
                 if !screens.isEmpty {
-                    slot.window.setFrame(screens[min(i, screens.count - 1)].frame, display: true)
+                    let idx = min(i + immersiveScreenOffset, screens.count - 1)
+                    slot.window.setFrame(screens[idx].frame, display: true)
                 }
                 slot.window.makeKeyAndOrderFront(nil)
                 let f = slot.window.frame
@@ -522,6 +590,18 @@ func runConnect() -> Int32 {
         }
     }
     DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(durationMs), execute: stopItem)
+    // A-02 测量：把标题栏之外的内容矩形（CG 全局坐标，左上原点）报给驱动脚本，
+    // 截屏只在这个矩形里判读条码，避免把「屏幕上那份直出条码」当成「流里那份」。
+    if CommandLine.arguments.contains("--ref-barcode") {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            guard let win = slots.first?.window, let cv = win.contentView else { return }
+            let r = win.convertToScreen(cv.bounds)
+            let mainH = CGDisplayBounds(CGMainDisplayID()).height
+            print("A02_WINDOW_RECT \(Int(r.origin.x)),\(Int(mainH - r.maxY)),"
+                  + "\(Int(r.width)),\(Int(r.height))")
+            fflush(stdout)
+        }
+    }
     DispatchQueue.main.async {
         NSApp.activate(ignoringOtherApps: true)
         slots.first?.window.makeKeyAndOrderFront(nil)
