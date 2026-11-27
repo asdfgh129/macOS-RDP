@@ -36,6 +36,11 @@ codesign -dv "${REPO}/.state/bin/veild-host-agent" 2>&1 | head -2 || true
 echo "== 安装 LaunchAgent =="
 mkdir -p "${HOME}/Library/LaunchAgents"
 cp "${PLIST_SRC}" "${PLIST_DST}"
+# plist 里的 run-host.command 路径按本机仓库位置改写（模板里是主开发机的绝对路径，
+# 克隆到 ~/macOS-RDP 的测试机上直接照抄会指向不存在的路径）。
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:3 ${REPO}/Scripts/host-deploy/run-host.command" \
+    "${PLIST_DST}"
+echo "   run-host.command → $(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "${PLIST_DST}")"
 launchctl bootout "gui/$(id -u)/com.veild.host" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "${PLIST_DST}"
 launchctl enable "gui/$(id -u)/com.veild.host"

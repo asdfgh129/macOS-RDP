@@ -7,6 +7,9 @@
 
     <!-- FR-09：开机（自动登录进 GUI 会话后）自启，经 Terminal 拉起以继承
          屏幕录制/辅助功能 TCC 授权（path 直起会被按自身进程判权，无头下无法授权）。 -->
+    <!-- 注意：这里的绝对路径是主开发机（/Volumes/Data/Code/macOS-RDP）的模板值。
+         install-unattended.sh 安装时会按本机仓库位置改写；手工安装必须自己改，
+         否则 LaunchAgent 指向不存在的脚本、开机不会拉起 agent。 -->
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/open</string>

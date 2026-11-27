@@ -286,10 +286,16 @@ func runConnect() -> Int32 {
     // NFR-07：客户端用持久身份证书接入，主机才能按指纹钉死（--allow-fingerprint）。
     // 缺身份文件时不阻断（P0 联调兼容），但会失去配对认证这一层。
     let identityPath = arg("--identity") ?? ".state/rdp-identity.p12"
-    let identityPass = arg("--pass")
+    // NFR-07 E2：口令优先取环境变量/钥匙串，不默认写在命令行里。
+    var usedDevPass: ObjCBool = false
+    let identityPass = M1ResolveIdentityPassphrase(arg("--pass"), &usedDevPass)
+    if usedDevPass.boolValue {
+        FileHandle.standardError.write(Data(("⚠ 身份口令使用开发默认值 rdpdev（NFR-07 E2）：生产部署请设置 "
+            + "VEILRD_IDENTITY_PASS 或写入钥匙串 `veild-identity`\n").utf8))
+    }
     if FileManager.default.fileExists(atPath: identityPath) {
         client.identityPath = identityPath
-        if let identityPass { client.identityPass = identityPass }
+        client.identityPass = identityPass
         if let fp = M1QuicIdentityFingerprint(identityPath, client.identityPass, nil) {
             client.localFingerprint = fp
             print("客户端身份 \(identityPath) 指纹 \(fp)")

@@ -90,7 +90,8 @@ static BOOL M1SavePixelBufferPNG(CVPixelBufferRef pb, NSString *path) {
 - (instancetype)init {
     if ((self = [super init])) {
         _identityPath = @".state/rdp-identity.p12";
-        _identityPass = @"rdpdev";
+        // NFR-07 E2：默认口令同样走 环境变量 → 钥匙串 → 开发默认 的解析链。
+        _identityPass = M1ResolveIdentityPassphrase(nil, NULL);
         _alpn = @"rdp1";
         _readySem = dispatch_semaphore_create(0);
         _streamingSem = dispatch_semaphore_create(0);

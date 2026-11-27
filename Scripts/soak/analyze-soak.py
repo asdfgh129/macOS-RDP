@@ -74,5 +74,20 @@ def main():
                 pids.add(line.strip().split(",")[-1])
         print(f"WindowServer PID 变化: {len(pids)} 个（>1 即发生过重启）: {sorted(pids)}")
 
+    # 无人值守可靠性：agent 消失或重生都算事件（判据要求 0 条）
+    ecsv = os.path.join(hdir, "host-events.csv")
+    if os.path.exists(ecsv):
+        events = []
+        with open(ecsv) as f:
+            next(f, None)
+            for line in f:
+                parts = line.strip().split(",")
+                if len(parts) >= 2 and parts[1]:
+                    events.append(parts[1])
+        missing = events.count("agent_missing")
+        restarted = events.count("agent_restarted")
+        verdict = "PASS" if (missing == 0 and restarted == 0) else "FAIL"
+        print(f"host 事件: agent_missing={missing} agent_restarted={restarted} → {verdict}")
+
 if __name__ == "__main__":
     main()

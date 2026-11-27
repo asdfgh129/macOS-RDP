@@ -258,6 +258,39 @@ NSString *M1QuicIdentityFingerprint(NSString *identityPath, NSString *password, 
     return hex;
 }
 
+// NFR-07 E2：口令不落命令行。`--pass` 仍保留（联调/自检方便），但只要不是显式传入，
+// 就依次看环境变量与钥匙串；两者都没有才退回开发默认值，并让调用方打一次告警。
+static NSString *M1KeychainIdentityPassphrase(void) {
+    NSDictionary *query = @{
+        (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrService: @"veild-identity",
+        (__bridge id)kSecAttrAccount: NSUserName() ?: @"",
+        (__bridge id)kSecReturnData:  @YES,
+        (__bridge id)kSecMatchLimit:  (__bridge id)kSecMatchLimitOne,
+    };
+    CFTypeRef data = NULL;
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)query, &data) != errSecSuccess || !data) {
+        return nil;
+    }
+    NSData *bytes = (__bridge_transfer NSData *)data;
+    NSString *pw = [[NSString alloc] initWithData:bytes encoding:NSUTF8StringEncoding];
+    return pw.length > 0 ? pw : nil;
+}
+
+NSString *M1ResolveIdentityPassphrase(NSString *explicitPass, BOOL *outUsedDevDefault) {
+    if (outUsedDevDefault) *outUsedDevDefault = NO;
+    if (explicitPass.length > 0) return explicitPass;
+
+    const char *env = getenv("VEILRD_IDENTITY_PASS");
+    if (env && *env) return [NSString stringWithUTF8String:env];
+
+    NSString *fromKeychain = M1KeychainIdentityPassphrase();
+    if (fromKeychain) return fromKeychain;
+
+    if (outUsedDevDefault) *outUsedDevDefault = YES;
+    return @"rdpdev";
+}
+
 #pragma mark - 统计
 @interface M1QuicTransportStats ()
 @property (nonatomic, assign) uint64_t datagramsSent;

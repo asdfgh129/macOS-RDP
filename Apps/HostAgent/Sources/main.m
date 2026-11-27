@@ -159,7 +159,7 @@ static BOOL AgentParseSpec(NSString *spec, int32_t *w, int32_t *h) {
 static BOOL AgentRunServe(int argc, const char *argv[]) {
     uint16_t port = 0;
     NSString *portFile = nil, *outPath = nil, *specText = nil;
-    NSString *identity = @".state/rdp-identity.p12", *pass = @"rdpdev", *inject = @"record";
+    NSString *identity = @".state/rdp-identity.p12", *pass = nil, *inject = @"record";
     NSString *allowFp = nil;
     uint32_t waitMs = 15000;
     int durationMs = 5000, fps = 20;
@@ -191,6 +191,14 @@ static BOOL AgentRunServe(int argc, const char *argv[]) {
     }
     if (specText && !AgentParseSpec(specText, &specW, &specH)) { AgentServeUsage(); return NO; }
     if (fps <= 0 || durationMs <= 0) { AgentServeUsage(); return NO; }
+
+    // NFR-07 E2：口令优先取环境变量/钥匙串，不默认写在命令行里。
+    BOOL usedDevPass = NO;
+    pass = M1ResolveIdentityPassphrase(pass, &usedDevPass);
+    if (usedDevPass) {
+        fprintf(stderr, "⚠ 身份口令使用开发默认值 rdpdev（NFR-07 E2）：生产部署请设置 "
+                        "VEILRD_IDENTITY_PASS 或写入钥匙串 `veild-identity`\n");
+    }
 
     NSError *err = nil;
     NSString *localFp = M1QuicIdentityFingerprint(identity, pass, &err);

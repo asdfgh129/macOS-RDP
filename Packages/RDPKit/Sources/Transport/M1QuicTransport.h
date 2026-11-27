@@ -147,6 +147,13 @@ NSString * _Nullable M1QuicIdentityFingerprint(NSString *identityPath,
                                                NSString * _Nullable password,
                                                NSError * _Nullable * _Nullable error);
 
+// NFR-07 E2：p12 身份口令的取值来源（避免把私钥口令写在命令行里被同机进程看到）。
+// 优先级：显式参数 > 环境变量 VEILRD_IDENTITY_PASS > 钥匙串（service `veild-identity`,
+// account `$USER`）> 开发默认 `rdpdev`。走最后一档时 outUsedDevDefault 置 YES，
+// 调用方应打印一次告警；生产部署必须用环境变量或钥匙串。
+NSString *M1ResolveIdentityPassphrase(NSString * _Nullable explicitPass,
+                                      BOOL * _Nullable outUsedDevDefault);
+
 NS_ASSUME_NONNULL_END
 
 #endif /* M1QuicTransport_h */
