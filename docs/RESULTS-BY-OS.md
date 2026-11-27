@@ -1980,6 +1980,8 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 **处置**：`M1RDPDriver` 增加默认拒绝的安全闸——`physical.count > 1` 时直接拒绝独占并给出重启提示，只有显式 `M1_ALLOW_MULTI_DISPLAY_EXCLUSIVE=1` 才放行（`M1RDPDriver.m`；单测 343/343 PASS）。本机显示栈需重启恢复。
 
+**事后复核（17:49 重启后，17:56 复测）**：整机重启后两块屏自动回到在线态（`2026701824` 3440×1440@60 main + `817925634` 1080×1920@60，`Mirror: Off`、`Online: Yes`），无需任何人工干预；`/Library/Logs/DiagnosticReports` 中**本时段没有 WindowServer 崩溃报告**（最新一份仍是 11-25 22:06）⇒ 本次是**显示列表丢失**，不是 WS 崩溃（与 13 机型 1080p 的 `layer_blit` SIGBUS 崩溃区别明确）。本机未安装任何 veild/p0v LaunchAgent，重启后无 `stream_probe`/guardian/`v01probe` 残留进程；重启清空了 `/private/tmp`，p2 本轮日志已丢失，故障时段的"WS 注册表实况"以当年 `v01probe probe` 与 `sls_dump` 输出为准（已记入上表）。
+
 **G. 本轮仍未闭合（含理由）**
 
 - **双物理屏独占**：已按 F 判为 OS 层边界并加闸，不再作为待测项；若后续换 AMD/Apple Silicon 平台需重新评估。
