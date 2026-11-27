@@ -1947,15 +1947,17 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 同时确认了一条**新的、更硬的边界**：锁屏态（`loginDone=1` 且 `screenIsLocked=1`、secure input 生效）下，用 `CGEventPostToPid` 向 loginwindow 注入「10 字符 + Return」**被系统丢弃**，`screenIsLocked` 仍为 1。§5.29 的「键入成功」发生在**登录窗**（`loginDone=0`，注销/重启后的登录界面），是另一种状态。⇒ 远端解锁锁屏需要 HID 级注入或认证插件路径，属 V-04d 剩余部分，本轮不做（见 F）。
 
+**口径决议（2026-11-27，C-17.45）**：不投入 HID 级注入开发，FR-13 收窄为「只保证登录窗态（`loginDone=0`）远程登录」，锁屏态由运维约束规避（自动登录 + `autoLoginUserScreenLocked=false` + 禁止闲置锁屏）。理由：①锁屏态在生产部署里被运维约束排除了（host 保持登录态是 FR-09 的既有要求）；②HID 虚拟键盘路径在 26 上能否绕过 secure input 无把握，属新开发而非补测。DESIGN FR-13 已同步改写。
+
 恢复：锁屏无法用合成事件解锁，走重启 + 自动登录。14 于 14:58 重启，15:00 回到未锁桌面（`console=bemin`、单屏 active）；13 曾在「屏睡 + 锁屏」态，15:01 重启后同样恢复（`screenIsLocked=nil`）。
 
 **D. soak：仍未执行，前置已列清**
 
 72h soak 本轮**没有跑**，理由是不需要试跑就能判定的：它要求两台机器连续 72h 不被占用、且 client 侧不锁屏屏睡；本轮只有几十分钟窗口。已就绪的资产与执行前置：
 
-- `Scripts/soak/soak-host.sh`（host 侧 RSS/CPU + WS PID）、`soak-client.sh`（每轮 30min 会话 + 重连）、`analyze-soak.py`（会话数/丢帧/控制间隔/内存斜率/WS 重启）。
-- 拓扑按 README 固定 Tahoe host × Sequoia client（WAN）；14 无 Xcode，产品二进制需从 Tahoe 构建后拷入 `VEILRD_BIN` 指向的路径。
-- 前置条件（本次实测都踩过）：host 侧 agent 必须由 GUI Terminal/LaunchAgent 启动才有采集授权（§5.48 F）；client 侧必须先 `caffeinate -d -u` 并保持未锁屏，否则 preflight 直接 `locked=1 / asleep=1` 拒绝（本轮 13 就是被这条挡住）。
+- `Scripts/soak/soak-host.sh`（host 侧 RSS/CPU + WS PID + **agent 消失/重生事件**）、`soak-client.sh`（每轮 30min 会话 + 重连 + **自带 `caffeinate -d -i -u`**）、`analyze-soak.py`（会话数/丢帧/控制间隔/内存斜率/WS 重启/**host 事件判定**）。
+- **拓扑改为 Sonoma 14 host × Ventura 13 client（2026-11-27 定）**：不再用 Tahoe host——本机是工作机，独占 72h 等于三天不可用；两台专用测试机同网段（`192.168.34.212` / `.213`），不受 WAN 抖动干扰。脚本已改为 `--host/--port/--fp/--bin` 命名参数（旧位置参数仍兼容），换回 Tahoe×Sequoia 形态无需改代码，但结论必须按 OS 分开记录。
+- 前置条件（本次实测都踩过）：host 侧 agent 必须由 GUI Terminal/LaunchAgent 启动才有采集授权（§5.48 F）；client 侧必须先 `caffeinate -d -u` 并保持未锁屏，否则 preflight 直接 `locked=1 / asleep=1` 拒绝（本轮 13 就是被这条挡住）；14/13 无 Xcode，产品二进制需从本机 `xcodebuild` 产物拷入并用 `--bin` 指定。
 - 判据见 `Scripts/soak/README.md`：RSS 斜率 < ~10MB/h、WS PID 全程不变、丢帧不恶化、控制间隔 < 8000ms。
 
 **E. 环境事实（本轮新增）**

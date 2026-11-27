@@ -43,15 +43,15 @@
 | D2 | 补片请求限流 | 5ms/屏（定向/整帧独立桶），indices ≤64 且 < fragCount | `M1ControlSession.m:616,654` | 单测 | ✅ |
 | D3 | 控制面重传上限 | 250ms × 20 次后判死，本地转 Closed，不无限重传 | `M1ControlLink` + `abortWithReason:` | FR-08 断网实测 | ✅ |
 | D4 | 控制面静默熔断 | 8s 无心跳判死（看门狗） | `M1StreamSession.m` watchdog | FR-07 实测 | ✅ |
-| D5 | 显示 SPI 挂起熔断 | 8s 死线 → 置 WindowServerHung，此后拒绝一切显示事务 | `P0VDisplayControl.m:360-405`、`M1RDPDriver.m` `M1DisplayTxTimeoutSec` | 单测（事务超时用例）+ 真机故障注入待跑 | 🟡 |
+| D5 | 显示 SPI 挂起熔断 | 8s 软死线 → 12s 状态收敛观察期，仍未收敛则置 `WindowServerHung`，此后拒绝一切显示事务；收敛判据本身改为「WS 探活 + verify 同一个 1s 有界窗口」，真挂起时不会卡死反而漏熔断 | `P0VDisplayIsolation/src/P0VDisplayControl.m`、`M1RDPDriver.m` | 单测（事务超时用例）+ **真机故障注入 PASS（`Scripts/tests/tx-breaker/`）**：`wsfreeze` 8.3–9.3s 熔断、`hang` 20.2s 熔断、熔断后新事务 code 10 即时拒绝（<200ms），Tahoe 26 / Sonoma 14 / Ventura 13 三机一致（RESULTS §5.49 A） | ✅ |
 | D6 | 半开连接 | QUIC idle 30s、单次接入失败不掀常驻进程（连续 5 次放弃） | `M1QuicTransport.m:434`、`main.m` | 真机 | ✅ |
 
 ## E. 凭据与日志
 
 | # | 检查项 | 机制 | 位置 | 验证 | 状态 |
 |---|---|---|---|---|---|
-| E1 | 日志不含凭据 | 控制面诊断仅计数/时序；口令、配对码不进日志 | 全仓 `M1QLOG`/printf 审计 | grep 审计（M3 执行） | 🟡 |
-| E2 | p12 口令来源 | 目前 `--pass` 默认 `rdpdev`（开发值），命令行可被同机进程看到 | `main.m:162` | `ps -ef` 可见 | ❌ 开发环境接受；生产前改 Keychain/env |
+| E1 | 日志不含凭据 | 控制面诊断仅计数/时序；口令、配对码、解锁凭据都不进日志 | 全仓 `printf`/`NSLog`/`fprintf` 审计（2026-11-27） | 命中项只有两处**非日志**输出：`veild-host-agent pairing` 自检子命令打印自签发的配对码（该码本来就要交给用户，且不在 serve 路径）、客户端 `demoPairing()` 演示函数 | ✅ |
+| E2 | p12 口令来源 | `M1ResolveIdentityPassphrase`：显式 `--pass` > 环境变量 `VEILRD_IDENTITY_PASS` > 钥匙串（`veild-identity` / `$USER`）> 开发默认 `rdpdev`（走最后一档会打印告警） | `M1QuicTransport.m`、`Apps/HostAgent/Sources/main.m`、`Apps/Client/Sources/main.swift`、`M1StreamSession.m` | 生产部署用 env 或钥匙串，`ps -ef` 里看不到口令；命令行 `--pass` 保留给联调 | ✅ |
 | E3 | 身份文件权限 | `.state/` 0700、p12 0600 | `gen_quic_identity.sh` | `ls -l` | ✅ |
 | E4 | 诊断包不含凭据 | `--out` JSON 仅统计指标 | `main.m` 汇总段 | 抽查 JSON | ✅ |
 
@@ -72,5 +72,7 @@
 4. **坐标越界/畸形事件**：`x=2.0`、缺 kind、fragCount 越界 → 拒绝且会话不断（C3）。
 5. **洪泛**：1001 event/s、连环 keyframe-request → 限流生效、会话不断（C4/D1）。
 6. **断网重连**：pf 双向阻断 12s → 会话对端判死并重连，不留僵尸会话（D3/D4）。
-7. **日志抽查**：`grep -ri "password\|1Apple\|pass=" /tmp/veild-*.log .state/*.log` → 零命中（E1）。
+7. **日志抽查**：`grep -rEi "password|passphrase|pass=|pair-?code|credential" /tmp/veild-*.log /tmp/veilrd-soak/*.log .state/*.log` → 除自检子命令外零命中（E1）。
 8. **主机收尾**：`kill -TERM $(pgrep veild-host-agent)` → 物理屏 5s 内恢复、无 WindowServer 脏态（F2）。
+9. **口令来源**：`ps -ef | grep -i veild` → 命令行里不应出现 `--pass`（E2）。生产部署用：
+   `security add-generic-password -U -s veild-identity -a "$USER" -w '<口令>'`，或导出 `VEILRD_IDENTITY_PASS`。

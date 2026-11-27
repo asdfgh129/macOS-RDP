@@ -4,7 +4,7 @@
 
 格式约定：以日期为版本号构成版本节（`[YYYY-MM-DD]` + 里程碑简述），节内按 **Added / Changed / Fixed / Documentation** 分类，每条附短 commit hash；分类参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，Documentation 用于纯文档提交，本文件自身的维护提交不重复列入。真机结论按 OS 分离记录在 `docs/RESULTS-BY-OS.md`，决策编号见 `docs/DECISIONS.md`。
 
-## [2026-11-27] — 显示事务死线修正、挂起判定有界化、剩余项收敛（多屏独占 / 独占态 Path A）
+## [2026-11-27] — 显示事务死线修正、挂起判定有界化、剩余项收敛（多屏独占 / 独占态 Path A）、M3 收口开发
 
 ### Added
 
@@ -15,9 +15,12 @@
 ### Changed
 
 - change: `P0VPerformTransactionV` 的挂起判定有界化——软死线后的收敛判据 `verify()` 本身是 WindowServer IPC，真挂起时会永久阻塞（熔断永不触发）；改为「探活 + verify 在同一个 1s 有界窗口内」，超时即判 `ws-unresponsive` 立即熔断；熔断 detail 增加 `reason`（`ws-unresponsive` / `state-not-converged`）
+- change: 身份口令脱离命令行（`59bef12`，NFR-07 E2）——新增 `M1ResolveIdentityPassphrase`：显式 `--pass` > `VEILRD_IDENTITY_PASS` > 钥匙串（`veild-identity` / `$USER`）> 开发默认 `rdpdev`（走最后一档打告警）；host agent / 客户端 / 会话节点层三处默认值统一，`ps -ef` 不再能看到私钥口令
+- change: soak 拓扑改为专用机（`59bef12`，NFR-06 前置）——`soak-client.sh` 改命名参数并自带 `caffeinate -d -i -u`、每轮记录屏态；`soak-host.sh` 增 `host-events.csv` 记 agent 消失/重生；`analyze-soak.py` 汇总 host 事件并判定；README 改为 Sonoma 14 host × Ventura 13 client
 
 ### Fixed
 
+- fix: 无人值守启动器路径写死（`59bef12`，F4）——`run-host.command` 硬编码 `cd /Volumes/Data/Code/macOS-RDP`、plist 硬编码同一路径，仓库克隆在 `~/macOS-RDP` 的测试机上 LaunchAgent 指向不存在的脚本；改为按脚本位置推导仓库根（`VEILD_REPO` 可覆盖），`install-unattended.sh` 安装时用 PlistBuddy 改写 plist 路径并回显
 - fix: 多屏独占默认拒绝——本机 Tahoe 双物理屏实测一次禁 2 块屏会让 WindowServer 丢掉物理屏显示列表（只剩 `vendor=0x756e6b6e` 合成屏、ID 全失效、guardian 无法恢复），`M1RDPDriver` 在 `physical.count > 1` 时直接拒绝并提示重启风险，显式 `M1_ALLOW_MULTI_DISPLAY_EXCLUSIVE=1` 才放行（§5.49 F/G）
 - fix: 显示事务 8s 误判（`f216f90`）——改为「8s 软死线只报慢提交 + 12s 按实际显示状态收敛判定」，13/14 真机 8.3–10.0s 的迟到生效不再被熔断；驱动层以实际 active 集合复核禁屏/恢复，并解除误判的挂起标志
 - fix: 产品客户端 `framesRendered` 恒 0（`f216f90`）——按 displayID 查不到 slot 时，单屏按唯一 slot 兜底，与 `DisplayRouter.view(for:)` 同口径
@@ -25,6 +28,7 @@
 ### Documentation
 
 - docs: `RESULTS-BY-OS.md` §5.48（13/14 全独占 720p 双向 PASS、FR-08 对称断路复测、FR-09 无人值守装载）与 §5.49（真挂起注入、多屏独占、**独占态 Path A 纠正：失效变量是 Aqua 调用上下文而非独占态**、soak 前置）；决策 `C-17.43`
+- docs: M3 收口口径（`59bef12`）——`SECURITY-CHECKLIST` 的 D5/E1/E2 三项从 🟡/❌ 转 ✅ 并附证据（D5 三机故障注入、E1 全仓凭据审计、E2 口令来源链）；`DESIGN` FR-13 收窄为「只保证登录窗态远程登录，锁屏态由运维约束规避」；新增决策 `C-17.45`；`RESULTS` §5.49 C/D 同步该口径与 soak 拓扑
 
 
 
