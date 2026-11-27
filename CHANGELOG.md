@@ -20,6 +20,7 @@
 
 ### Fixed
 
+- fix: **SIGTERM 与 dispatch 事件竞争导致收尾不执行**（`2e1525e`，F2）——推流中 `kill -TERM` 会让 agent 直接消失、收尾一行日志都没有，物理屏留在被禁状态并从 WindowServer 列表消失（14 因此重启两次）。根因是信号源用 kqueue 投递事件，而进程对 SIGTERM 的默认处置仍是「终止」，两条路径赛跑，推流负载下总是内核先杀。修法：建信号源前 `signal(SIGTERM/SIGINT, SIG_IGN)`；另加收尾取证 `/tmp/veild-teardown.log`（独立 fd + 逐行 fsync，不依赖 pty）。复测：物理屏 ~1s 恢复、虚拟屏销毁、退出码 0
 - fix: 无人值守启动器路径写死（`59bef12`，F4）——`run-host.command` 硬编码 `cd /Volumes/Data/Code/macOS-RDP`、plist 硬编码同一路径，仓库克隆在 `~/macOS-RDP` 的测试机上 LaunchAgent 指向不存在的脚本；改为按脚本位置推导仓库根（`VEILD_REPO` 可覆盖），`install-unattended.sh` 安装时用 PlistBuddy 改写 plist 路径并回显
 - fix: 多屏独占默认拒绝——本机 Tahoe 双物理屏实测一次禁 2 块屏会让 WindowServer 丢掉物理屏显示列表（只剩 `vendor=0x756e6b6e` 合成屏、ID 全失效、guardian 无法恢复），`M1RDPDriver` 在 `physical.count > 1` 时直接拒绝并提示重启风险，显式 `M1_ALLOW_MULTI_DISPLAY_EXCLUSIVE=1` 才放行（§5.49 F/G）
 - fix: 显示事务 8s 误判（`f216f90`）——改为「8s 软死线只报慢提交 + 12s 按实际显示状态收敛判定」，13/14 真机 8.3–10.0s 的迟到生效不再被熔断；驱动层以实际 active 集合复核禁屏/恢复，并解除误判的挂起标志
@@ -29,6 +30,7 @@
 
 - docs: `RESULTS-BY-OS.md` §5.48（13/14 全独占 720p 双向 PASS、FR-08 对称断路复测、FR-09 无人值守装载）与 §5.49（真挂起注入、多屏独占、**独占态 Path A 纠正：失效变量是 Aqua 调用上下文而非独占态**、soak 前置）；决策 `C-17.43`
 - docs: M3 收口口径（`59bef12`）——`SECURITY-CHECKLIST` 的 D5/E1/E2 三项从 🟡/❌ 转 ✅ 并附证据（D5 三机故障注入、E1 全仓凭据审计、E2 口令来源链）；`DESIGN` FR-13 收窄为「只保证登录窗态远程登录，锁屏态由运维约束规避」；新增决策 `C-17.45`；`RESULTS` §5.49 C/D 同步该口径与 soak 拓扑
+- docs: `RESULTS-BY-OS.md` §5.50（`2e1525e`）——M3 收口真机轮：A3 指纹钉死三用例、F2 首测失败与 SIGTERM 竞争根因、F4 无人值守（路径改写/钉死/重启 32s 自启）、72h soak 起跑（14 host × 13 client，19:00:57）与脚本坑；`SECURITY-CHECKLIST` A3/F2/F4 转 ✅
 
 
 

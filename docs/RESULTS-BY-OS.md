@@ -1990,6 +1990,62 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - **锁屏态远端解锁**（C 的新边界）：需要 HID 级注入（`CGEventPost` 到 HID tap 亦被 secure input 拦）或认证插件，属产品能力缺口，不是测试缺口。
 - **72h soak** 与 **A-02 玻璃到玻璃**：前者需跨日窗口，后者需相机/外部计时硬件。
 
+## 5.50 M3 收口真机轮（2026-11-27 18:40–19:05，Sonoma 14 host × Ventura 13 client）
+
+本轮目标是 M3 出口剩下的三项真机验收（NFR-07 A3/F2/F4）+ 起跑 72h soak。过程中挖出一个**会让物理屏永久黑掉的真缺陷**（SIGTERM 未走收尾），已修并复测通过。
+
+**A. A3 客户端指纹钉死（Sonoma 14 host，`--allow-fingerprint` = 13 客户端叶子证书 SHA-256 `88fe55f7…`）**
+
+| 用例 | 客户端 | 结果 |
+|---|---|---|
+| 正向 | 13 自带身份 `.state/rdp-identity.p12` | `TLS_CONNECTED → PAIRED → NEGOTIATED → DISPLAYS_READY → STREAMING`，13 侧解码 4 帧 0 丢帧，会话正常收尾 |
+| 反向 ①：无身份 | `--identity /tmp/none.p12` | host 明确拒绝：`hello 未上报指纹，无法与钉死值比对`；客户端停在 `PAIRED` 后失败，从未进入 STREAMING |
+| 反向 ②：错身份 | 临时生成的第二份 p12（指纹 `ddc7923e…`） | TLS 层就被钉死拦下（`expectedPeerFingerprint`），host 侧没有任何 accept 记录，客户端表现为握手超时后失败 |
+
+判读：钉死有两层——控制面 hello 指纹比对（给出明确原因）与传输层 `expectedPeerFingerprint`（错证书直接握不上手，host 静默丢弃）。两层都有效；**注意反向 ① 双方都会先报 `PAIRED` 才被拒**，配对态名称容易误读，但输入注入只在 STREAMING 后才触发（C1/C2），实际风险为零。
+
+**B. F2 有序收尾——首次测试即失败，根因是信号处置竞争（已修）**
+
+首次在推流中 `kill -TERM`，agent **进程直接消失**：`/tmp/veild-teardown.log`、pty 日志、`[信号] 收到 SIGTERM` 都没有，物理屏随后从 WS 列表消失（只剩 `vendor=0x756e6b6e` 合成屏），只能重启机器恢复（本轮 14 因此重启两次）。
+
+定位：`handleTermination` 用 `DISPATCH_SOURCE_TYPE_SIGNAL` 收信号，但进程对 SIGTERM 的**默认处置仍是「终止」**。dispatch 的信号源靠 kqueue 投递事件，与内核按默认处置杀进程是两条独立路径，谁先到没有保证——空闲态偶尔赢一次（本轮空闲态确实收到过），推流负载下每次都输，于是收尾一行都没跑。
+
+修复（`Apps/HostAgent/Sources/main.m`）：建信号源前先 `signal(SIGTERM, SIG_IGN)` / `signal(SIGINT, SIG_IGN)`；同时加**收尾取证**——独立文件 `/tmp/veild-teardown.log` 逐行 `write`+`fsync`，不依赖 pty（首次失败就是因为 pty 日志在进程猝死时丢尾行，无法区分「没走到收尾」和「收尾失败」）。
+
+复测（独占 1280×720 推流中 SIGTERM，14）：
+
+| 观察点 | 结果 |
+|---|---|
+| 收尾取证 | `收到信号 SIGTERM → host shutdown 完成 → endExclusive 开始 phase=Streaming active=1 → endExclusive 成功 active=1 → 退出` |
+| 物理屏恢复 | **约 1s** 回到 `818512064 1920×1080`（远快于 FR-00 的 5s） |
+| 虚拟屏销毁 | `销毁 1 块虚拟屏`，收尾后 active 只剩物理屏 |
+| 进程退出 | 收尾整体耗时 **14s**（显示事务迟到提交 10s + 窗口布局恢复 1s 占大头），退出码 0 |
+
+⇒ F2 PASS。**但记住 14s 这个量级**：外部管理器（launchd/守护）若在 8s 内强杀，会把「已恢复但退出慢」误判成挂死；`run-host.command` 的 10s 重启间隔要理解为「上一轮已退出后才等 10s」，不要另外加超时杀。
+
+**C. F4 无人值守（Sonoma 14）**
+
+| 检查点 | 结果 |
+|---|---|
+| 路径可移植（本轮修的缺陷） | `install-unattended.sh` 把 plist 里的 `run-host.command` 改写为本机仓库路径，实测回显 `/Users/bemin/macOS-RDP/Scripts/host-deploy/run-host.command`；启动器自报 `repo=/Users/bemin/macOS-RDP`（旧版写死 `/Volumes/Data/Code/macOS-RDP`，在这台机上根本起不来） |
+| 指纹钉死 | 新增 `.state/allow-fingerprint`（不进仓库），启动器有该文件才传 `--allow-fingerprint`；实测横幅 `钉死=yes` 且 `⚠ 未钉死客户端指纹` 告警消失 |
+| 断电重启自启 | 重启（18:57:16 boot）→ 启动器 **32s 后**拉起 agent 并监听 46600，`console=bemin` 自动登录生效（判据 2min） |
+| 接入冒烟 | 13 侧 12s 会话：解码 9 帧、上屏 9 帧、0 丢帧、p95 37.5ms |
+| 端口占用保护 | 新增：46600 被占时启动器只记日志并等 5s，不再硬起（避免 `listener 失败 48` 的 10s 重试风暴） |
+
+**D. 72h soak 起跑（NFR-06）**
+
+- 拓扑：**Sonoma 14 host（无人值守 LaunchAgent，`--max-sessions 0 --inject real`，钉死 13 指纹）× Ventura 13 client（`soak-client.sh`，每轮 30min + 10min 重连窗口）**，规格 1280×720，起跑 **2026-11-27 19:00:57**。
+- 产物：host `/tmp/veild-soak/{host-rss.csv,ws-pid.csv,host-events.csv,run.log}`；client `/tmp/veilrd-soak/{client-*.json,client-*.log,client-rss.csv,driver.log}`。
+- 首轮确认：host `STREAMING`、client `STREAMING`，13 侧落 JSON/日志/RSS 采样。
+- 判据与收尾：`python3 Scripts/soak/analyze-soak.py /tmp/veilrd-soak /tmp/veild-soak`（含 agent 消失/重生事件判定）。
+- **窗口约束**：这 72h 内 14/13 不要做别的测试、不要强制退出那两个 Terminal 窗口（soak 进程挂在里面），也不要重启——一重启计时就作废。
+
+**E. 本轮踩到的脚本坑（已修）**
+
+- `soak-host.sh` 用 `${line%% *}` 解析 `ps -o %cpu=,rss=`，字段带前导空格会取到空串 → 改 `awk`。
+- `soak-client.sh` / `run-host.command` 里 `$VAR` 紧跟中文全角字符（`$CAFF_PID，`、`$BIN（`、`$code，`）在 `LANG=C.UTF-8` 下被 bash 当成变量名的一部分，报 `unbound variable` → 一律改 `${VAR}`。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |

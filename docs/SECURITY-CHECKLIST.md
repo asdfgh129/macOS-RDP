@@ -11,7 +11,7 @@
 |---|---|---|---|---|---|
 | A1 | 传输加密 | QUIC(TLS 1.3) datagram，ALPN `rdp1` | `M1QuicTransport.m` | 真机 WAN 会话 `transportIsQUIC=1` | ✅ |
 | A2 | 服务端身份钉死 | 客户端按 SHA-256 指纹校验 Host 叶子证书（`verifyPeer` + `expectedPeerFingerprint`） | `M1QuicTransport.m:456` | 指纹不符时握手失败（真机 + 单测 `ctl-hello-fingerprint-mismatch`） | ✅ |
-| A3 | 客户端身份钉死 | Host `--allow-fingerprint HEX` 校验 hello `certFingerprint`；客户端以 `.state/rdp-identity.p12` 持久身份接入 | `Apps/HostAgent/Sources/main.m`（`--allow-fingerprint`）、`M1ControlSession.m:262` | 单测 `ctl-host-pins-client-fingerprint`；真机待跑 | 🟡 |
+| A3 | 客户端身份钉死 | Host `--allow-fingerprint HEX` 校验 hello `certFingerprint`；客户端以 `.state/rdp-identity.p12` 持久身份接入 | `Apps/HostAgent/Sources/main.m`（`--allow-fingerprint`）、`M1ControlSession.m:262` | 单测 `ctl-host-pins-client-fingerprint` + **真机 PASS（RESULTS §5.50 A）**：正向接入成功；无身份客户端被拒（`hello 未上报指纹`）；错身份在 TLS 层被钉死拦下 | ✅ |
 | A4 | 未配置钉死时的行为 | Host 启动横幅告警「任何客户端都可接入」；不静默放行 | `main.m` banner | 启动日志 | ✅ |
 | A5 | 私钥/证书不入库 | `.gitignore` 忽略 `M1-Skeleton/.state/`、`.state/` | `.gitignore` | `git status` 无 p12/key | ✅ |
 
@@ -60,9 +60,9 @@
 | # | 检查项 | 机制 | 位置 | 验证 | 状态 |
 |---|---|---|---|---|---|
 | F1 | 禁屏前必须有兜底 | 无快照/无守护进程时拒绝禁屏 | `M1RDPDriver.m:366` | 单测 `无兜底时拒绝启动守护` | ✅ |
-| F2 | 有序收尾 | SIGTERM/SIGINT → 停管线 → 还物理屏 → 销毁 VD → 摘 guardian | `Apps/HostAgent/Sources/main.m`（`handleTermination`） | 真机待验证 | 🟡 |
+| F2 | 有序收尾 | SIGTERM/SIGINT → 停管线 → 还物理屏 → 销毁 VD → 摘 guardian | `Apps/HostAgent/Sources/main.m`（`handleTermination`） | **真机 PASS（§5.50 B）**：推流中 SIGTERM → 收尾取证完整、物理屏 ~1s 恢复、虚拟屏销毁、退出码 0；首测暴露「信号默认处置与 dispatch 事件竞争」缺陷，已用 SIG_IGN 修（`main.m`） | ✅ |
 | F3 | 崩溃兜底 | guardian 外部进程按快照恢复（Tahoe 上存在恢复失败边界，见 RESULTS-BY-OS §5.44） | `P0VStartGuardian` | 真机 | 🟡 |
-| F4 | 无人值守加固 | 自动登录 + LaunchAgent + 禁止闲置锁屏 + 输入钉死 | `Scripts/host-deploy/` | M3 真机验收 | 🟡 |
+| F4 | 无人值守加固 | 自动登录 + LaunchAgent + 禁止闲置锁屏 + 输入钉死 | `Scripts/host-deploy/` | **真机 PASS（§5.50 C）**：安装脚本改写 plist 路径、`repo=` 自报正确、`.state/allow-fingerprint` 钉死生效、重启后 32s agent 自动就绪并可接入 | ✅ |
 
 ## 渗透自查执行步骤（每次发布前）
 
