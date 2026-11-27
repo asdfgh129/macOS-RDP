@@ -373,6 +373,48 @@ static int P0VTxGraceSec(void) {
     return n;
 }
 
+// ---- 故障注入（只给 Scripts/tests/tx-breaker 用，默认关闭）----
+// 真挂起（WindowServer 冻结）在真机上必然连带崩显示栈并踢回 loginwindow，
+// 不能靠人工冻结 WS 做验收；这里在同一层把「事务线程不返回」注入出来：
+//   P0V_FAULT_TX=hang      事务线程永不返回，WS 仍可响应（模拟提交卡死）
+//   P0V_FAULT_TX=wsfreeze  事务线程永不返回，且 WS 探测无响应（模拟真冻结）
+// 两种模式都不会真正提交显示配置，物理屏不会被改动。
+static int P0VFaultMode(void) {
+    static int mode = -1;
+    if (mode >= 0) return mode;
+    const char *v = getenv("P0V_FAULT_TX");
+    if (!v || !*v) mode = 0;
+    else if (!strcmp(v, "hang")) mode = 1;
+    else if (!strcmp(v, "wsfreeze")) mode = 2;
+    else mode = 0;
+    return mode;
+}
+
+// WindowServer 是否还能响应。真挂起时连 CGDisplayIsActive 都会阻塞，
+// 所以「状态收敛」判据必须自己带死线，否则软死线之后会永久卡在 verify() 里，
+// 熔断反而永远不会触发（这是 8s 死线修复后剩下的真实缺口）。
+// 返回 NO 表示探测超时或注入为冻结。*outConverged 仅在返回 YES 时有效。
+static BOOL P0VProbeVerify(BOOL (^verify)(void), int timeoutMs, BOOL *outConverged) {
+    __block BOOL converged = NO;
+    dispatch_semaphore_t s = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        if (P0VFaultMode() == 2) {
+            // 故障注入：模拟 WS 完全冻结——探测线程不返回，由下面的 1s 死线兜住
+            P0SleepMs(5000);
+            return;
+        }
+        (void)CGDisplayIsActive(CGMainDisplayID());   // 最轻的 WS IPC，先探活
+        if (verify) converged = verify();
+        dispatch_semaphore_signal(s);
+    });
+    if (dispatch_semaphore_wait(s, dispatch_time(DISPATCH_TIME_NOW,
+                                                (int64_t)timeoutMs * NSEC_PER_MSEC)) != 0) {
+        return NO;   // 线程留在那里也无害：本进程已判定挂起，不再发事务
+    }
+    if (outConverged) *outConverged = converged;
+    return YES;
+}
+
 static BOOL P0VPerformTransactionV(P0VCommitScope scope,
                                    int timeoutSec,
                                    NSDictionary * (^body)(CGDisplayConfigRef cfg, BOOL *shouldCommit),
@@ -397,6 +439,12 @@ static BOOL P0VPerformTransactionV(P0VCommitScope scope,
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        if (P0VFaultMode() != 0) {
+            // 故障注入：既不 commit 也不 cancel，模拟 SPI 永不返回（显示状态不会收敛）。
+            P0Error(@"故障注入：P0V_FAULT_TX=%s，事务线程不返回（显示配置未提交）",
+                    P0VFaultMode() == 1 ? "hang" : "wsfreeze");
+            return;
+        }
         CGDisplayConfigRef cfg = NULL;
         beginErr = CGBeginDisplayConfiguration(&cfg);
         if (beginErr == kCGErrorSuccess && cfg) {
@@ -420,9 +468,10 @@ static BOOL P0VPerformTransactionV(P0VCommitScope scope,
         commitConfirmed = YES;
     } else {
         int grace = P0VTxGraceSec();
-        P0Error(@"显示配置事务 %ds 未返回：进入 %ds 收敛观察期（按实际显示状态判定，不重复提交）",
+        P0Error(@"显示配置事务 %ds 未返回：进入 %ds 收敛观察期（先探活 WindowServer，再按实际状态判定，不重复提交）",
                 timeoutSec, grace);
         double graceEnd = CFAbsoluteTimeGetCurrent() + grace;
+        BOOL wsAlive = YES;
         while (CFAbsoluteTimeGetCurrent() < graceEnd) {
             if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
                                                            250 * NSEC_PER_MSEC)) == 0) {
@@ -430,15 +479,24 @@ static BOOL P0VPerformTransactionV(P0VCommitScope scope,
                 lateCommit = YES;
                 break;
             }
-            if (verifyUsable && verify()) { lateCommit = YES; break; }
+            BOOL converged = NO;
+            if (!P0VProbeVerify(verifyUsable ? verify : NULL, 1000, &converged)) {
+                wsAlive = NO;   // WS 探测 1s 无响应 ⇒ 真挂起，不再等满宽限期
+                break;
+            }
+            if (converged) { lateCommit = YES; break; }
         }
         if (!lateCommit) {
             atomic_store(&gWindowServerHung, true);
-            P0Error(@"显示配置事务 %.1fs 未生效且显示状态未收敛：判定 WindowServer 挂起；"
-                    @"不再重试，交由守护进程兜底恢复", CFAbsoluteTimeGetCurrent() - t0);
+            double elapsed = CFAbsoluteTimeGetCurrent() - t0;
+            NSString *reason = wsAlive ? @"state-not-converged" : @"ws-unresponsive";
+            P0Error(@"显示配置事务 %.1fs 未生效且%@：判定 WindowServer 挂起；"
+                    @"不再重试，交由守护进程兜底恢复",
+                    elapsed, wsAlive ? @"显示状态未收敛" : @"WindowServer 探测无响应");
             if (outDetail) {
                 *outDetail = @{ @"timedOut": @YES, @"timeoutSec": @(timeoutSec),
-                                @"graceSec": @(grace), @"elapsedSec": @(CFAbsoluteTimeGetCurrent() - t0),
+                                @"graceSec": @(grace), @"elapsedSec": @(elapsed),
+                                @"reason": reason,
                                 @"warning": @"事务可能迟到生效，不要重复提交" };
             }
             if (error) *error = [NSError errorWithDomain:@"P0V" code:11

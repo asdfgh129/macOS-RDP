@@ -4,7 +4,28 @@
 
 格式约定：以日期为版本号构成版本节（`[YYYY-MM-DD]` + 里程碑简述），节内按 **Added / Changed / Fixed / Documentation** 分类，每条附短 commit hash；分类参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，Documentation 用于纯文档提交，本文件自身的维护提交不重复列入。真机结论按 OS 分离记录在 `docs/RESULTS-BY-OS.md`，决策编号见 `docs/DECISIONS.md`。
 
-## [2026-11-25] — M3 开工：FR-08 断网重连、宿主有序收尾、SPI 8s 熔断、指纹钉死
+## [2026-11-27] — 显示事务死线修正、挂起判定有界化、剩余项收敛（多屏独占 / 独占态 Path A）
+
+### Added
+
+- test: `Scripts/tests/tx-breaker/`——显示事务硬熔断故障注入（`P0V_FAULT_TX=hang|wsfreeze`，事务线程不返回且不提交任何显示配置，物理屏不受影响），三模式断言：正常幂等事务不误判、`wsfreeze` 在软死线 +1s 内熔断、`hang` 在 8s+12s 宽限后熔断、熔断后新事务 code 10 即时拒绝；26/14/13 三机均 PASS
+- test: `Scripts/tests/multi-display/extra_display` —— 独立进程持有的「外部虚拟屏」，用来在没有第二块物理屏的机型上验证独占禁屏集合（active − 本会话虚拟屏）与恢复
+- test: `Scripts/tests/patha/patha_probe` —— 独占态 Path A 取证（state / lock / capture / unlock，凭据走 stdin 不进 argv）
+
+### Changed
+
+- change: `P0VPerformTransactionV` 的挂起判定有界化——软死线后的收敛判据 `verify()` 本身是 WindowServer IPC，真挂起时会永久阻塞（熔断永不触发）；改为「探活 + verify 在同一个 1s 有界窗口内」，超时即判 `ws-unresponsive` 立即熔断；熔断 detail 增加 `reason`（`ws-unresponsive` / `state-not-converged`）
+
+### Fixed
+
+- fix: 显示事务 8s 误判（`f216f90`）——改为「8s 软死线只报慢提交 + 12s 按实际显示状态收敛判定」，13/14 真机 8.3–10.0s 的迟到生效不再被熔断；驱动层以实际 active 集合复核禁屏/恢复，并解除误判的挂起标志
+- fix: 产品客户端 `framesRendered` 恒 0（`f216f90`）——按 displayID 查不到 slot 时，单屏按唯一 slot 兜底，与 `DisplayRouter.view(for:)` 同口径
+
+### Documentation
+
+- docs: `RESULTS-BY-OS.md` §5.48（13/14 全独占 720p 双向 PASS、FR-08 对称断路复测、FR-09 无人值守装载）与 §5.49（真挂起注入、多屏独占、**独占态 Path A 纠正：失效变量是 Aqua 调用上下文而非独占态**、soak 前置）；决策 `C-17.43`
+
+
 
 ### Added
 
