@@ -1766,21 +1766,152 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - FR-08 对称断路 12s 复测（新二进制）待 host 恢复。
 - guardian 失败兜底与「恢复失败不 disable」预检、FR-09 真机装载、8s 熔断故障注入、72h soak 全部待 host。
 
+### 5.46 新增两台 Intel 测试机：Sonoma 14 首次基线 + Ventura 13 当前 HEAD 补测 + 13↔14 同 LAN（2026-11-26 17:2x–18:1x）
+
+**环境**：本地与两端仓库统一 `3dcba66`（原 Ventura 机停在 `e7bb64a`，已快进）。
+- **Sonoma（新增）**：iMac20,1 / i5-7500 / 4C / 8GB / 1920×1080 / en0 `192.168.34.212`，macOS **14.5 (23F79)**，仅 CLT 16.0.0 / Swift 6.0.3；`git clone --depth 1` 到 `~/macOS-RDP`，项目 SSH 公钥已加入 `authorized_keys`。`Scripts/test.sh` 的 M1/P1 单测、`M1-Skeleton/build_stream_probe.sh`、`RDPApp/build.sh` 与 `rdpapp --selftest` 均通过；`Scripts/test.sh` 末尾的跨模块集成目标因无完整 Xcode（`xcodebuild` 不可用）不参与 CLT-only 门禁。
+  - **CLT 16 构建坑**：`/Library/Developer/CommandLineTools/usr/include/swift/` 下 `module.modulemap` 与 `bridging.modulemap` 同时定义 `SwiftBridging`，Swift 桥接头编译报 `redefinition of module 'SwiftBridging'`。本机把重复的 `bridging.modulemap` 改名为 `.disabled` 后 `rdpapp` 正常构建（仅改测试机工具链，未改源码）。
+- **Ventura（已有）**：iMac17,1 / `192.168.34.213`，13.6.7 (22G720)，CLT 14.3.1；快进到 `3dcba66` 后重建 `stream_probe`/`rdpapp`，单测与 `rdpapp --selftest` PASS。两机 SSH 均加窄化 sudoers（仅允许 `launchctl asuser 501`），以便从 GUI Aqua 会话启动采集/上屏。
+- 两端初始均锁屏且屏睡；用 `p0vprobe type` 定向注入解锁（口令不落日志）。LAN 路径 `.212 ↔ .213` 直连；TCP 22 通、同网段 ping 通。
+
+**A. Sonoma 14 只读侦察（P0-R 部分，A-07 未关闭）**
+- `v01probe probe`（GUI 会话）：`osVersion=14.5.0 / iMac20,1`，`SLSConfigureDisplayEnabled` 可解析，`activeIDs=[]`（当时屏睡），`onlineIDs=[818512064]`，SLS 残留虚拟槽位 `4128829–4128835`，`SCShareableContent` 被 TCC 拒绝。
+- 解锁后 `stream_probe --preflight client` `ok=1`（`locked=0 asleep=0 active=1`），证明 14 上 client 角色前置条件成立；`--preflight host` 仍 `ok=0`：唯一失败项「缺屏幕录制授权」。在 GUI Terminal 里调用 `CGRequestScreenCaptureAccess()` 未获授权，`capture=0` 保持。⇒ **Sonoma host 采集/C-09 真机未测，需用户在 GUI 里对相关二进制/Terminal 点一次「屏幕录制」授权**；本次不把 14 host 结论外推。
+
+**B. 13 host → 14 client，同 LAN，四轮（均 `3dcba66`，720p15 请求，`--inject record`）**
+
+| 轮 | 档 | host 采集/编码/发出 | client 收齐/解出/上屏 | 判定 |
+|---|---|---|---|---|
+| r1 | 镜像（`P2_MIRROR=1`） | 415 / 406 / 406 | 405 / 405 / 405 | **PASS** |
+| r2 | 独占 keep-main | 413 / 404 / 404 | 404 / 404 / 404 | **PASS**（`c09=skipped-keep-main`，解码 1280×720 规格一致） |
+| r3 | 镜像 + 产品客户端 `rdpapp --connect` | 360 帧发出 | 360 / 360 / **0** | 部分：解码与 PNG 成立，上屏计数 0 |
+| r5 | 镜像 + `--input-synth` | 318 / 317 / 317 | 317 / 317 / 317 | **PASS**（输入 7/7 上行） |
+
+- r1：客户端 14.9fps、丢帧 0、补片 22/22、控制最大间隔 1038ms、`sendErr=0`；镜像档请求 1280×720 而解码 1920×1080 属预期（`summary` 不判规格）。落盘 PNG 为 Ventura 物理桌面 + 彩色动画柱，非黑帧。
+- r2：虚拟屏 `displayID=4128832`，动画贴窗成功；客户端规格断言 PASS、p50/p95 渲染 3.5/3.5ms、0 积压、控制间隔 1003ms；结束后物理屏 1920×1080 在位。**新增回归**：收尾日志出现 `[17:48:31] 显示配置事务 8s 未返回：WindowServer 疑似挂起`（M3 把死线 20s→8s），host JSON `sessionRecovered=false`；但 guardian 日志 17:48:33 记「父进程已正常恢复并写 done」，物理屏实际正常，`p2.sh summary` 仍判 PASS。⇒ Ventura 13 的正常收尾可超过 8s，当前 `sessionRecovered` 口径会把「恢复实际成功」误报为失败，需开发轮次修正或按 OS 放宽死线；本轮不改代码。
+- r3：Sonoma 上用 CLT 编译的 `rdpapp --connect` 能握手、收齐 360 帧、解出 360 帧、落盘 3 张非黑 PNG，但 `framesRendered=0` / `上屏=0`（`framesSkippedOccluded=0`）。疑为后台应用窗口未绘制（§5.38 同类现象），**不把产品客户端在 14 上的上屏判为 PASS**；需要 GUI 前台/可见性复核。
+- r5：客户端合成 6 组鼠标坐标 → 上行 7 条（`--input-synth` 额外产生 1 条），host `注入计划 7 条`、注入成功 7、记录模式无真实光标位移（预期）。Sonoma 客户端输入回传路径成立。
+- 三轮 `p2.sh summary` 均为结构性 PASS；capture→render 样本显示主机时钟差约 **+2.1s**（两机系统时钟未同步），p50 数值不可作延迟基线，时钟校准另记待办。
+
+**C. 13 host 全独占 720p 在当前 HEAD 失败（r4，OS 边界，不重试）**
+- 客户端状态到 `DISPLAYS_READY` 后 `15s 内未进入 STREAMING`（rc=4）；host 日志停在虚拟屏 `4128832` 的 `stage=create`，未打印 `虚拟屏就绪`；动画夹具未启动。
+- guardian 17:52:01 判定父进程未正常收尾并兜底恢复，17:52:02 记录「恢复失败」；控制台切到 `loginwindow`（`uid=88 / loginDone=FALSE`），物理屏不可用。与 §5.31 同机型显示栈边界一致，但本轮触发点是 `3dcba66` 的 8s 显示事务死线与建屏慢路径叠加，**不重复捶打 WindowServer**。
+- 恢复：该机 FileVault 已 Off、`autoLoginUser=bemin` 但缺 `/etc/kcpassword`；补齐 root:wheel 0600 的 kcpassword 后重启，18:02 自动登录回 bemin 控制台，`stream_probe --preflight host` 恢复 `ax=1 capture=1 locked=0 asleep=0 active=1`、`screencapture` 成功，SLS 仍留 4 个陈旧虚拟槽位（不影响当前 active/online 集）。未留明文口令于日志或产物。
+
+**D. 结论与口径**
+- A-07 在 **13** 上按当前 HEAD 补齐：client 收流/上屏/输入回传、host 镜像与 keep-main 虚拟屏双机全链路 PASS；全独占 720p 在该机型当前 HEAD 仍为 OS 边界（与 §5.30 旧 commit 的正向结论分开记录，不撤销历史结论）。
+- **14 Sonoma** 只关闭了构建/单测/client 前置/client 收流上屏与输入；host 侧采集、虚拟屏、C-09 未测，A-07 不因本轮关闭。
+- 本轮所有结论仅限同 LAN `192.168.34.0/24`，不写 WAN；13→14 一个方向，反向（14 host → 13 client）待 Sonoma 屏幕录制授权。
+
+### 5.47 Sonoma 授权后反向链路：14 host → 13 client（2026-11-27 08:2x，同 LAN）
+
+**前置核对**：本机即 Tahoe host（Macmini8,1 / 26.5.2 / en0 `192.168.10.23`，`console=bemin`，`ax=1 capture=1 active=2`），与两台远程测试机分开记录。Sonoma 用户在 GUI 授予屏幕录制后，`stream_probe --preflight host` 在 GUI Terminal 内 `capture=1 / ok=1`（SSH/launchctl 上下文仍 `capture=0`，属 TCC 按进程继承的预期）；`v01probe probe` 仍只有物理屏 `activeIDs=[818512064]`。两端仓库 `3dcba66`。
+
+| 轮 | 档 | host 采集/编码/发出 | client 收齐/解出/上屏 | 判定 |
+|---|---|---|---|---|
+| r6 | 镜像 1080p15 | 414 / 413 / 413 | 413 / 413 / 412 | **PASS** |
+| r7 | 独占 keep-main 720p15 | 411 / 410 / 410 | 408 / 408 / 408 | **PASS**（规格一致 1280×720） |
+| r8 | 全独占 720p15 | 建屏后禁屏事务 8s 熔断 | 停在 `DISPLAYS_READY`，15s rc=4 | **FAIL**（开发项，不重试） |
+
+- r6：镜像档请求 1280×720、实际 1920×1080 属预期；0 丢帧，PNG 是 Sonoma 真实桌面 + 彩条动画窗；`p2.sh summary` PASS。Sonoma 作为 host 的屏幕采集路径成立。
+- r7：虚拟屏 `4128835`，1280×720 规格一致、0 丢帧、guardian 正常写 done；客户端 PNG 为真实桌面。动画夹窗口虽贴屏，落盘帧未见彩条（不计入结构判定）。
+- **8s 死线误报扩大**：r7 的正常收尾日志出现 `显示配置事务 8s 未返回`，host JSON `sessionRecovered=false`，但 guardian 写 done、物理屏恢复；`p2.sh summary` 对 keep-main 不检查该字段故仍 PASS。结合 §5.46 Ventura r2，该缺陷在 **13 与 14 两版均复现**，不是单机偶发；需开发轮次修正（见待办）。
+- r8：`stage=mode-commit ok=true` 之后禁屏提交超过 8s 触发熔断，客户端等不到 STREAMING；无 WindowServer 崩溃、控制台仍 `bemin`，守护进程恢复后物理屏 `activeIDs=[1104977159]` 在位。与 §5.46 的 13 全独占失败同因，**不再对两台测试机重复捶打显示栈**。为兜底，已给 Sonoma 配 `autoLoginUser=bemin` + root:wheel 0600 的 `/etc/kcpassword`（与 13 同口径，口令未入文档/日志）。
+- 口径：A-07 在 **14** 上补齐 host 镜像与 keep-main 全链路；全独占在 13/14 当前 HEAD 均由 M3 8s 死线阻断，不能判为关闭。反向链路与 §5.46 的正向链路合并后，13↔14 同 LAN 双向（镜像 + keep-main）均已实测；延迟数字受两机时钟差影响，不作基线。
+
+**E. Sonoma 产品客户端「上屏 0」复核（r9/r10）**
+- 13 host 镜像 + 14 `rdpapp --connect`，两轮均收齐/解出 657 帧、0 丢帧、PNG 非黑；JSON `framesRendered=0 / presentP50=0`。在客户端会话中从 Sonoma GUI Terminal 截取整屏，VeilRD 窗口内**确实显示远端 Ventura 桌面与彩色动画柱**（截图 `/tmp/veild-r10-sonoma-desktop.png`），故「上屏 0」不是黑屏/未渲染。
+- 根因在**统计口径**：窗口按 host 屏表绑定到 `displayID=1000`，实际帧流/接收器用 `displayID=1535231424`；汇总时 `slots.first { $0.displayID == displayID }` 查不到对应 slot，于是 `framesRendered/presentP50` 读 0。`DisplayRouter` 的单视图兜底仍让画面正常上屏。
+- 该问题只影响产品客户端 JSON 指标，不影响画面；修复建议：单屏时按唯一 slot 兜底统计，或在 `bindSlots` 同时绑定 `receiverDisplayIDs`。本轮不改产品代码。
+
+**F. 本机 Tahoe（26.5.2）环境与安全项**
+- 本机即 Tahoe host（Macmini8,1 / en0 `192.168.10.23` / `console=bemin` / `ax=1 capture=1 active=2`），`3dcba66` 全量重建（host-agent、VeilRD、stream_probe、P0V）与单测 `ALL PASS` / 两个 selftest PASS。
+- 尝试从 13 client 跨网段连本机 `192.168.10.23:46610`（host-agent `--mirror` + `--allow-fingerprint`）：ICMP 1.8–2.6ms 正常，但 host 未收到任何 UDP 包（日志无 `已接受连接`），客户端 8s 握手超时。**跨网段 UDP 路径在本轮不可用**，不能据此判 NFR-07；指纹钉死的接受/拒绝两侧仍待在可达链路上补测。未在本机跑全独占（会禁物理屏并可能中断当前会话），留待有人在场的窗口。
+
+### 5.48 8s 死线误判修复后：13/14 全独占 720p 双向 PASS + FR-08 对称断路复测 + FR-09 无人值守装载（2026-11-27 10:5x–11:2x，同 LAN）
+
+**背景**：§5.46/§5.47 把 13/14 的全独占 720p 全部阻断在 M3 的 8s 显示事务死线（真机正常提交 8.3–10.0s，被当成 WindowServer 挂起后既熔断本事务、又用 `gWindowServerHung` 拒绝后续 restore）。本轮先修再测，改动 `f216f90`（只改显示控制层与客户端统计，不动协议）。
+
+**A. 修复口径（`P0VPerformTransactionV`）**
+- 两级死线：8s 软死线到点**只报慢提交**，随后在 `P0V_TX_GRACE_SEC`（默认 12s）内每 250ms 用公开 CG 状态收敛判定（禁用屏不再 active / 启用屏 active）；状态也没收敛才置 `WindowServerHung` 并按 NFR-06 语义熔断、不重试。
+- 事务开始前目标态已成立时**不使用**状态收敛判据，避免把真挂起判成成功；收敛但提交线程未回时按成功返回并标注 `commitConfirmed=false`，明确禁止重复提交。
+- 驱动层兜底：禁屏/恢复后以实际 active 集合复核，状态已恢复则解除误判的挂起标志（`sessionRecovered` 不再由事务返回值单点决定）。
+
+**B. 14 host（Sonoma 14.5）全独占 720p15 → 13 client**
+
+| 观察点 | 结果 |
+|---|---|
+| 禁屏事务 | 8s 软死线 → **8.3s 迟到生效**，按状态判成功（修复前此处直接熔断） |
+| 虚拟屏 / C-09 | `4128835`，`c09Status=verified`，禁屏后 `activeDisplayIDsAfterDisable=[4128835]`（物理屏全禁） |
+| host 采集 | captured=409 / encoded=408 / sent=408，dropPreEnc=0 encFail=0 sendFail=0 |
+| client | 解码 408 / 上屏 408 / 丢帧 0，12.3fps，1280×720 规格断言 PASS，首帧 855ms |
+| 收尾 | 恢复事务同样 8.3s 迟到生效；`sessionRecovered=true`、`sessionEnded=true`，teardown 后 `activeIDs=[818512064]`（物理屏回来），guardian「父进程已正常恢复并写 done」 |
+| 判定 | `p2.sh summary` **PASS**；落盘 PNG 为真实桌面（菜单栏/程序坞/Terminal 窗口） |
+
+**C. 13 host（Ventura 13.6.7）全独占 720p15 → 14 client**
+
+| 观察点 | 结果 |
+|---|---|
+| 禁屏事务 | 8.3s 迟到生效 → 判成功；虚拟屏 `4128832`，`c09Status=verified` |
+| host 采集 | captured=294 / sent=285 |
+| client | 解码 285 / 上屏 285 / 丢帧 0，8.7fps（13 采集后端上限，低于 15fps 目标），1280×720 规格断言 PASS |
+| 收尾 | 恢复事务 8.3s 与 10.0s 两级均迟到生效；`sessionRecovered=true`，物理屏 `1535231424` 回到 active；`~/Library/Logs/DiagnosticReports` **无 WindowServer 崩溃报告** |
+| 判定 | `summary` **PASS** |
+
+> 两机各只有一块物理屏，全独占期间 `active` 集合只剩虚拟屏，C-09 判据（active ⊆ 本会话虚拟屏且非空）成立。
+
+**D. FR-08 对称断路复测（13 client × 14 常驻 host，只断 UDP 46600）**
+- 网络手法：客户端 pf 规则按「协议 + 端口」收窄（`block drop quick on en0 proto udp ... port 46600`），**TCP 22 不受影响**，断路 12s 期间两端仍可 SSH 观测——这是相对既有 `Scripts/tests/fr08-reconnect`（整 IP 阻断、必然切断 SSH）的改进。
+- 时间线：11:17:28 断路 → `控制链路失败: seq=17 重传 20 次仍未确认` → `CLOSED` → 自动重连第 1 次（0.5s 后，仍在断路内，握手失败）→ 11:17:40 恢复网络 → 第 2 次握手 **15ms** → `✓ 重连成功（第 1 次），恢复推流`。
+- 结果：`reconnects=1`，解码/上屏 80/80、丢帧 0；**没有再出现 §5.45 的僵尸 STREAMING（`断线重连 0 次`）**。
+
+**E. FR-08 的负向发现（host 形态决定能否验收）**
+- 用 `p2.sh host`（单次会话、会话结束即退出）时，重连 7 次全部握手失败，最终「重连窗口 60s 内未恢复」。
+- 用独占 host 时，链路断开后 host 需 10–12s 完成还屏 + 销毁虚拟屏，期间新会话在 `DISPLAYS_READY` 后立即 `CLOSED`。
+- ⇒ FR-08 验收必须用常驻 host（`veild-host-agent --serve --max-sessions ≥2`，或 `--wait-ms > 0` 的多会话 host）；单次 host / 独占 teardown 窗口内的失败不构成客户端重连缺陷。
+
+**F. FR-09 无人值守装载（14）**
+- 二进制：本机（Tahoe，Xcode）构建的 `veild-host-agent`（`minos 13.0`）拷到 14 的 `.state/bin/`，`selftest PASS`；CLT-only 机器本机跑不了 `xcodebuild` 是已知限制。
+- 装载：`~/Library/LaunchAgents/com.veild.host.plist`（`RunAtLoad` + `LimitLoadToSessionType=Aqua`）经 `open -a Terminal run-host.command` 拉起，继承 Terminal 的屏幕录制授权；agent 参数 `--serve --port 46600 --max-sessions 3 --mirror --fps 30 --inject record`。
+- 装载即监听 46600，指纹 `b09c8b0e…`；重启后 `console=bemin` 且 agent 自动拉起（pid 761/762），13 侧客户端接入 `DISCOVERED → … → STREAMING`，33 帧上屏、判定 **PASS** ⇒ 无人值守链路成立（重启后无须人工开 Terminal 或登录）。
+- 备注：重启后两机时钟差约 1.9s，该轮 `capture→render` 数值不作延迟基线。
+- 收尾：验证完成后已在 14 上 `launchctl bootout gui/501/com.veild.host` 并删除 `~/Library/LaunchAgents/com.veild.host.plist`，避免测试机长期开放一个未钉指纹的接入端口（日志与二进制保留，`run-host.command` 留在 `~/host-deploy-test/` 便于复现）。
+
+**G. 上屏计数口径修复验证（对应 §5.47 E 的 #9）**
+- 客户端汇总改为「按 displayID 精确查不到时，单屏按唯一 slot 兜底」，与 `DisplayRouter.view(for:)` 同口径。
+- 复测：408/408、285/285、80/80 三组 `framesRendered` 与解码数一致（修复前恒 0），无需再靠截图判读。
+
+**H. 环境与前置（两机）**
+- 两机初始均为锁屏 + 屏睡。合成按键在锁屏上被系统整体丢弃（`CGEventPostToPid` 与 HID tap 两级注入、root 与 GUI 会话两条路径都无效果，屏幕无回显、光标不移动）：这类机器**不能靠注入解锁**。
+- 可用做法：`defaults write /Library/Preferences/com.apple.loginwindow autoLoginUserScreenLocked -bool false` + `askForPassword=0`（含 `-currentHost`）+ 自动登录（`/etc/kcpassword`），重启后直接落到未锁桌面。两机均已按此配置。
+- 构建/单测：Sonoma（CLT 16）、Ventura（CLT 14.3.1）在 `f216f90` 上 `v01probe`/`stream_probe`/`rdpapp` 全构建通过，两端各 5 套单测 `ALL PASS`；本机 Tahoe 同步重建 + 单测 `ALL PASS`。
+
+**I. 本轮仍未闭合（含理由）**
+- **真挂起（WindowServer 冻结）的硬熔断故障注入**：需要人为冻结 WindowServer，历史上会连带崩显示栈并踢回 loginwindow，须有人在场的窗口；本轮只覆盖了「慢提交」侧（8.3s/10.0s 共 6 次自然触发）。
+- **多屏独占**：两台 Intel 测试机各只有一块物理屏，无法构造双物理屏独占；Tahoe 本机双屏独占留待有人在场窗口。
+- **72h soak** 与 **A-02 玻璃到玻璃**：前者需要长窗口占用机器，后者需要相机/外部计时硬件，均不在本轮范围。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |
 |---|---|---|---|
 | A-01 Tahoe SPI 可用 | — | ✅ 关闭 | — |
 | A-04 虚拟屏容量与物理屏解耦 | — | ✅ 关闭 | — |
-| A-07 13–26 双角色 | — | — | ⚠️ 部分收敛：client 全角色 PASS（§5.24）；host 的 SCK 被系统拒绝但 CG 回退可用，镜像 + 虚拟屏 keep-main 双机全链路 PASS（§5.27/§5.28），真实系统输入注入 PASS（光标位移 >1000px），SPI 建虚拟屏 PASS，帧率 ~14.8fps@720p；锁屏态改用 CGDisplayCreateImage 后端后可看见登录界面并接受键入，14.9fps@720p（§5.29）；**1280×720 完整独占禁屏/C-09 加 ScreensharingAgent 竞态规避后已 PASS（§5.30）**，健康态复测再次全链路 PASS（§5.32）；1920×1080 独占触发 WindowServer layer-blit 崩溃为该机型 OS 层边界、不重试；多屏独占未覆盖（§5.31） |
+| A-07 13–26 双角色 | — | — | ⚠️ 部分收敛：client 全角色 PASS（§5.24）；host 的 SCK 被系统拒绝但 CG 回退可用，镜像 + 虚拟屏 keep-main 双机全链路 PASS（§5.27/§5.28），真实系统输入注入 PASS（光标位移 >1000px），SPI 建虚拟屏 PASS，帧率 ~14.8fps@720p；锁屏态改用 CGDisplayCreateImage 后端后可看见登录界面并接受键入，14.9fps@720p（§5.29）；**1280×720 完整独占禁屏/C-09 加 ScreensharingAgent 竞态规避后已 PASS（§5.30）**，健康态复测再次全链路 PASS（§5.32）；1920×1080 独占触发 WindowServer layer-blit 崩溃为该机型 OS 层边界、不重试；多屏独占未覆盖（§5.31）；**当前 HEAD `3dcba66` 补测（§5.46）**：镜像/keep-main 双机全链路 PASS、Sonoma 客户端输入回传 PASS；全独占 720p 在建屏阶段停滞并触发 guardian 恢复失败，仍属该机型 OS 边界；**`f216f90` 修 8s 死线误判后 720p 全独占双向 PASS（§5.48 B/C）**：C-09 verified、`sessionRecovered=true`、物理屏恢复、无 WindowServer 崩溃，13 侧采集 8.7fps 为该机型上限；多屏独占与独占态登录窗迁移仍未覆盖 |
 | A-08 物理屏全禁后仍可建屏/捕获/注入 | ✅ 核心关闭（SCK OK） | ✅ 关闭：V-01 通过；V-03 显示隔离+恢复成立（已登录零物理屏下 SCK 不可靠，但公开抓屏 API 稳定可用）；V-02 锁屏建屏成立；禁屏后登录 UI 完整迁移 |
 | A-09 锁屏/登录窗可远程进入 | V-04a/b ✅、V-04c 未测、V-04d 未实现 | ✅ **关闭**：V-04a/b/c/d 全过，Path A 端到端成立；前置防显示睡眠（屏睡态 SCK 无帧，caffeinate 可避免） | ✅ 镜像模式 Path A 端到端 PASS（V-04a/b/c 等价）：锁屏且防睡眠下 CGDisplayCreateImage 后端看到完整登录界面（14.9fps），定向键入使密码框出现圆点，真实口令注入后 `locked=0 / ok=1`、回到桌面（§5.29）。**独占禁屏下的登录窗迁移（V-04d 等价）仍未实测**：补测被建屏阶段的控制通道重传放弃与 WindowServer layer-blit 崩溃阻断（§5.31）；健康态独占全链路虽 PASS，但独占态下 `SACLockScreenImmediate` 静默失效（须 Aqua session 且物理屏全禁时不生效），登录 UI 未呈现（§5.32） |
 | A-02 glass-to-glass 延迟 | 未测 | ⚠️ 部分推进：M1-Pre 采集编码链路成立，但带编码的真实帧率 `CGDisplayCreateImage` 1–7fps / SCK 2–18fps，均远达不到 60fps；首帧延迟 739–1031ms；无编码时的 55fps 是假象。2026-11-19 跨公网已取得首批双机数据（§5.13，Tahoe host × Sequoia client）：1080p20 客户端渲染 84.7ms/帧、解码/发出 54/375；720p10 渲染 41.6ms、上屏 0 积压；补测 C/D 拿到完整配对（3440×1440 → 7 解出；720p15 → 136/443，丢包 4–6% + 严格按序重组等关键帧是主因）。无 60fps / glass-to-glass 证据，A-02 保持开放，见 D-10。**2026-11-22 打点落地（§5.35）**：帧头 v3 内嵌 `capturedAtUs` + 控制通道 `time-sync`；Tahoe 26.5.2 host × Sequoia 15.5 client（WAN，1080p20 镜像）两轮 capture→render **p50 94–95ms / p95 206–231ms**（时钟差 ~88ms、RTT 7–9ms），玻璃到玻璃仍未测 |
+
+> **Sonoma 14.5（23F79，iMac20,1，2026-11-26 新增）**：上表未单列。CLT 16 本机构建/单测、`v01probe` 只读侦察、client 前置与 13→14 同 LAN 收流/上屏/输入回传均成立（§5.46 A/B）；授权后 14→13 反向镜像与 keep-main 全链路 PASS（§5.47 r6/r7）。**`f216f90` 后 14 的 host 档位已补齐（§5.48）**：全独占 720p `c09Status=verified`、408/408 上屏 0 丢帧、`sessionRecovered=true`、物理屏恢复，A-07 在 14 上按 720p 关闭（1080p 独占未测，不跨分辨率外推）。
 
 ---
 
 ## 7. 变更记录
 
+- v0.78-draft 2026-11-27 11:2x：**8s 死线误判修复 + 13/14 全独占 720p 双向 PASS + FR-08/FR-09 闭合（§5.48，代码 `f216f90`）**。显示事务改为「8s 软死线 + 12s 状态收敛观察期」，只有状态也没收敛才熔断；驱动层以实际 active 集合复核禁屏/恢复，解除误判的挂起标志。真机：14 host 独占 720p 采集 409/发 408、client 408/408 上屏 0 丢帧、C-09 verified、恢复 8.3s 迟到生效、物理屏回来；13 host 独占 720p 采集 294/发 285、client 285/285、无 WS 崩溃。FR-08 用「只断 UDP 46600」的 pf 规则（SSH 全程可达）复测：判死→重连第 2 次握手 15ms→`reconnects=1`、80/80 上屏 0 丢帧；同时定位两种不能用于验收的 host 形态（单次 host、独占 teardown 窗口）。FR-09：14 装载 LaunchAgent 经 Terminal 继承 TCC，重启后 agent 自动拉起并被 13 接入 STREAMING（33 帧 PASS）。另修客户端上屏计数（单屏按唯一 slot 兜底），`framesRendered` 与解码数一致；记录锁屏机器无法靠注入解锁，需 `autoLoginUserScreenLocked=false` + 自动登录。
+- v0.77-draft 2026-11-27 08:5x：**产品客户端上屏计数根因（§5.47 E）**。13 host + 14 `rdpapp` 两轮 657 帧、0 丢帧，会话中整屏截图确认 VeilRD 窗口真实显示远端桌面；`framesRendered=0` 源于窗口绑定 `displayID=1000` 与帧流 `1535231424` 不一致导致汇总查不到 slot，属指标口径缺陷，不改产品代码。另记录本机 Tahoe 重建/单测 PASS，及跨网段 UDP 未达导致 NFR-07 指纹钉死未测（§5.47 F）。
+- v0.76-draft 2026-11-27 08:3x：**Sonoma 授权后反向链路入档（§5.47）**。本机确认为 Tahoe host 并先核对环境；Sonoma GUI Terminal `capture=1` 后 14 host → 13 client：镜像 413/412、keep-main 408/408 规格一致，两项 `summary` PASS；全独占 720p 在禁屏事务 8s 熔断、客户端 rc=4，无 WS 崩溃且物理屏恢复，按开发项记录不重试。8s 死线「恢复成功却报失败」在 13/14 均复现；Sonoma 已补自动登录兜底。
+- v0.75-draft 2026-11-26 18:1x：**两台 Intel 测试机补测入档（§5.46）**。新增 Sonoma 14.5 / iMac20,1（CLT 16，本地构建+单测+client 前置 PASS，host 采集被 TCC 挡住）；Ventura 13 快进到 `3dcba66` 重建。13→14 同 LAN：镜像 405/405、keep-main 404/404 规格一致、合成输入 7/7 上行，三项 `summary` PASS 且 PNG 非黑；产品 `rdpapp` 在 14 上 360/360 解出但上屏计数 0（待可见性复核）。全独占 720p 当前 HEAD 建屏停滞、guardian 恢复失败并踢回 loginwindow，补齐 `/etc/kcpassword` 后重启恢复；发现 M3 8s 显示事务死线在 Ventura 正常收尾误触发（`sessionRecovered=false` 但实际恢复成功）。时钟差 ~2.1s，capture→render 不作延迟基线。
 - v0.74-draft 2026-11-25 22:4x：**M3 开工（§5.45）**。FR-08 断网重连真机 3 轮 PASS（10–12s 双向 pf 阻断 + 清 state）：判死 8.8s、退避 0.5→1→2s、重连后沿用 VD 4128835，0 丢帧、`reconnects=1`（195/195、118/118、103/103）。对称断路暴露僵尸 STREAMING（`控制链路失败 seq=18 重传 20 次` 后 `断线重连 0 次`），修复 `75e976c`（`abortWithReason:` 接入链路失败与 8s 看门狗），复测被 host 失联阻塞。同轮落地（`3c06c1c`）：host SIGTERM/SIGINT 有序还屏、显示事务死线 8s（NFR-06）、`--allow-fingerprint` 客户端指纹钉死 + 客户端持久身份、无人值守/soak 资产、安全自查清单；单测 343 PASS。事故：SIGTERM 杀 agent → guardian 恢复 `CGError 1001` → 物理屏 ID 失效、仅合成主屏 → 配好自动登录后 22:08 重启，至 22:38 SSH/WAN/LAN 全不可达，待物理检查。
 - v0.73-draft 2026-11-25 21:2x：**M2 重连清理 PASS（§5.44）**。Tahoe 26.5.2 host（WAN）× Sequoia 15.5 client，`--max-sessions 2`：会话 1 1920×1080 17/17 上屏、客户端离开；会话 2 1280×720 `[独占] 换屏 4128834` 23/23 上屏、host 时长到收尾；`sessions=2`、sent=40、fragments=633、控制面 0 异常、退出 0、物理屏恢复、无遗留进程。两个根因：① 显示收尾（16s+）占着控制交付队列，饿死下一轮 attach/hello（`57`/重传耗尽）；② Tahoe 同进程销毁虚拟屏后再建必 `online=0`，身份 offset 无效——改为会话间复用虚拟屏（规格变则 create-then-destroy 换屏），物理屏常驻期保持禁用。
 - v0.72-draft 2026-11-24 22:3x：**M2 收口真机（§5.42）**。FR-07 keep-main 2→1 WAN 换屏 PASS：host `[换屏] 2→1（4128833 1024×768）`、旧屏 retired、client 结果 ok 并重绑窗口、0 丢帧、两端控制间隔 1.44s/1.19s；根因定位为控制消息在 QUIC 收包线程同步交付，换屏 ~2.2s 拖死 ACK、2s 重传预算耗尽后控制链路静默失效，修复 `7f664b6`（专用交付队列）。FR-06 真机文本注入 PASS：client `--send-text` 两串 → host `inputOK=2`、落盘 `HelloVeilRD中文输入测试` 29B 逐字节一致、39/39 上屏 0 丢帧；首轮收端 canonical 模式不落盘已定位。沉浸模式真机目测与 FR-07 取档因 host WindowServer 虚拟屏 `active=false` 脏态延后，已重启 host 待补。
