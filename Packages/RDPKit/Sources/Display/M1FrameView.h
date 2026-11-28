@@ -37,6 +37,12 @@ NS_ASSUME_NONNULL_BEGIN
 // FR-06：Cmd+Opt+F 切换沉浸模式；宿主负责改窗口样式（默认不响应）。
 @property (nonatomic, copy, nullable) void (^onToggleImmersive)(void);
 
+// A-02：视频 layer.contents 提交的同一主线程事务里回调，供参考钟类覆盖层
+// 把「本机时间」写进同一帧。独立 Timer 重绘会在主线程积压时冻结读数，
+// 让双钟差失真（见 RESULTS §5.51）；回调必须同步更新 layer.contents，
+// 不能只调 needsDisplay（那会落到下一次事务）。
+@property (nonatomic, copy, nullable) void (^onPresentCommit)(void);
+
 // 把一帧贴到屏幕上。capturedAtUs 为帧头 v3 携带的主机采集 epoch 微秒；
 // 传 0 表示不统计端到端延迟。
 - (void)presentPixelBuffer:(CVPixelBufferRef)pb capturedAtUs:(uint64_t)capturedAtUs;

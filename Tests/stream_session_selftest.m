@@ -52,6 +52,11 @@ int main(int argc, const char *argv[]) {
         printf("host 监听端口 %u 指纹 %s\n", host.port, fp.UTF8String);
 
         M1StreamNode *client = [M1StreamNode new];
+        // NFR-07：两端握手都要报指纹（host 按 expectedPeerFingerprint 钉死），
+        // 客户端不能匿名接入。早期夹具只设了 expectedFingerprint，改加固后
+        // 这里一直握手超时——是测试夹具漏配，不是产品回归。
+        client.identityPath = identity;
+        client.identityPass = pass;
         client.expectedFingerprint = fp;
         if (![client startAsClientTo:@"127.0.0.1" port:host.port timeout:12000 error:&err]) {
             fprintf(stderr, "✗ client 握手: %s\n", err.localizedDescription.UTF8String ?: "unknown");

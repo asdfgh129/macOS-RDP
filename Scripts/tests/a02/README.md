@@ -1,130 +1,101 @@
-# A-02 玻璃到玻璃延迟：无相机替代法（时钟 + 截屏）
+# A-02 端到端延迟：无相机替代法
 
 A-02 的定义是「主机屏幕上出现某时刻的画面 → 客户端屏幕上也出现它」的时间差。
-原计划用 240fps 相机把两块屏拍进同一帧读数；**没有相机**时，本目录用
-「同一帧里放两个时钟」的办法等价实现——把相机的 CMOS 换成显示器帧缓冲。
+没有 240fps 相机时，本目录提供两条互补路径：
 
-## 1. 为什么单钟截屏不行
+1. **主判据 inband（推荐，数值判据）**：用 SCK 帧头携带的
+   `SCStreamFrameInfoDisplayTime`（WindowServer 真正显示该帧的 mach 时刻），
+   客户端在贴层时结算 `presentP50 = 显示时刻 → 上屏`。**不截屏、不侵入合成器**。
+2. **交叉验证双钟同框**：主机画洋红毫秒条码（被采集），客户端在自己窗口里画青色
+   参考条码（不经流），一次截屏同时读两个钟，截屏时刻消掉。仅作视觉/自检用。
+
+## 1. 为什么不用「单钟 + 截屏」
 
 `CGDisplayCreateImage` 在本机（Tahoe 26.5.2 / 3440×1440）单次耗时 **177–695ms**，
-而且无法知道快照究竟发生在调用的哪一刻：同一张图上
-`t0 − 钟读数` 是 **−600ms**、`t1 − 钟读数` 是 **+40ms**，中间全靠猜。
-延迟在 30–50ms 量级时，这个不确定度比被测量本身还大，**单钟 + 截屏不能用于判定**。
+而且无法知道快照究竟发生在调用的哪一刻：同一张图上 `t0 − 钟读数` 是 −600ms、
+`t1 − 钟读数` 是 +40ms。延迟在 30–50ms 量级时不确定度比被测量还大，不能用于判定。
 
-## 2. 双钟同框（本方案）
-
-```
-        ┌───────────── 采集屏（同屏模式，单显示器即可）─────────────┐
-        │  a02_clock 全屏：洋红条码 + 大号毫秒时钟（被采集的内容）  │
-        │      ┌─────── 客户端窗口（1200×675，居中）───────┐        │
-        │      │  远端画面（含洋红条码，已延迟）            │        │
-        │      │  左下角：青色条码 = 本机当前毫秒（--ref-barcode）│  │
-        │      └────────────────────────────────────────────┘        │
-        └────────────────────────────────────────────────────────────┘
-                                ↑ 一次截屏，只裁客户端内容矩形
-```
-
-* 洋红条码 = 主机侧「被采集的内容」，经过 采集→编码→QUIC→解码→上屏；
-* 青色条码 = 客户端进程自己画的**本机时钟**，不经过任何流；
-* 两者在**同一帧**里被合成 ⇒ 截屏的时刻完全消掉，延迟 = 青读数 − 洋红读数。
-
-条码是 48 位 epoch 毫秒 + 8 位校验（56 格），外框洋红/青各 C/2 厚，
-解码端用「彩色连通域 + 57:4 形状 + 密度」定位，再按 Cx/Cy 分别反推格宽，
-因此**缩放无关**（3440 采成 1280、再显示成 1200 都能量）。
-
-### 口径（写结论时必须带上）
+## 2. 主判据 inband 的口径
 
 | 项 | 说明 |
 |---|---|
-| 起点 | 主机应用把该毫秒值绘进图层（不是显示器扫描出光子） |
-| 终点 | 客户端窗口该帧被 WindowServer 合成（不是相机采样到光子） |
-| 含 | 主机合成/采集、编码、传输、解码、上屏 |
+| 起点 | WindowServer 把该帧显示出来（`SCStreamFrameInfoDisplayTime`，换算成 epoch） |
+| 终点 | 客户端把该帧 IOSurface 赋给 `layer.contents` |
+| 含 | 采集、编码、QUIC 传输、重组、解码、渲染转换、主线程贴层 |
 | 不含 | 两端显示器扫描输出、相机曝光；**不等于**相机同框的 glass-to-glass |
-| 系统性偏差 | 主机绘制→采集之间有 0–2 个刷新周期（16.7–33.4ms @60Hz），偏高 |
-| 对照量 | 客户端 `presentP50Ms`（帧头 `capturedAtUs` → 上屏）给出**下界** |
+| 跨机 | 两端墙钟差需减掉控制通道 `time-sync` 估出的 `clockOffsetUs`；同机为 0 |
 
-即：真实 glass-to-glass 落在 `[presentP50, 双钟p50]` 区间内——
-下界是「采集完成」起算，上界是「应用绘制」起算，差值就是主机合成+采集那一段。
+关键实现（改动见 C-17.47）：
+
+* `M1CapturePipeline.m`：SCK 回调不再用 `M1WallMs()`（回调时刻），改读
+  `SCStreamFrameInfoDisplayTime` 并按 `mach_timebase_info` 换算成 epoch 毫秒。
+  积压时两者差可达秒级，旧口径会把延迟系统性低估。CGDisplayStream / 锁屏快照
+  后端没有该字段，仍用回调时刻。
+* `M1FrameView.m/.h`：新增 `onPresentCommit`，在 `layer.contents` 提交的
+  **同一主线程事务**里回调。
+* `Apps/Client/Sources/main.swift`：`A02RefBarcodeView` 不再用 8ms Timer 重绘
+  （主线程积压时会冻结读数，把 713ms 测成 100ms），改为随帧同步更新 `layer.contents`。
 
 ## 3. 用法
 
 ```bash
 bash Scripts/tests/a02/build.sh                 # 出 a02_clock / a02_shot
+bash M1-Skeleton/build_stream_probe.sh          # 出 host 侧 stream_probe
+bash Scripts/build.sh VeilRD                    # 出客户端（含 --ref-barcode / onPresentCommit）
 
-# 自检：参考钟故意偏 -40ms，判读中位数应为 -40ms（±20ms，证明判读链路无系统错位）
+# 主判据：本机 host + client，40s，720p。3440×1440 源屏默认带 M1_CAPTURE_RESOLUTION=best
+./run.sh inband-local --display <CGDisplayID> --spec 1280x720 --seconds 40
+
+# 主判据：跨机（host 已在 14 上起好），13 这边只跑客户端并结算
+./run.sh inband-client --host 192.168.34.212 --port 46600 \
+    --fingerprint <host_fp> --spec 1920x1080 --seconds 40
+
+# 双钟判读链路自检：注入 -40ms，判读中位数应为 -40ms（±20ms）
 ./run.sh selftest --display <CGDisplayID> --skew-ms -40
 
-# 同屏环回（仅验证拓扑，数据不可信——见 §6；本机双屏有镜中镜/渲染积压）
-./run.sh local --capture-display <CGDisplayID> --samples 40 --interval 0.3
-
-# 单次采样（跨机时在客户端机器上跑）
-./run.sh shot --two --display <CGDisplayID> --rect x,y,w,h [--png out.png]
-./run.sh shot --two --window <CGWindowID> [--png out.png]   # 抓单窗口，避开直出条码与全屏抓图侵入
-./run.sh shot --png-in shot.png          # 离线复判，用于取证
-./run.sh list                            # 屏幕与显示器 id
+# 双钟交叉验证（数据不可当判据，见 §5）
+./run.sh local --capture-display <CGDisplayID> --samples 20 --interval 0.3
+./run.sh shot --two --window <CGWindowID> [--png out.png]
+./run.sh shot --png-in shot.png          # 离线复判
+./run.sh list                            # 屏幕与窗口 id
 ```
 
-产物在 `/tmp/veild-a02/`：`samples.jsonl`（每次采样一行 JSON）、`sample.png`
-（第一帧截图，人眼可核对条码与时钟）、`host.json` / `client.json`（两端计数）、
-`host.log` / `client.log`。
+产物在 `--outdir`：`host.json` / `client.json`（计数与 presentP50/P95）、
+`host.log` / `client.log`、`clock.log`；双钟模式另有 `samples.jsonl` / `sample.png`。
 
-## 4. 跨机怎么跑（soak 结束后）
+## 4. 实测结果（2026-11-28，仅 Tahoe 26.5.2 / Macmini8,1）
 
-主机侧（本机，需屏幕录制授权，见 §5）：
+镜像模式，源屏 3440×1440，内容源 `a02_clock` 30fps：
 
-```bash
-a02_clock --display <采集屏> --hold 120          # 洋红条码内容源
-stream_probe --host --port 46600 --mirror --display <采集屏> \
-    --spec 1280x720 --width 1280 --height 720 --fps 30 \
-    --duration-ms 120000 --identity <p12> --out /tmp/host.json
-```
+| 规格 | 采集设置 | display→present p50 | p95 | 判定 |
+|---|---|---|---|---|
+| 1280×720 @30 | `M1_CAPTURE_RESOLUTION=best` | **39.5ms** | 48.5ms | PASS |
+| 1920×1080 @30 | 默认（3440×1440 降采样） | 181.5ms | 1213.5ms | FAIL |
+| 1920×1080 @30 | best，两轮 | 47.5 / 54.5ms | 498.5 / 1115.5ms | 贴线，未稳定达标 |
 
-客户端侧（另一台机器）：
+⇒ strict A-02（1080p <50ms）在 Tahoe 本机**未稳定闭合**；720p 达标。
+本机双物理屏 + 3440×1440 源屏是不利条件，**不外推到 13/14**。
+14×13 的 72h soak 结束后按上面的 `inband-client` 在两台独立机器上补 1080p。
 
-```bash
-VeilRD --connect <host> --port 46600 --fingerprint <host_fp> \
-    --identity <p12> --spec 1280x720 --window 1200x675 \
-    --ref-barcode --duration-ms 90000 --out /tmp/client.json
-# 客户端会打印 A02_WINDOW_RECT x,y,w,h（CG 全局坐标，左上原点）
-a02_shot --two --display <客户端屏> --rect <A02_WINDOW_RECT>   # 反复采样
+## 5. 双钟模式的已知限制（详见 RESULTS §5.51）
 
-# 更优：抓客户端窗口本身（CGWindowListCreateImage，不经显示帧缓冲、不侵入合成器）
-# 窗口 ID 从 a02_shot --list-windows 里按 "VeilRD 1/1" 标题取
-a02_shot --two --window <CGWindowID> [--png out.png]
-```
+* 同屏环回 → 镜中镜：流里嵌套整块主屏，`A02LargestComponent` 选中主屏直出的大条码 ⇒ 假值 100ms。
+* 跨屏 + `CGDisplayCreateImage` 抓副屏 → 单次抓图 597ms 侵入合成器 ⇒ 假值 2554ms。
+* 跨屏 + `--window` 抓客户端窗口 → 抓图 150–650ms，仍拖慢合成器；双钟读数分裂为
+  80–400ms 与 1.1–3.5s 两簇，且与抓图耗时强相关。**只作交叉验证。**
+* 副屏（独立 Space）上由其它进程创建的窗口拿不到合成；`orderFrontRegardless`、
+  激活、screenSaver 层级、全局坐标 `setFrame` 全试过，副屏始终只有壁纸。
+  所以参考钟放在客户端进程自己的窗口里。
+* 条码在格宽 < 6px（画面被缩到 1/6 以下）时读不出，属分辨率边界。
 
-跨机必须在**两台独立机器**上做：客户端抓图不能和主机采集在同一台机器上，
-否则抓图侵入合成器会把主机帧缓冲拖慢、读数失真（§6）。
+## 6. TCC 与环境的坑
 
-跨机时两端时钟不同源：延迟 = (青读数 + host−client 时钟差) − 洋红读数，
-钟差用控制通道 `time-sync` 的最小 RTT 样本（LAN 上 ±1ms 量级）。
-同机环回时该差为 0，这也是本目录默认先跑环回的原因。
-
-## 5. TCC 与主机选择（踩过的坑）
-
-* **host 不能套 `script -q /dev/null`**：pty 会改变 TCC 的「责任进程」，
-  SCK 立刻报 `The user declined TCCs ...`、CGDisplayStream 返回空 stream。
-* **未签名的 `veild-host-agent` 在非 GUI 上下文拿不到屏幕录制**（本机 debug 产物
-  无签名），而 `stream_probe`（adhoc、`com.m1.pipeline`）已有授权 ⇒
-  `run.sh` 默认用 `stream_probe` 当 host（采集/编码/传输是同一份 RDPKit），
-  `A02_HOST=product` 可切回产品入口（须在 GUI Terminal 内运行）。
-* **客户端日志要行缓冲**才能轮询 `A02_WINDOW_RECT`，所以客户端仍套 `script`。
+* **host 不能套 `script -q /dev/null`**：pty 会改变 TCC 责任进程，SCK 立刻被拒。
+* **未签名的 `veild-host-agent` 在非 GUI 上下文拿不到屏幕录制**；`stream_probe`
+  已有授权 ⇒ `run.sh` 默认用它当 host（`A02_HOST=product` 可切回产品入口）。
+* 客户端日志要行缓冲才能轮询状态，所以客户端仍套 `script`。
 * 屏睡会让 SCK 直接没有帧；`run.sh` 全程 `caffeinate -d -u`。
-* **会话被锁**（`CGSSessionScreenIsLocked=Yes`）时截图只剩壁纸、客户端整帧不上屏
-  （`framesRendered=0`）——这一条最容易误判成「窗口没显示/工具坏了」。
+* 会话被锁时截图只剩壁纸、客户端整帧不上屏（`framesRendered=0`）。
   前置检查：`ioreg -n Root -d1 | grep IOConsoleLocked`（`=No` 才对）或
   `stream_probe --preflight` 的 `locked=0`，不要只看截图。
-
-## 6. 已知限制 / 本机环回诊断（2026-11-28，详见 RESULTS §5.51）
-
-* **本机双物理屏环回的数据不可信**，三种拓扑实测：
-  1. 同屏环回 → 镜中镜，流里嵌套整块主屏，`A02LargestComponent` 选中主屏直出的大条码 ⇒ 假值 100ms；
-  2. 跨屏 + `CGDisplayCreateImage` 抓副屏 → 单次抓图 597ms 侵入合成器、framebuffer 停在 2s 前 ⇒ 假值 2554ms；
-  3. 跨屏 + `--window` 抓客户端窗口 → 无直出条码、抓图 ~150–250ms，但客户端渲染持续积压
-     （`decoded/rendered=736/417`、`presentP50` 在 90–713ms 波动）⇒ 双钟读数分两簇 83–184ms / 384–4578ms。
-  ⇒ **不在本机给 glass-to-glass 数值或 PASS/FAIL**；可信测量按 §4 在 14×13 跨机做。
-* 参考钟放在客户端进程内，是因为**副屏（独立 Space）上由其它进程创建的窗口拿不到
-  合成**：`orderFrontRegardless`、激活、screenSaver 层级、全局坐标 `setFrame` 全试过，
-  副屏始终只有壁纸。
-* 主机绘制到采集之间的 0–2 帧无法用软件消除，只能用 `presentP50` 给下界。
-* 条码在格宽 < 6px（画面被缩到 1/6 以下）时会读不出，属分辨率边界。
+* 黑屏 ≠ 锁屏：机器空闲会熄屏但不锁，`caffeinate -d -u -t N` 唤醒即可。

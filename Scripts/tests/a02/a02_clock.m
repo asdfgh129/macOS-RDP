@@ -22,7 +22,10 @@
 //
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <fcntl.h>
+#import <stdio.h>
 #import <time.h>
+#import <unistd.h>
 
 static uint64_t A02NowMs(void) {
     struct timespec ts;
@@ -57,6 +60,23 @@ static void A02Fill(CGContextRef ctx, CGRect r, CGFloat cr, CGFloat cg, CGFloat 
 
     uint64_t ms = (uint64_t)((long long)A02NowMs() + self.skewMs);
     self.lastMs = ms;
+
+    // A-02 非侵入式打点：把「这一帧画面实际画出来时」的 epoch 毫秒写到文件，
+    // 采集回调读取它作为 capturedAtUs。这样 presentP50 直接就是应用绘制→上屏，
+    // 不需要截屏；截屏双钟只作为交叉验证（截屏本身 150–650ms 会拖慢合成器）。
+    if (!self.cyanFrame) {
+        const char *path = getenv("A02_CLOCK_FILE");
+        if (path) {
+            int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) {
+                char buf[32];
+                int n = snprintf(buf, sizeof(buf), "%llu", (unsigned long long)ms);
+                ssize_t w = write(fd, buf, (size_t)n);
+                (void)w;
+                close(fd);
+            }
+        }
+    }
 
     uint8_t bytes[7];
     for (int i = 0; i < 6; i++) bytes[i] = (uint8_t)((ms >> (8 * (5 - i))) & 0xFF);

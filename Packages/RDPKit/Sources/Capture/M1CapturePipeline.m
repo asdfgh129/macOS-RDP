@@ -8,6 +8,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <IOSurface/IOSurface.h>
+#include <mach/mach_time.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <math.h>
@@ -31,6 +32,31 @@ static NSError *M1CaptureErr(M1PipelineErrorCode code, NSString *msg) {
 
 static double M1WallMs(void) {
     return [[NSDate date] timeIntervalSince1970] * 1000.0;
+}
+
+// SCK 的 SCStreamFrameInfoDisplayTime 是 WindowServer 实际显示这一帧的
+// mach 绝对时间。旧实现在回调里取 M1WallMs()，那是「交付时刻」，
+// 积压时会比画面内容晚很多 ⇒ A-02 的 capturedAtUs 偏新、端到端被低估。
+// 这里把它换算成 epoch 毫秒：先取一对同时刻的 mach/epoch，再按时间基差回推。
+static double M1FrameDisplayEpochMs(CMSampleBufferRef sb) {
+    CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+    if (!atts || CFArrayGetCount(atts) == 0) return 0;
+    CFDictionaryRef info = CFArrayGetValueAtIndex(atts, 0);
+    CFTypeRef value = CFDictionaryGetValue(info, (CFStringRef)SCStreamFrameInfoDisplayTime);
+    if (!value || CFGetTypeID(value) != CFNumberGetTypeID()) return 0;
+    int64_t displayMach = 0;
+    if (!CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &displayMach) ||
+        displayMach <= 0) return 0;
+
+    static mach_timebase_info_data_t tb;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ mach_timebase_info(&tb); });
+    uint64_t nowMach = mach_absolute_time();
+    if ((uint64_t)displayMach > nowMach) return 0;   // 未来时间：异常，回退到回调时刻
+    uint64_t deltaNs = (uint64_t)(((double)(nowMach - (uint64_t)displayMach))
+                                  * (double)tb.numer / (double)tb.denom);
+    double epochMs = M1WallMs() - (double)deltaNs / 1e6;
+    return epochMs > 0 ? epochMs : 0;
 }
 
 #pragma mark - 配置
@@ -125,7 +151,11 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     if (frameScale > 0) atomic_store(&_lastScale, (double)frameScale);
 
     CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
-    [self deliverPixelBuffer:pb ptsMs:M1WallMs()];
+    // 用 WindowServer 的显示时刻而不是回调时刻：积压时两者差可达秒级，
+    // 用后者会把 capturedAtUs 标成「新帧」，端到端延迟被系统性低估。
+    double ptsMs = M1FrameDisplayEpochMs(sampleBuffer);
+    if (ptsMs <= 0) ptsMs = M1WallMs();
+    [self deliverPixelBuffer:pb ptsMs:ptsMs];
 }
 
 // SCK 与 CGDisplayStream 的公共帧出口：在这里统一做统计与时间戳，

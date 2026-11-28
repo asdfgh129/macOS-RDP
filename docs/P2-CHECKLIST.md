@@ -309,7 +309,7 @@ M1_QUIC_DEBUG=1 P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 P2_SECONDS=35 \
 | 解码单帧 | 0.8 ms | 硬解 |
 | 渲染单帧 | 12.9 ms @3440×1440 | IOSurface 直贴 |
 | capture→render（帧头 v3） | 跨机 p50 94.2–95.1ms / p95 206–231ms（WAN 1080p20 镜像，r2/r3） | 帧头 `capturedAtUs` + `time-sync`；单机环回 49.4ms 为竞争值不作基线 |
-| **glass-to-glass** | **方法论已闭合、数值待跨机实测**（2026-11-28）：双钟同框+截屏，自检 PASS；本机双屏环回环境不可信，不在此给数值（§5.51） | `Scripts/tests/a02/`；14×13 跨机补测（soak 结束后）；capture→render 不含显示扫描与摄像头 |
+| **glass-to-glass** | **Tahoe 本机部分闭合**：inband 主判据（帧头显示时刻→贴层）720p p50 39.5ms/p95 48.5ms PASS；1080p p50 47.5–54.5ms/p95 0.5–1.1s 未稳定达标（2026-11-28，§5.51） | `Scripts/tests/a02/run.sh inband-local|inband-client`；14×13 跨机补 1080p（soak 结束后）；不含显示扫描与摄像头 |
 
 ---
 
@@ -355,7 +355,7 @@ scp bemin@192.168.10.23:/path/to/P2-Dual/out/<时间戳>/host.json .
 
 ---
 
-## 7. glass-to-glass（A-02）：方法论已闭合，数值待跨机实测（2026-11-28）
+## 7. glass-to-glass（A-02）：主判据已跑通，Tahoe 720p 达标 / 1080p 贴线（2026-11-28）
 
 原计划需要 240fps 相机把两块屏拍进同一帧；**无相机**时改用等价的软件同框法：
 
@@ -368,7 +368,17 @@ scp bemin@192.168.10.23:/path/to/P2-Dual/out/<时间戳>/host.json .
   不含两端显示扫描与相机采样。真实值落在 `[客户端 presentP50, 双钟 p50]` 区间内。
 - 工具与操作：`Scripts/tests/a02/`（README 有 TCC、拓扑与跨机步骤）。
 - 决定记录：`DECISIONS.md` C-17.46；实测数据：`RESULTS-BY-OS.md` §5.51。
-- **自检 PASS**（注入 −40ms → 判读中位数 −40ms）；端到端拓扑跑通。但**本机双物理屏环回不是可信测量环境**：同屏镜中镜、跨屏全屏抓图侵入合成器、跨屏抓窗口则渲染持续积压（详见 §5.51）。故**不在本机给数值或 PASS/FAIL**，按 §4 在 14×13 跨机补测（soak 至 11-30 19:00 结束后）。
+- **主判据改为 inband（C-17.47）**：SCK 帧头携带 `SCStreamFrameInfoDisplayTime`（WindowServer 真正显示该帧的 mach 时刻），
+  客户端在贴层时结算 `presentP50 = 显示时刻 → 上屏`。截屏抓窗口本身要 150–650ms、会拖慢合成器，
+  双钟法降为交叉验证（自检仍 PASS：注入 −40ms → 中位数 −40ms）。
+- **实测（仅 Tahoe，3440×1440 源屏）**：`M1_CAPTURE_RESOLUTION=best` 下 720p p50 39.5ms / p95 48.5ms（PASS）；
+  1080p 两轮 p50 47.5 / 54.5ms、p95 0.5–1.1s（贴线，**未稳定达标**）。不外推 13/14（§5.51）。
 
-原「路线 3」（帧头 v3 `capturedAtUs` + `time-sync` 的 capture→render 打点）保留为
-**下界**数据源，与双钟上界一起构成区间，两者共用同一次会话。
+```bash
+# 本机：host + client 一次跑完，输出 client.json 的 presentP50/P95
+./run.sh inband-local --display <CGDisplayID> --spec 1280x720 --seconds 40
+# 跨机：host 在 14 上先起，13 这边只跑客户端并结算
+./run.sh inband-client --host 192.168.34.212 --port 46600 --fingerprint <host_fp> --spec 1920x1080
+```
+
+72h soak 至 11-30 19:00 结束后在 14×13 两台独立机器上补 1080p；strict A-02（1080p <50ms）在 Tahoe 尚未稳定闭合。

@@ -294,6 +294,10 @@ static NSString *M1PrintableCharacters(NSEvent *event) {
             }
             // CALayer 支持直接把 IOSurface 当 contents（零拷贝上屏）。
             self.layer.contents = (__bridge id)surface;
+            // A-02：参考钟必须在同一事务里更新，否则主线程积压时它停在旧读数。
+            // 回调在 self.layer.contents 之后、blk 返回之前执行，交给 AppKit 一次提交。
+            void (^commitHook)(void) = self.onPresentCommit;
+            if (commitHook) commitHook();
             CFRelease(surface);
             self.lastRenderMs = costMs;
             if (costMs > self.maxRenderMs) self.maxRenderMs = costMs;

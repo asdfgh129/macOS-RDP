@@ -17,10 +17,18 @@
 #    · 主机绘制到采集之间有 0～2 个刷新周期（合成+双缓冲），是系统性高估来源；
 #      与客户端 present 直方图（capture→present）配合可给出上下界。
 #
+#  主判据（inband，2026-11-28）：不用截屏也不靠条码判读。SCK 帧头携带
+#    SCStreamFrameInfoDisplayTime（WindowServer 真正显示该帧的 mach 时刻），
+#    换算成 epoch 后随帧传到客户端；客户端在 layer.contents 提交时结算
+#    presentP50 = 显示时刻 → 上屏。截屏抓窗口本身要 150–650ms，会拖慢合成器，
+#    只适合做交叉验证，不能当判据（见 RESULTS §5.51）。
+#
 #  用法：
-#    ./a02-run.sh local  --capture-display <id> --client-display <id> [选项]
-#    ./a02-run.sh list
-#    ./a02-run.sh selftest --display <id> [--skew-ms -40]
+#    ./run.sh inband-local --display <id> [--spec 1280x720] [--fps 30] [--seconds 40]
+#    ./run.sh inband-client --host <ip> --port <udp> --fingerprint <fp> [--spec 1280x720]
+#    ./run.sh local  --capture-display <id> --client-display <id> [选项]
+#    ./run.sh list
+#    ./run.sh selftest --display <id> [--skew-ms -40]
 #
 #  选项（local）：--spec 1280x720 --fps 30 --samples 40 --interval 0.25 --outdir DIR
 #                --port 46600 --host-mode mirror|keep-main
@@ -37,6 +45,29 @@ IDENTITY="${A02_IDENTITY:-$REPO/M1-Skeleton/.state/rdp-identity.p12}"
 
 say() { printf '%s\n' "$*"; }
 die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+
+report_inband() {
+  python3 - "$1" <<'PY'
+import json, os, sys
+out = sys.argv[1]
+cj = os.path.join(out, "client.json")
+if not os.path.exists(cj):
+    print("FAIL：缺 client.json"); sys.exit(1)
+c = json.load(open(cj))
+p50, p95 = c.get("presentP50Ms", 0), c.get("presentP95Ms", 0)
+print(f"采集显示时刻→上屏  p50 {p50:.1f}ms  p95 {p95:.1f}ms"
+      f"（时钟差 {c.get('clockOffsetUs', 0)}us，样本见客户端日志）")
+print(f"收齐/解出/上屏 {c.get('framesCompleted','?')}/{c.get('framesDecoded','?')}/"
+      f"{c.get('framesRendered','?')}，渲染丢帧 {c.get('framesRenderDropped','?')}，"
+      f"遮挡跳过 {c.get('framesSkippedOccluded','?')}")
+hj = os.path.join(out, "host.json")
+if os.path.exists(hj):
+    h = json.load(open(hj))
+    print(f"主机采/编/发 {h.get('framesCaptured','?')}/{h.get('framesEncoded','?')}/"
+          f"{h.get('framesSent','?')}")
+print("VERDICT " + ("PASS" if 0 < p50 <= 50 else "FAIL") + f"（A-02 p50 ≤50ms，实测 {p50:.1f}ms）")
+PY
+}
 
 cmd="${1:-}"; shift || true
 
@@ -86,6 +117,86 @@ case "$cmd" in
     diff=$(( got - skew )); [ "$diff" -lt 0 ] && diff=$(( -diff ))
     [ "$diff" -le 20 ] && say "SELFTEST PASS" && exit 0
     say "SELFTEST FAIL"; exit 1
+    ;;
+  inband-local)
+    # 本机 host + client，主判据无截屏侵入。3440×1440 源屏务必带
+    # M1_CAPTURE_RESOLUTION=best（脚本默认设上，可用环境变量覆盖）。
+    display=""; spec="1280x720"; fps=30; seconds=40; port=46610
+    outdir="/tmp/veild-a02-inband"; mode="mirror"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --display) display="$2"; shift 2 ;;
+        --spec) spec="$2"; shift 2 ;;
+        --fps) fps="$2"; shift 2 ;;
+        --seconds) seconds="$2"; shift 2 ;;
+        --port) port="$2"; shift 2 ;;
+        --outdir) outdir="$2"; shift 2 ;;
+        --host-mode) mode="$2"; shift 2 ;;
+        *) die "未知参数 $1" ;;
+      esac
+    done
+    [ -n "$display" ] || die "inband-local 需要 --display <CGDisplayID>"
+    [ -x "$PROBE_BIN" ] || die "找不到 ${PROBE_BIN}（先 bash M1-Skeleton/build_stream_probe.sh）"
+    [ -x "$CLIENT_BIN" ] || die "找不到 $CLIENT_BIN"
+    w="${spec%x*}"; h="${spec#*x}"
+    mkdir -p "$outdir"; rm -f "$outdir"/*.json "$outdir"/*.log
+    caffeinate -d -u -t "$(( seconds + 40 ))" & CAF=$!
+    "$HERE/a02_clock" --display "$display" --hold "$(( seconds + 20 ))" \
+        >"$outdir/clock.log" 2>&1 & CLOCK=$!
+    sleep 1
+    mode_arg="--mirror"; [ "$mode" = "keep-main" ] && mode_arg="--keep-main"
+    M1_CAPTURE_RESOLUTION="${M1_CAPTURE_RESOLUTION:-best}" \
+      "$PROBE_BIN" --host --port "$port" $mode_arg --display "$display" \
+        --spec "$spec" --width "$w" --height "$h" --fps "$fps" \
+        --wait-ms 60000 --duration-ms "$(( seconds * 1000 + 10000 ))" \
+        --identity "$IDENTITY" --out "$outdir/host.json" >"$outdir/host.log" 2>&1 & HOST=$!
+    crt="${IDENTITY%.p12}.crt"
+    [ -f "$crt" ] || die "缺身份证书 $crt"
+    fp="$(openssl x509 -in "$crt" -outform DER 2>/dev/null | shasum -a 256 | awk '{print $1}')"
+    ready=0
+    for _ in $(seq 1 150); do
+      if lsof -nP -iUDP:"$port" 2>/dev/null | grep -q stream; then ready=1; break; fi
+      sleep 0.2
+    done
+    [ "$ready" = 1 ] || { cat "$outdir/host.log"; die "host 未监听 $port"; }
+    script -q /dev/null "$CLIENT_BIN" --connect 127.0.0.1 --port "$port" \
+        --fingerprint "$fp" --identity "$IDENTITY" --spec "$spec" \
+        --duration-ms "$(( seconds * 1000 ))" --out "$outdir/client.json" \
+        >"$outdir/client.log" 2>&1 & CLIENT=$!
+    say "inband-local：采集屏 $display 规格 $spec @${fps}fps，${seconds}s，输出 $outdir"
+    wait $CLIENT 2>/dev/null || true
+    wait $HOST 2>/dev/null || true
+    kill $CLOCK $CAF 2>/dev/null || true
+    report_inband "$outdir"
+    exit $?
+    ;;
+  inband-client)
+    # 跨机：host 已在另一台机器运行，只在客户端这边跑并结算。
+    host=""; port=46600; fp=""; spec="1280x720"; seconds=40
+    outdir="/tmp/veild-a02-inband-client"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --host) host="$2"; shift 2 ;;
+        --port) port="$2"; shift 2 ;;
+        --fingerprint) fp="$2"; shift 2 ;;
+        --spec) spec="$2"; shift 2 ;;
+        --seconds) seconds="$2"; shift 2 ;;
+        --outdir) outdir="$2"; shift 2 ;;
+        *) die "未知参数 $1" ;;
+      esac
+    done
+    [ -n "$host" ] && [ -n "$fp" ] || die "inband-client 需要 --host 与 --fingerprint"
+    mkdir -p "$outdir"; rm -f "$outdir"/*.json "$outdir"/*.log
+    caffeinate -d -u -t "$(( seconds + 20 ))" & CAF=$!
+    script -q /dev/null "$CLIENT_BIN" --connect "$host" --port "$port" \
+        --fingerprint "$fp" --identity "$IDENTITY" --spec "$spec" \
+        --duration-ms "$(( seconds * 1000 ))" --out "$outdir/client.json" \
+        >"$outdir/client.log" 2>&1 & CLIENT=$!
+    say "inband-client：连接 ${host}:${port} 规格 $spec，${seconds}s，输出 $outdir"
+    wait $CLIENT 2>/dev/null || true
+    kill $CAF 2>/dev/null || true
+    report_inband "$outdir"
+    exit $?
     ;;
   local) ;;
   # 先按 local 收参数（函数体在下面），这里不 break

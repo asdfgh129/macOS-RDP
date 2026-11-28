@@ -2065,6 +2065,29 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 
 **结论**：A-02 方法论与工具链成立（自检 PASS、端到端拓扑跑通），但**本机双屏环回不是可信测量环境**，不在此给出 glass-to-glass 数值或 PASS/FAIL 判定。可信测量需在 14×13 跨机环境（host 在独立机器采集、client 在另一台机器，抓客户端窗口）进行——Box 14/13 正在进行 72h soak（§5.50 D，至 11-30 19:00），期间不占用；soak 结束后按 `Scripts/tests/a02/README.md` 跨机步骤补测。A-02 保持「方法论已闭合、数值待跨机实测」口径，不跨机外推、不跨 OS 外推。
 
+### 5.51 补测（2026-11-28 11:2x–11:5x，Tahoe 本机）：口径修正与 A-02 数值
+
+上一节记录了双钟判读链路自检 PASS、但本机双屏环回数据不可信。继续定位后拿到两个**真实缺陷**和一个**可信判据**：
+
+**缺陷 ①：参考钟被主线程积压冻住。** `A02RefBarcodeView` 原用 8ms Timer 重绘；主线程忙时它停在旧读数，而视频帧在另一时刻提交，于是双钟差被压到 80–100ms，`presentP50` 却报 713ms。修复：`M1FrameView` 新增 `onPresentCommit`，在 `self.layer.contents = surface` 的**同一次主线程事务**里调用；参考钟改为同步生成 CGImage 并写 `layer.contents`（`Apps/Client/Sources/main.swift`、`Packages/RDPKit/Sources/Display/M1FrameView.*`）。
+
+**缺陷 ②：capturedAtUs 用的是回调时刻而不是画面显示时刻。** SCK 回调里原来取 `M1WallMs()`；积压时会比画面内容晚到秒级，导致 `presentP50` 系统性偏小（53.5ms vs 双钟 1.2s）。修复（C-17.47）：读 `SCStreamFrameInfoDisplayTime`（WindowServer 显示该帧的 mach 绝对时间），按 `mach_timebase_info` 换算成 epoch 毫秒后作为 `ptsMs`/`capturedAtUs` 传下去（`Packages/RDPKit/Sources/Capture/M1CapturePipeline.m`）。CGDisplayStream / 锁屏快照后端没有这个信息，仍用回调时刻，行为不变。
+
+**判据改为 inband（无截屏侵入）**：帧头 v3 已带 `capturedAtUs`，客户端在贴层时结算 `presentP50 = 显示时刻 → 上屏`。截屏抓窗口本身要 150–650ms，会拖慢合成器（双钟读数因此分裂成 80–400ms 与 1.1–3.5s 两簇，且与抓图耗时强相关），只保留为交叉验证。驱动固化在 `Scripts/tests/a02/run.sh`：`inband-local` / `inband-client`。
+
+**Tahoe 26.5.2 / Macmini8,1 本机环回（镜像模式，源屏 3440×1440，时钟内容 30fps，客户端窗口 1200×675）：**
+
+| 规格 | 采集设置 | 帧数（采/编/发 → 收/解/上屏） | display→present p50 | p95 | 判定 |
+|---|---|---|---|---|---|
+| 1280×720 @30fps | `M1_CAPTURE_RESOLUTION=best` | 936/934/934 → 934/934/899 | **39.5ms** | 48.5ms | PASS |
+| 1920×1080 @30fps | 默认（SCK 送 3440×1440 再降采样） | 575/570/570 → 569/569/421 | 181.5ms | 1213.5ms | FAIL |
+| 1920×1080 @30fps | `M1_CAPTURE_RESOLUTION=best` | 570/570/570 → 569/569/421 | 54.5ms | 1115.5ms | p50 贴线 FAIL |
+| 1920×1080 @30fps | `M1_CAPTURE_RESOLUTION=best`（复跑） | 865/865/865 → 864/864/820 | **47.5ms** | 498.5ms | p50 PASS，尾部不达标 |
+
+**结论（仅 Tahoe）**：720p 稳定达标（p50 39.5ms / p95 48.5ms）；1080p p50 在 47.5–54.5ms 之间、贴着 50ms 线，p95 因渲染积压（上屏 421/569、丢 137）达 0.5–1.1s，**不能写成稳定 PASS**。A-02 严格口径（1080p 15–30fps、总链路 <50ms）在 Tahoe 本机**未稳定闭合**：720p 达标，1080p 待跨机复测。本机双物理屏 + 3440×1440 源屏是已知不利条件（§5.49 F），**不外推到 13/14**；72h soak（14×13）结束后按 `inband-client` 在两台独立机器上补 1080p。
+
+双钟自检仍然 PASS（注入 −40ms → 判读中位数 −40ms）；`--window` 抓图与 `--ref-barcode` 保留作视觉交叉验证，不再作为数值判据。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |

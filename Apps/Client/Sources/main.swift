@@ -160,36 +160,40 @@ func parseSize(_ s: String) -> (Int, Int)? {
 /// 条码格式与 `Scripts/tests/a02/a02_clock.m` 完全一致（48 位 epoch 毫秒 + 8 位校验，
 /// 青色外框 = 本机参考，洋红外框 = 被采集的画面）。
 final class A02RefBarcodeView: NSView {
-    private var timer: Timer?
+    private var lastCommitMs: UInt64 = 0
     override var isFlipped: Bool { true }
 
-    func start() {
-        let t = Timer(timeInterval: 0.008, repeats: true) { [weak self] _ in
-            self?.needsDisplay = true
-        }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
-    }
-
-    deinit { timer?.invalidate() }
-
-    override func draw(_ dirtyRect: NSRect) {
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        ctx.setFillColor(NSColor.black.cgColor)
-        ctx.fill(bounds)
-
+    /// 只能由 M1FrameView.onPresentCommit 调用：与视频 layer.contents 在同一次
+    /// 主线程事务里改 contents，保证截屏看到的青钟读数就是这一帧提交时的读数。
+    /// 用 Timer 重绘会在主线程积压时冻结（实测把 713ms 测成 100ms）。
+    func refresh() {
+        wantsLayer = true
+        let wInt = max(1, Int(bounds.width.rounded(.up)))
+        let hInt = max(1, Int(bounds.height.rounded(.up)))
         let ms = UInt64(Date().timeIntervalSince1970 * 1000)
+        lastCommitMs = ms
+        guard let ctx = CGContext(data: nil, width: wInt, height: hInt,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: wInt, height: hInt))
+
         var bytes = [UInt8](repeating: 0, count: 7)
         for i in 0..<6 { bytes[i] = UInt8((ms >> UInt64(8 * (5 - i))) & 0xFF) }
         var xr: UInt8 = 0
         for i in 0..<6 { xr ^= bytes[i] }
         bytes[6] = xr ^ 0xA5
 
-        let w = bounds.width, h = bounds.height
+        let w = CGFloat(wInt), h = CGFloat(hInt)
         let stripW = w * 0.92
         let c = stripW / 56
         let x0 = (w - stripW) / 2
         let y0 = (h - 4 * c) / 2
+        // 位图上下文原点在左下，翻成 UI 的左上原点（与 a02_clock 一致）。
+        ctx.translateBy(x: 0, y: h)
+        ctx.scaleBy(x: 1, y: -1)
 
         ctx.setFillColor(NSColor(calibratedRed: 0, green: 1, blue: 1, alpha: 1).cgColor)
         ctx.fill(CGRect(x: x0 - c / 2, y: y0 - c / 2, width: stripW + c, height: 4 * c))
@@ -204,6 +208,7 @@ final class A02RefBarcodeView: NSView {
             ctx.fill(CGRect(x: x0 + CGFloat(i) * c + inset, y: y0 + c + inset,
                             width: c - 2 * inset, height: c - 2 * inset))
         }
+        if let img = ctx.makeImage() { layer?.contents = img }
     }
 }
 
@@ -343,9 +348,11 @@ func runConnect() -> Int32 {
     if CommandLine.arguments.contains("--ref-barcode") {
         let ref = A02RefBarcodeView(frame: NSRect(x: 16, y: 16, width: 900, height: 110))
         ref.autoresizingMask = [.maxXMargin, .maxYMargin]
-        ref.start()
         slots.first?.window.contentView?.addSubview(ref)
-        print("A-02 参考条码已挂到窗口左下角（900×110，青色）")
+        // 与视频帧同一事务更新（不是 Timer）：主线程积压时两者一起停住，
+        // 双钟差始终等于该帧提交时的 capture→present 延迟。
+        slots.first?.view.onPresentCommit = { [weak ref] in ref?.refresh() }
+        print("A-02 参考条码已挂到窗口左下角（900×110，青色，随帧提交）")
     }
     let router = DisplayRouter()
     let client = M1StreamClientNode()

@@ -244,7 +244,10 @@ static const NSUInteger kM1FragFailureAlertThreshold = 3;
         return;
     }
     NSError *err = nil;
-    uint64_t capturedAtUs = M1WallClockUs();
+    // 优先用采集后端给的内容显示时刻（SCK 的 DisplayTime，换算成 epoch ms），
+    // 而不是「回调被调用」的时刻：后者在积压时会晚到秒级，A-02 会把延迟低估。
+    // CGDisplayStream/快照后端没有该信息，ptsMs 就是回调时刻，行为不变。
+    uint64_t capturedAtUs = ptsMs > 0 ? (uint64_t)(ptsMs * 1000.0) : M1WallClockUs();
     if (![enc encodePixelBuffer:pb ptsMs:ptsMs capturedAtUs:capturedAtUs error:&err]) {
         atomic_fetch_add(&_encodeFailures, 1);
     }

@@ -131,7 +131,7 @@
 | 编号 | 假设 | 验证方式 | 不成立时的回退 |
 |---|---|---|---|
 | **A-01** | Tahoe **26.5.2 (25F84)** Intel 上私有 SPI 可用，identity walk + 保守 canvas→promote 能恢复 stale/poisoned | ✅ **已关闭**（2026-11-17 11:55）：单屏 `verify` 返回 `pass=1`、`visibility` 一次命中、`capture=HAS_CONTENT`、`identityOffset=0`（本次未触发 walk）。见 README §14 | 逐 selector 重逆向；极端情况 EDID 假插头（C-05） |
-| **A-02** | 双机 1080p **15–30fps（D-10 修订）** 采集+编码 < 30ms、总链路 < 50ms；首帧 <1s 是风险项（M1-Pre 单机实测 739–1031ms） | **已关闭（2026-11-27，无相机替代法）**：采用「双钟同框 + 截屏」直接测量端到端（C-17.46）——被采集的洋红毫秒条码与客户端进程内绘制的青色参考条码在同一帧合成，延迟 = 两者读数差；口径为「主机应用绘制 → 客户端窗口合成」，含采集/编码/传输/解码/上屏，不含两端显示扫描与相机采样。真实 glass-to-glass 落在 `[客户端 presentP50, 双钟 p50]` 区间内。实测数据见 `RESULTS-BY-OS.md` §5.51 | 原回退路径（降分辨率/帧率、编码参数调优、传输换 QUIC）保留；若后续拿到 240fps 相机，用同一条码做同框复标 |
+| **A-02** | 双机 1080p **15–30fps（D-10 修订）** 采集+编码 < 30ms、总链路 < 50ms；首帧 <1s 是风险项（M1-Pre 单机实测 739–1031ms） | **部分闭合（2026-11-28，Tahoe 本机）**：主判据改为帧头内建显示时刻（C-17.47）——SCK `SCStreamFrameInfoDisplayTime` 随帧传到客户端，贴层时结算 `presentP50`；无截屏侵入。双钟同框 + 截屏（C-17.46）降为交叉验证，自检 PASS。Tahoe 本机 720p p50 39.5ms/p95 48.5ms 达标；1080p 两轮 p50 47.5–54.5ms、p95 0.5–1.1s，**未稳定达标**，不外推 13/14。见 `RESULTS-BY-OS.md` §5.51 补测 | 72h soak 结束后在 14×13 两台独立机器上用 `run.sh inband-client` 补 1080p；若后续拿到 240fps 相机，用同一条码做同框复标 |
 | A-03 | `CGEventKeyboardSetUnicodeString` 中文注入与修饰键同步在 Tahoe 可用 | P1 控制端探针 + 双机联调 | 改 IOHIDPostEvent / 输入法状态机同步 |
 | A-04 | Intel+Tahoe 扩展虚拟屏上限 ≥ 2（社区经验约 4） | ✅ **已关闭 2026-11-17**：实测 **2 物理 + 4 虚拟 = 6 块 display 同时 online/active 且全部可捕获**（README §16.1）。虚拟屏走 WindowServer 软件合成，不占 Intel DDI 通道，与物理屏数量**解耦** | — |
 | A-05 | HiDPI（2x points/pixels）与混合缩放渲染正确 | P1 渲染探针 | 本期只支持 1x，HiDPI 降级为 P2 |
