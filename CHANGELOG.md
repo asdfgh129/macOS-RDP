@@ -4,6 +4,22 @@
 
 格式约定：以日期为版本号构成版本节（`[YYYY-MM-DD]` + 里程碑简述），节内按 **Added / Changed / Fixed / Documentation** 分类，每条附短 commit hash；分类参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，Documentation 用于纯文档提交，本文件自身的维护提交不重复列入。真机结论按 OS 分离记录在 `docs/RESULTS-BY-OS.md`，决策编号见 `docs/DECISIONS.md`。
 
+## [2026-11-28] — A-02 主判据改为帧头显示时刻，修正参考钟冻结与 SCK 时间戳低估
+
+### Fixed
+
+- fix: SCK 回调原先取 `M1WallMs()` 作 `capturedAtUs`，积压时比画面内容晚到秒级、端到端被系统性低估；改读 `SCStreamFrameInfoDisplayTime`（WindowServer 显示该帧的 mach 时刻）换算 epoch；CGDisplayStream / 锁屏快照后端保持原行为（`9e6c67e`）
+- fix: A-02 参考钟用 8ms Timer 重绘，主线程积压时冻结读数，把 713ms 测成 100ms；`M1FrameView.onPresentCommit` 让青钟在视频 `layer.contents` 提交的同一主线程事务里同步更新（`9e6c67e`）
+- fix: `Tests/stream_session_selftest.m` 漏设客户端身份，NFR-07 双向指纹加固后握手超时；补上后 integration selftest PASS（`9e6c67e`）
+
+### Added
+
+- test: `Scripts/tests/a02/run.sh` 新增 `inband-local` / `inband-client`——用帧头显示时刻结算 display→present，不截屏、不侵入合成器；双钟截屏降为交叉验证（`9e6c67e`）
+
+### Documentation
+
+- docs: `DECISIONS` C-17.47、`DESIGN` A-02、`P2-CHECKLIST` §7、`RESULTS` §5.51 补测与 `Scripts/tests/a02/README.md` 同步；Tahoe 本机 720p p50 39.5ms/p95 48.5ms PASS，1080p 两轮 p50 47.5–54.5ms/p95 0.5–1.1s 贴线未稳定达标，不外推 13/14（`9e6c67e`）
+
 ## [2026-11-27] — 显示事务死线修正、挂起判定有界化、剩余项收敛（多屏独占 / 独占态 Path A）、M3 收口开发
 
 ### Added
