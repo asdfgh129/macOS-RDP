@@ -252,6 +252,7 @@ int main(int argc, const char *argv[]) {
         BOOL hasRect = NO;
         BOOL two = NO;
         NSString *pngIn = nil;
+        uint32_t windowID = 0;   // --window：抓单个窗口，比 CGDisplayCreateImage 快一个量级
         for (int i = 1; i < argc; i++) {
             if (!strcmp(argv[i], "--two")) {
                 two = YES;
@@ -267,6 +268,8 @@ int main(int argc, const char *argv[]) {
                     rw = [p[2] doubleValue]; rh = [p[3] doubleValue];
                     hasRect = (rw >= 32 && rh >= 16);
                 }
+            } else if (!strcmp(argv[i], "--window") && i + 1 < argc) {
+                windowID = (uint32_t)strtoul(argv[++i], NULL, 10);
             } else if (!strcmp(argv[i], "--png-in") && i + 1 < argc) {
                 pngIn = [NSString stringWithUTF8String:argv[++i]];
             } else if (!strcmp(argv[i], "--png") && i + 1 < argc) {
@@ -346,10 +349,18 @@ int main(int argc, const char *argv[]) {
         }
 
         uint64_t t0 = A02NowUs();
-        CGImageRef img = hasRect
-            ? CGDisplayCreateImageForRect((CGDirectDisplayID)displayID,
-                                          CGRectMake(rx, ry, rw, rh))
-            : CGDisplayCreateImage((CGDirectDisplayID)displayID);
+        CGImageRef img = NULL;
+        if (windowID) {
+            // 抓单窗口：CGWindowListCreateImage 直接从窗口 backing store 取图，
+            // 不经过显示帧缓冲，也不会像 CGDisplayCreateImage 那样阻塞合成器几百毫秒。
+            img = CGWindowListCreateImage(CGRectNull, kCGWindowListOptionIncludingWindow,
+                                          windowID, kCGWindowImageBoundsIgnoreFraming);
+        } else if (hasRect) {
+            img = CGDisplayCreateImageForRect((CGDirectDisplayID)displayID,
+                                              CGRectMake(rx, ry, rw, rh));
+        } else {
+            img = CGDisplayCreateImage((CGDirectDisplayID)displayID);
+        }
         uint64_t t1 = A02NowUs();
         if (!img) {
             printf("{\"ok\":false,\"why\":\"capture-failed\",\"t0Us\":%llu,\"t1Us\":%llu}\n",
@@ -367,13 +378,10 @@ int main(int argc, const char *argv[]) {
             d.why = "bitmap-failed";
             rc = 2;
         } else {
-            if (hasRect) {
-                if (!A02CropBitmap(&full, (long)rx, (long)ry, (long)rw, (long)rh, &bm)) {
-                    printf("{\"ok\":false,\"why\":\"crop-out-of-range\"}\n");
-                    free(full.px); CGImageRelease(img); return 2;
-                }
-                free(full.px);
-            } else { bm = full; }
+            // 在线采样：CGDisplayCreateImageForRect 已经按矩形裁过（像素尺寸 = rw×rh），
+            // 这里不能再拿全局坐标裁第二次，否则必然 crop-out-of-range。
+            // 离线 --png-in 才是整屏图，需要上面的 A02CropBitmap。
+            bm = full;
             d = A02DecodeBarcode(&bm, A02FrameMagenta);
             if (two) ref = A02DecodeBarcode(&bm, A02FrameCyan);
             if (!d.ok) rc = (strcmp(d.why, "checksum") == 0) ? 5

@@ -2046,6 +2046,25 @@ host json: sessionMode=exclusive-keep-main c09Status=skipped-keep-main sessionRe
 - `soak-host.sh` 用 `${line%% *}` 解析 `ps -o %cpu=,rss=`，字段带前导空格会取到空串 → 改 `awk`。
 - `soak-client.sh` / `run-host.command` 里 `$VAR` 紧跟中文全角字符（`$CAFF_PID，`、`$BIN（`、`$code，`）在 `LANG=C.UTF-8` 下被 bash 当成变量名的一部分，报 `unbound variable` → 一律改 `${VAR}`。
 
+
+## 5.51 A-02 无相机替代法（时钟+截屏）工具链与本机环回诊断（2026-11-28 10:30–11:0x，Tahoe 本机双物理屏）
+
+用户无 240fps 相机，A-02 改用「双钟同框 + 截屏」：主机 `a02_clock` 画洋红毫秒条码（被采集推流），客户端 `--ref-barcode` 在**自己窗口内**画青色参考条码，两者在同一帧合成 ⇒ 截屏耗时消掉，`延迟 = 青读数 − 洋红读数`（C-17.46）。
+
+**自检 PASS（判读链路无系统错位）**：注入 `--skew-ms -40`，`a02_shot --two` 连续 7 次判读中位数 `-40ms`（样本 -40/-23/-40/-40/-40/-40/-40，单帧抖动 ≤1 帧）。修正两个工具 bug：① `run.sh selftest` 期望符号写反（应为 skew 本身，非 `-skew`），改中位数 ±20ms 容差；② `a02_shot --rect` 双重裁剪（CGDisplayCreateImageForRect 已裁过，又用全局坐标裁一次 → 必然 `crop-out-of-range`）。
+
+**本机双屏环回诊断（不能作为 A-02 判据，如实记录）**：
+
+| 拓扑 | 结果 |
+|---|---|
+| 同屏环回（host 采主屏、client 窗口叠主屏） | 镜中镜：流里嵌套整块主屏，`A02LargestComponent` 选中主屏直出的大条码 ⇒ 假值 100ms；真实流里条码晚 200ms+ |
+| 跨屏（host 采主屏、client 沉浸副屏、`CGDisplayCreateImage` 抓副屏） | 单次抓图 597ms，强侵入合成器，framebuffer 停在 2s 前 ⇒ 双钟 2554ms 假值 |
+| 跨屏 + `--window` 抓客户端窗口 | 去掉直出条码、抓图降到 ~150–250ms；但客户端渲染持续积压（`decoded/rendered=736/417`、`presentP50` 在 90–713ms 大幅波动）⇒ 双钟读数分两簇 83–184ms / 384–4578ms，无稳定 p50 |
+
+**根因**：本机双物理屏（3440×1440 + 1080×1920 竖屏）上，1280×720 流被拉伸到 1080×1920，客户端渲染队列积压、窗口显示旧帧，双钟测到的是「旧帧 vs 当前参考钟」而非真实链路延迟。`presentP50` 与双钟 p50 的大小关系在两轮中多次反转（713>233、90<1166），均系积压时点不同。
+
+**结论**：A-02 方法论与工具链成立（自检 PASS、端到端拓扑跑通），但**本机双屏环回不是可信测量环境**，不在此给出 glass-to-glass 数值或 PASS/FAIL 判定。可信测量需在 14×13 跨机环境（host 在独立机器采集、client 在另一台机器，抓客户端窗口）进行——Box 14/13 正在进行 72h soak（§5.50 D，至 11-30 19:00），期间不占用；soak 结束后按 `Scripts/tests/a02/README.md` 跨机步骤补测。A-02 保持「方法论已闭合、数值待跨机实测」口径，不跨机外推、不跨 OS 外推。
+
 ## 6. 状态汇总
 
 | 假设 | Sequoia | Tahoe | Ventura |

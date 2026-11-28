@@ -53,7 +53,9 @@ case "$cmd" in
     exec "$HERE/a02_clock" "$@"
     ;;
   selftest)
-    # 已知偏差自检：参考钟故意偏 --skew-ms，读到 -skew 才说明整条判读链路无系统性错位。
+    # 已知偏差自检：参考钟故意偏 --skew-ms；判读 latencyMs = 参考读数 − 主机读数，
+    # 因此期望值就是 skew 本身（不是 -skew）。两钟各自按自己的刷新周期更新，
+    # 相邻帧读数会差最多 1 帧（实测 -40/-24/-42），故取 7 次采样中位数、容差 ±20ms。
     display=""; skew="-40"
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -63,18 +65,26 @@ case "$cmd" in
       esac
     done
     [ -n "$display" ] || die "selftest 需要 --display <id>"
-    "$HERE/a02_clock" --display "$display" --hold 14 >/dev/null 2>&1 &
+    "$HERE/a02_clock" --display "$display" --hold 24 >/dev/null 2>&1 &
     M=$!
     sleep 1.5
     "$HERE/a02_clock" --display "$display" --cyan --no-text --skew-ms "$skew" \
-        --size 900x120 --anchor bl --hold 10 >/dev/null 2>&1 &
+        --size 900x120 --anchor bl --hold 20 >/dev/null 2>&1 &
     R=$!
     sleep 2
-    got="$("$HERE/a02_shot" --two --display "$display" | python3 -c \
-        'import json,sys;d=json.load(sys.stdin);print(d["latencyMs"] if d["ok"] else "fail")')"
+    samples=""
+    for _ in $(seq 1 7); do
+      v="$("$HERE/a02_shot" --two --display "$display" | python3 -c \
+          'import json,sys;d=json.load(sys.stdin);print(d["latencyMs"] if d["ok"] else "fail")')"
+      samples="$samples $v"
+      sleep 0.2
+    done
     kill $M $R 2>/dev/null || true
-    say "注入偏差 ${skew}ms → 判读 ${got}ms"
-    [ "$got" = "$(( -skew ))" ] && say "SELFTEST PASS" && exit 0
+    got="$(printf '%s\n' $samples | python3 -c \
+        'import sys,statistics as st; v=[int(x) for x in sys.stdin.read().split() if x.lstrip("-").isdigit()]; print(int(st.median(v)) if v else 9999)')"
+    say "注入偏差 ${skew}ms → 判读中位数 ${got}ms（样本:${samples} ）"
+    diff=$(( got - skew )); [ "$diff" -lt 0 ] && diff=$(( -diff ))
+    [ "$diff" -le 20 ] && say "SELFTEST PASS" && exit 0
     say "SELFTEST FAIL"; exit 1
     ;;
   local) ;;

@@ -51,14 +51,15 @@ A-02 的定义是「主机屏幕上出现某时刻的画面 → 客户端屏幕�
 ```bash
 bash Scripts/tests/a02/build.sh                 # 出 a02_clock / a02_shot
 
-# 同屏环回（推荐，单显示器即可；也不需要 GUI Terminal 授权之外的任何东西）
-./run.sh local --capture-display <CGDisplayID> --samples 40 --interval 0.3
-
-# 自检：参考钟故意偏 40ms，判读应为 +40ms（证明整条判读链路无错位）
+# 自检：参考钟故意偏 -40ms，判读中位数应为 -40ms（±20ms，证明判读链路无系统错位）
 ./run.sh selftest --display <CGDisplayID> --skew-ms -40
+
+# 同屏环回（仅验证拓扑，数据不可信——见 §6；本机双屏有镜中镜/渲染积压）
+./run.sh local --capture-display <CGDisplayID> --samples 40 --interval 0.3
 
 # 单次采样（跨机时在客户端机器上跑）
 ./run.sh shot --two --display <CGDisplayID> --rect x,y,w,h [--png out.png]
+./run.sh shot --two --window <CGWindowID> [--png out.png]   # 抓单窗口，避开直出条码与全屏抓图侵入
 ./run.sh shot --png-in shot.png          # 离线复判，用于取证
 ./run.sh list                            # 屏幕与显示器 id
 ```
@@ -86,7 +87,14 @@ VeilRD --connect <host> --port 46600 --fingerprint <host_fp> \
     --ref-barcode --duration-ms 90000 --out /tmp/client.json
 # 客户端会打印 A02_WINDOW_RECT x,y,w,h（CG 全局坐标，左上原点）
 a02_shot --two --display <客户端屏> --rect <A02_WINDOW_RECT>   # 反复采样
+
+# 更优：抓客户端窗口本身（CGWindowListCreateImage，不经显示帧缓冲、不侵入合成器）
+# 窗口 ID 从 a02_shot --list-windows 里按 "VeilRD 1/1" 标题取
+a02_shot --two --window <CGWindowID> [--png out.png]
 ```
+
+跨机必须在**两台独立机器**上做：客户端抓图不能和主机采集在同一台机器上，
+否则抓图侵入合成器会把主机帧缓冲拖慢、读数失真（§6）。
 
 跨机时两端时钟不同源：延迟 = (青读数 + host−client 时钟差) − 洋红读数，
 钟差用控制通道 `time-sync` 的最小 RTT 样本（LAN 上 ±1ms 量级）。
@@ -104,11 +112,19 @@ a02_shot --two --display <客户端屏> --rect <A02_WINDOW_RECT>   # 反复采�
 * 屏睡会让 SCK 直接没有帧；`run.sh` 全程 `caffeinate -d -u`。
 * **会话被锁**（`CGSSessionScreenIsLocked=Yes`）时截图只剩壁纸、客户端整帧不上屏
   （`framesRendered=0`）——这一条最容易误判成「窗口没显示/工具坏了」。
+  前置检查：`ioreg -n Root -d1 | grep IOConsoleLocked`（`=No` 才对）或
+  `stream_probe --preflight` 的 `locked=0`，不要只看截图。
 
-## 6. 已知限制
+## 6. 已知限制 / 本机环回诊断（2026-11-28，详见 RESULTS §5.51）
 
+* **本机双物理屏环回的数据不可信**，三种拓扑实测：
+  1. 同屏环回 → 镜中镜，流里嵌套整块主屏，`A02LargestComponent` 选中主屏直出的大条码 ⇒ 假值 100ms；
+  2. 跨屏 + `CGDisplayCreateImage` 抓副屏 → 单次抓图 597ms 侵入合成器、framebuffer 停在 2s 前 ⇒ 假值 2554ms；
+  3. 跨屏 + `--window` 抓客户端窗口 → 无直出条码、抓图 ~150–250ms，但客户端渲染持续积压
+     （`decoded/rendered=736/417`、`presentP50` 在 90–713ms 波动）⇒ 双钟读数分两簇 83–184ms / 384–4578ms。
+  ⇒ **不在本机给 glass-to-glass 数值或 PASS/FAIL**；可信测量按 §4 在 14×13 跨机做。
 * 参考钟放在客户端进程内，是因为**副屏（独立 Space）上由其它进程创建的窗口拿不到
   合成**：`orderFrontRegardless`、激活、screenSaver 层级、全局坐标 `setFrame` 全试过，
-  副屏始终只有壁纸。同屏布局因此不需要第二块显示器。
+  副屏始终只有壁纸。
 * 主机绘制到采集之间的 0–2 帧无法用软件消除，只能用 `presentP50` 给下界。
 * 条码在格宽 < 6px（画面被缩到 1/6 以下）时会读不出，属分辨率边界。

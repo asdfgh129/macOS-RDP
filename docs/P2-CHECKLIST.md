@@ -309,7 +309,7 @@ M1_QUIC_DEBUG=1 P2_HANDSHAKE_MS=30000 P2_WAIT_MS=60000 P2_SECONDS=35 \
 | 解码单帧 | 0.8 ms | 硬解 |
 | 渲染单帧 | 12.9 ms @3440×1440 | IOSurface 直贴 |
 | capture→render（帧头 v3） | 跨机 p50 94.2–95.1ms / p95 206–231ms（WAN 1080p20 镜像，r2/r3） | 帧头 `capturedAtUs` + `time-sync`；单机环回 49.4ms 为竞争值不作基线 |
-| **glass-to-glass** | **仍未测** | 相机同框（§7 路线 1/2）；capture→render 不含显示扫描与摄像头 |
+| **glass-to-glass** | **方法论已闭合、数值待跨机实测**（2026-11-28）：双钟同框+截屏，自检 PASS；本机双屏环回环境不可信，不在此给数值（§5.51） | `Scripts/tests/a02/`；14×13 跨机补测（soak 结束后）；capture→render 不含显示扫描与摄像头 |
 
 ---
 
@@ -355,7 +355,7 @@ scp bemin@192.168.10.23:/path/to/P2-Dual/out/<时间戳>/host.json .
 
 ---
 
-## 7. glass-to-glass（A-02）：已用「双钟同框 + 截屏」关闭（2026-11-27）
+## 7. glass-to-glass（A-02）：方法论已闭合，数值待跨机实测（2026-11-28）
 
 原计划需要 240fps 相机把两块屏拍进同一帧；**无相机**时改用等价的软件同框法：
 
@@ -368,6 +368,7 @@ scp bemin@192.168.10.23:/path/to/P2-Dual/out/<时间戳>/host.json .
   不含两端显示扫描与相机采样。真实值落在 `[客户端 presentP50, 双钟 p50]` 区间内。
 - 工具与操作：`Scripts/tests/a02/`（README 有 TCC、拓扑与跨机步骤）。
 - 决定记录：`DECISIONS.md` C-17.46；实测数据：`RESULTS-BY-OS.md` §5.51。
+- **自检 PASS**（注入 −40ms → 判读中位数 −40ms）；端到端拓扑跑通。但**本机双物理屏环回不是可信测量环境**：同屏镜中镜、跨屏全屏抓图侵入合成器、跨屏抓窗口则渲染持续积压（详见 §5.51）。故**不在本机给数值或 PASS/FAIL**，按 §4 在 14×13 跨机补测（soak 至 11-30 19:00 结束后）。
 
 原「路线 3」（帧头 v3 `capturedAtUs` + `time-sync` 的 capture→render 打点）保留为
 **下界**数据源，与双钟上界一起构成区间，两者共用同一次会话。
